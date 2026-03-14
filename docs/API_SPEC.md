@@ -21,21 +21,19 @@ Base URL: `http://localhost:5900/api`
 **Response 200:**
 ```json
 {
-  "results": {
-    "지오영": [
-      {
-        "maker": "한미약품",
-        "product_name": "아모잘탄정 5/100mg",
-        "unit": "30T",
-        "insurance_code": "655801440",
-        "quantity": 25,
-        "supplier": "지오영",
-        "price": 12500,
-        "product_id": "GEO-12345"
-      }
-    ],
-    "복산": [...]
-  }
+  "keyword": "아모잘탄",
+  "results": [
+    {
+      "maker": "한미약품",
+      "product_name": "아모잘탄정 5/100mg",
+      "unit": "30T",
+      "insurance_code": "655801440",
+      "suppliers": [
+        { "name": "지오영", "quantity": 25, "price": 12500, "product_id": "GEO-12345" },
+        { "name": "복산", "quantity": 10, "price": 12300, "product_id": "BOK-67890" }
+      ]
+    }
+  ]
 }
 ```
 
@@ -107,6 +105,7 @@ Base URL: `http://localhost:5900/api`
 {
   "product_name": "아모잘탄정 5/100mg",
   "unit": "30T",
+  "insurance_code": "655801440",
   "total_quantity": 10,
   "suppliers": [
     { "supplier": "지오영", "product_id": "GEO-12345", "price": 12500 },
@@ -355,6 +354,7 @@ MCP 서버가 제공하는 도구 목록. stdio transport로 JSON-RPC 통신.
     "properties": {
       "product_name": { "type": "string" },
       "unit": { "type": "string" },
+      "insurance_code": { "type": "string", "description": "보험코드" },
       "total_quantity": { "type": "integer", "description": "총 필요 수량" },
       "suppliers": {
         "type": "array",
@@ -448,5 +448,59 @@ MCP 서버가 제공하는 도구 목록. stdio transport로 JSON-RPC 통신.
   "name": "get_monitoring_status",
   "description": "모니터링 실행 상태와 등록된 감시 제품 목록을 조회합니다.",
   "inputSchema": { "type": "object", "properties": {} }
+}
+```
+
+### add_monitoring_product
+
+모니터링 대상 제품 추가.
+
+```json
+{
+  "name": "add_monitoring_product",
+  "description": "모니터링 대상 제품을 추가합니다. 보험코드 또는 제품명으로 등록하면 주기적으로 재고를 검색합니다.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "description": "보험코드 또는 제품명" }
+    },
+    "required": ["name"]
+  }
+}
+```
+
+### remove_monitoring_product
+
+모니터링 대상 제품 삭제.
+
+```json
+{
+  "name": "remove_monitoring_product",
+  "description": "모니터링 대상 제품을 삭제합니다.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "product_id": { "type": "integer", "description": "제품 ID" }
+    },
+    "required": ["product_id"]
+  }
+}
+```
+
+### test_credential
+
+도매상 계정 연결 테스트.
+
+```json
+{
+  "name": "test_credential",
+  "description": "특정 도매상의 계정이 올바른지 실제 로그인을 시도하여 확인합니다.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "supplier": { "type": "string", "description": "도매상명 (지오영, 복산, 인천, 티제이팜, HMP, 백제, 피코, 새로팜)" }
+    },
+    "required": ["supplier"]
+  }
 }
 ```
