@@ -1,62 +1,63 @@
-"""크롤러 레지스트리: 도매상별 크롤러 등록 및 조회"""
+"""크롤러 레지스트리: 동적 로드 방식
+
+CrawlerLoader에서 로드한 크롤러를 관리한다.
+SearchService, OrderService는 CrawlerRegistry.get(name)으로 크롤러를 가져옴.
+"""
+
+import logging
 
 from domae_mcp.core.crawlers.base import BaseCrawler
 
+logger = logging.getLogger(__name__)
+
 
 class CrawlerRegistry:
-    """싱글턴 크롤러 레지스트리"""
+    """크롤러 레지스트리.
 
-    _instance = None
+    기존: _register_all()로 정적 import (모듈 로드 시 즉시 실행)
+    변경: CrawlerLoader.load() → register_all()로 동적 등록
+    """
+
     _crawlers: dict[str, type[BaseCrawler]] = {}
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._crawlers = {}
-        return cls._instance
+    _loaded: bool = False
 
     @classmethod
-    def register(cls, name: str, crawler_class: type[BaseCrawler]):
+    def register(cls, name: str, crawler_class: type[BaseCrawler]) -> None:
+        """크롤러 등록."""
         cls._crawlers[name] = crawler_class
+        logger.debug("크롤러 등록: %s", name)
+
+    @classmethod
+    def register_all(cls, crawlers: dict[str, type[BaseCrawler]]) -> None:
+        """CrawlerLoader에서 로드한 크롤러를 일괄 등록."""
+        cls._crawlers = crawlers
+        cls._loaded = True
+        logger.info("크롤러 %d개 일괄 등록", len(crawlers))
 
     @classmethod
     def get(cls, name: str) -> BaseCrawler:
+        """크롤러 인스턴스 생성. 없으면 KeyError."""
         if name not in cls._crawlers:
-            raise KeyError(f"등록되지 않은 도매상: {name}")
+            raise KeyError(f"등록되지 않은 크롤러: {name}")
         return cls._crawlers[name]()
 
     @classmethod
     def list_all(cls) -> list[str]:
+        """등록된 크롤러 이름 목록."""
         return list(cls._crawlers.keys())
 
     @classmethod
     def get_all(cls) -> dict[str, BaseCrawler]:
-        return {name: cls() for name, cls in cls._crawlers.items()}
+        """모든 크롤러 인스턴스 생성."""
+        return {name: cls._crawlers[name]() for name in cls._crawlers}
 
+    @classmethod
+    def is_loaded(cls) -> bool:
+        """크롤러가 로드되었는지 여부."""
+        return cls._loaded
 
-def _register_all():
-    """모든 크롤러 자동 등록"""
-    from domae_mcp.core.crawlers.geoweb import GeoWebCrawler
-    from domae_mcp.core.crawlers.boksan import BoksanCrawler
-    from domae_mcp.core.crawlers.inchun import InchunCrawler
-    from domae_mcp.core.crawlers.tjpharm import TjPharmCrawler
-    from domae_mcp.core.crawlers.hmpmall import HmpMallCrawler
-    from domae_mcp.core.crawlers.beakje import BeakjeCrawler
-    from domae_mcp.core.crawlers.picomall import PicomallCrawler
-    from domae_mcp.core.crawlers.saeropharm import SaeropharmCrawler
-    from domae_mcp.core.crawlers.sdpharm import SdpharmCrawler
-    from domae_mcp.core.crawlers.upharmmall import UpharmmallCrawler
-
-    CrawlerRegistry.register("지오영", GeoWebCrawler)
-    CrawlerRegistry.register("복산", BoksanCrawler)
-    CrawlerRegistry.register("인천", InchunCrawler)
-    CrawlerRegistry.register("티제이팜", TjPharmCrawler)
-    CrawlerRegistry.register("HMP", HmpMallCrawler)
-    CrawlerRegistry.register("백제", BeakjeCrawler)
-    CrawlerRegistry.register("피코", PicomallCrawler)
-    CrawlerRegistry.register("새로팜", SaeropharmCrawler)
-    CrawlerRegistry.register("신덕팜", SdpharmCrawler)
-    CrawlerRegistry.register("대전동원약품", UpharmmallCrawler)
-
-
-_register_all()
+    @classmethod
+    def clear(cls) -> None:
+        """등록된 크롤러 초기화 (테스트용)."""
+        cls._crawlers = {}
+        cls._loaded = False
