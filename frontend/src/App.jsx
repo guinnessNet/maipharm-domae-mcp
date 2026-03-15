@@ -4,10 +4,9 @@ import client from './api/client';
 import SearchPage from './pages/SearchPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupPage from './pages/SetupPage';
-
-function Placeholder({ title }) {
-  return <div className="empty-state"><h2>{title}</h2><p>준비 중입니다.</p></div>;
-}
+import UrgentPage from './pages/UrgentPage';
+import HistoryPage from './pages/HistoryPage';
+import ProductsPage from './pages/ProductsPage';
 
 export default function App() {
   const [setupDone, setSetupDone] = useState(null); // null=로딩, true/false
@@ -56,9 +55,9 @@ export default function App() {
         <Routes>
           <Route path="/setup" element={<SetupPage />} />
           <Route path="/" element={<SearchPage />} />
-          <Route path="/urgent" element={<Placeholder title="긴급주문" />} />
-          <Route path="/history" element={<Placeholder title="주문이력" />} />
-          <Route path="/products" element={<Placeholder title="모니터링 제품" />} />
+          <Route path="/urgent" element={<UrgentPage />} />
+          <Route path="/history" element={<HistoryPage />} />
+          <Route path="/products" element={<ProductsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

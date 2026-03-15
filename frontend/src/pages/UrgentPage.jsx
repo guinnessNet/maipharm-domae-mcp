@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import client from '../api/client';
 
 const styles = {
@@ -14,12 +14,6 @@ const styles = {
     marginBottom: 24,
     color: '#111',
   },
-  h2: {
-    fontSize: 18,
-    fontWeight: 600,
-    marginBottom: 16,
-    color: '#111',
-  },
   card: {
     border: '1px solid #e5e7eb',
     borderRadius: 8,
@@ -32,34 +26,6 @@ const styles = {
     alignItems: 'center',
     gap: 12,
     flexWrap: 'wrap',
-  },
-  badge: (active, filled) => ({
-    display: 'inline-block',
-    padding: '2px 10px',
-    borderRadius: 12,
-    fontSize: 12,
-    fontWeight: 600,
-    color: '#fff',
-    background: !active ? '#6b7280' : filled ? '#16a34a' : '#2563eb',
-  }),
-  btn: (color = '#2563eb') => ({
-    padding: '6px 14px',
-    borderRadius: 6,
-    border: 'none',
-    background: color,
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: 500,
-    cursor: 'pointer',
-  }),
-  btnOutline: {
-    padding: '6px 14px',
-    borderRadius: 6,
-    border: '1px solid #d1d5db',
-    background: '#fff',
-    color: '#374151',
-    fontSize: 13,
-    cursor: 'pointer',
   },
   input: {
     padding: '8px 12px',
@@ -90,24 +56,6 @@ const styles = {
     gridTemplateColumns: '1fr 1fr 1fr',
     gap: 12,
   },
-  logTable: {
-    width: '100%',
-    borderCollapse: 'collapse',
-    fontSize: 13,
-    marginTop: 8,
-  },
-  th: {
-    textAlign: 'left',
-    padding: '6px 8px',
-    borderBottom: '2px solid #e5e7eb',
-    color: '#6b7280',
-    fontWeight: 600,
-    fontSize: 12,
-  },
-  td: {
-    padding: '6px 8px',
-    borderBottom: '1px solid #f3f4f6',
-  },
   supplierTag: {
     display: 'inline-block',
     padding: '2px 8px',
@@ -118,24 +66,6 @@ const styles = {
     marginRight: 4,
     marginBottom: 4,
   },
-  section: {
-    marginBottom: 32,
-  },
-  progress: (filled, total) => ({
-    height: 6,
-    borderRadius: 3,
-    background: '#e5e7eb',
-    flex: 1,
-    position: 'relative',
-    overflow: 'hidden',
-  }),
-  progressBar: (filled, total) => ({
-    height: '100%',
-    borderRadius: 3,
-    background: filled >= total ? '#16a34a' : '#2563eb',
-    width: `${total > 0 ? Math.min((filled / total) * 100, 100) : 0}%`,
-    transition: 'width 0.3s',
-  }),
   error: {
     color: '#dc2626',
     fontSize: 14,
@@ -143,12 +73,6 @@ const styles = {
     background: '#fef2f2',
     borderRadius: 6,
     marginBottom: 12,
-  },
-  empty: {
-    textAlign: 'center',
-    color: '#9ca3af',
-    padding: 40,
-    fontSize: 14,
   },
 };
 
@@ -158,11 +82,19 @@ const statusLabel = (order) => {
   return '활성';
 };
 
+const statusBadgeClass = (order) => {
+  const s = statusLabel(order);
+  if (s === '완료') return 'badge badge-success';
+  if (s === '취소') return 'badge badge-muted';
+  return 'badge badge-warning';
+};
+
 export default function UrgentPage() {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [expanded, setExpanded] = useState({});
+  const [activeTab, setActiveTab] = useState('register'); // register | active | done
 
   // Form state
   const [form, setForm] = useState({
@@ -173,6 +105,8 @@ export default function UrgentPage() {
   });
   const [suppliers, setSuppliers] = useState([{ supplier: '', product_id: '', price: '' }]);
   const [submitting, setSubmitting] = useState(false);
+
+  const intervalRef = useRef(null);
 
   const fetchOrders = useCallback(async () => {
     try {
@@ -190,6 +124,31 @@ export default function UrgentPage() {
   useEffect(() => {
     fetchOrders();
   }, [fetchOrders]);
+
+  // Categorize orders
+  const activeOrders = useMemo(() => orders.filter((o) => o.active), [orders]);
+  const doneOrders = useMemo(
+    () => orders.filter((o) => !o.active),
+    [orders]
+  );
+
+  // Auto-refresh when there are active orders (30s)
+  useEffect(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (activeOrders.length > 0) {
+      intervalRef.current = setInterval(() => {
+        fetchOrders();
+      }, 30000);
+    }
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, [activeOrders.length, fetchOrders]);
 
   const toggleExpand = (id) => {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -264,11 +223,118 @@ export default function UrgentPage() {
       setForm({ product_name: '', unit: '', insurance_code: '', total_quantity: '' });
       setSuppliers([{ supplier: '', product_id: '', price: '' }]);
       fetchOrders();
+      setActiveTab('active');
     } catch (e) {
       setError(e.response?.data?.message || '등록에 실패했습니다.');
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const renderProgressBar = (order) => {
+    const pct = order.total_quantity > 0
+      ? Math.min((order.filled_quantity / order.total_quantity) * 100, 100)
+      : 0;
+    const isComplete = order.filled_quantity >= order.total_quantity;
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 13, color: '#6b7280', whiteSpace: 'nowrap' }}>
+          {order.filled_quantity} / {order.total_quantity}
+        </span>
+        <div className="progress">
+          <div
+            className={`progress-bar${isComplete ? ' complete' : ''}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <span style={{ fontSize: 12, color: '#6b7280', whiteSpace: 'nowrap' }}>
+          {Math.round(pct)}%
+        </span>
+      </div>
+    );
+  };
+
+  const renderOrderCard = (order) => {
+    const isExpanded = expanded[order.id];
+    return (
+      <div key={order.id} style={styles.card}>
+        <div style={{ ...styles.row, marginBottom: 8 }}>
+          <strong style={{ fontSize: 15 }}>{order.product_name}</strong>
+          {order.unit && (
+            <span style={{ color: '#6b7280', fontSize: 13 }}>{order.unit}</span>
+          )}
+          <span className={statusBadgeClass(order)}>
+            {statusLabel(order)}
+          </span>
+        </div>
+
+        {renderProgressBar(order)}
+
+        <div style={{ marginBottom: 8 }}>
+          {(order.suppliers || []).map((s, i) => (
+            <span key={i} style={styles.supplierTag}>
+              {s.supplier}
+              {s.price ? ` (${s.price.toLocaleString()}원)` : ''}
+            </span>
+          ))}
+        </div>
+
+        <div style={{ ...styles.row, gap: 8 }}>
+          <button onClick={() => toggleExpand(order.id)}>
+            {isExpanded ? '로그 접기' : '주문 로그'}
+          </button>
+          {order.active ? (
+            <button onClick={() => handleCancel(order.id)}>
+              취소
+            </button>
+          ) : (
+            <button className="btn-primary" onClick={() => handleReactivate(order.id)}>
+              재활성화
+            </button>
+          )}
+          <button className="btn-danger" onClick={() => handleDelete(order.id)}>
+            삭제
+          </button>
+        </div>
+
+        {isExpanded && (
+          <div style={{ marginTop: 12 }}>
+            {(order.logs || []).length === 0 ? (
+              <div style={{ color: '#9ca3af', fontSize: 13 }}>주문 로그가 없습니다.</div>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>도매상</th>
+                    <th>수량</th>
+                    <th>성공</th>
+                    <th>시간</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {order.logs.map((log, i) => (
+                    <tr key={i}>
+                      <td>{log.supplier}</td>
+                      <td>{log.ordered_quantity}</td>
+                      <td>
+                        <span className={`badge ${log.success ? 'badge-success' : 'badge-error'}`}>
+                          {log.success ? '성공' : '실패'}
+                        </span>
+                      </td>
+                      <td>
+                        {log.created_at
+                          ? new Date(log.created_at).toLocaleString('ko-KR')
+                          : '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -277,9 +343,30 @@ export default function UrgentPage() {
 
       {error && <div style={styles.error}>{error}</div>}
 
-      {/* Registration Form */}
-      <div style={{ ...styles.section }}>
-        <h2 style={styles.h2}>긴급주문 등록</h2>
+      {/* Tabs */}
+      <div className="tabs">
+        <button
+          className={`tab-btn${activeTab === 'register' ? ' active' : ''}`}
+          onClick={() => setActiveTab('register')}
+        >
+          등록
+        </button>
+        <button
+          className={`tab-btn${activeTab === 'active' ? ' active' : ''}`}
+          onClick={() => setActiveTab('active')}
+        >
+          활성 주문 {activeOrders.length > 0 && `(${activeOrders.length})`}
+        </button>
+        <button
+          className={`tab-btn${activeTab === 'done' ? ' active' : ''}`}
+          onClick={() => setActiveTab('done')}
+        >
+          완료/취소 {doneOrders.length > 0 && `(${doneOrders.length})`}
+        </button>
+      </div>
+
+      {/* Register Tab */}
+      {activeTab === 'register' && (
         <form onSubmit={handleSubmit} style={styles.card}>
           <div style={styles.grid2}>
             <div style={styles.fieldGroup}>
@@ -331,7 +418,7 @@ export default function UrgentPage() {
           <div style={{ marginBottom: 12 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
               <label style={{ ...styles.label, marginBottom: 0 }}>도매상 목록</label>
-              <button type="button" style={styles.btnOutline} onClick={addSupplier}>
+              <button type="button" onClick={addSupplier}>
                 + 도매상 추가
               </button>
             </div>
@@ -369,7 +456,7 @@ export default function UrgentPage() {
                   {suppliers.length > 1 && (
                     <button
                       type="button"
-                      style={{ ...styles.btn('#dc2626'), flexShrink: 0 }}
+                      className="btn-danger btn-sm"
                       onClick={() => removeSupplier(idx)}
                     >
                       삭제
@@ -380,133 +467,44 @@ export default function UrgentPage() {
             ))}
           </div>
 
-          <button type="submit" style={styles.btn('#2563eb')} disabled={submitting}>
+          <button type="submit" className="btn-primary" disabled={submitting}>
             {submitting ? '등록 중...' : '긴급주문 등록'}
           </button>
         </form>
-      </div>
+      )}
 
-      {/* Order List */}
-      <div style={styles.section}>
-        <h2 style={styles.h2}>긴급주문 목록</h2>
-        {loading ? (
-          <div style={styles.empty}>불러오는 중...</div>
-        ) : orders.length === 0 ? (
-          <div style={styles.empty}>등록된 긴급주문이 없습니다.</div>
-        ) : (
-          orders.map((order) => {
-            const status = statusLabel(order);
-            const isExpanded = expanded[order.id];
-            return (
-              <div key={order.id} style={styles.card}>
-                <div style={{ ...styles.row, marginBottom: 8 }}>
-                  <strong style={{ fontSize: 15 }}>{order.product_name}</strong>
-                  {order.unit && (
-                    <span style={{ color: '#6b7280', fontSize: 13 }}>{order.unit}</span>
-                  )}
-                  <span
-                    style={styles.badge(
-                      order.active,
-                      order.filled_quantity >= order.total_quantity
-                    )}
-                  >
-                    {status}
-                  </span>
+      {/* Active Orders Tab */}
+      {activeTab === 'active' && (
+        <div>
+          {loading ? (
+            <div className="empty-state">불러오는 중...</div>
+          ) : activeOrders.length === 0 ? (
+            <div className="empty-state">활성 긴급주문이 없습니다.</div>
+          ) : (
+            <>
+              {activeOrders.length > 0 && (
+                <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 12 }}>
+                  30초마다 자동 갱신됩니다.
                 </div>
+              )}
+              {activeOrders.map(renderOrderCard)}
+            </>
+          )}
+        </div>
+      )}
 
-                <div style={{ ...styles.row, marginBottom: 8 }}>
-                  <span style={{ fontSize: 13, color: '#6b7280' }}>
-                    {order.filled_quantity} / {order.total_quantity}
-                  </span>
-                  <div style={styles.progress(order.filled_quantity, order.total_quantity)}>
-                    <div
-                      style={styles.progressBar(order.filled_quantity, order.total_quantity)}
-                    />
-                  </div>
-                </div>
-
-                <div style={{ marginBottom: 8 }}>
-                  {(order.suppliers || []).map((s, i) => (
-                    <span key={i} style={styles.supplierTag}>
-                      {s.supplier}
-                      {s.price ? ` (${s.price.toLocaleString()}원)` : ''}
-                    </span>
-                  ))}
-                </div>
-
-                <div style={{ ...styles.row, gap: 8 }}>
-                  <button style={styles.btnOutline} onClick={() => toggleExpand(order.id)}>
-                    {isExpanded ? '로그 접기' : '주문 로그'}
-                  </button>
-                  {order.active ? (
-                    <button
-                      style={styles.btn('#6b7280')}
-                      onClick={() => handleCancel(order.id)}
-                    >
-                      취소
-                    </button>
-                  ) : (
-                    <button
-                      style={styles.btn('#2563eb')}
-                      onClick={() => handleReactivate(order.id)}
-                    >
-                      재활성화
-                    </button>
-                  )}
-                  <button
-                    style={styles.btn('#dc2626')}
-                    onClick={() => handleDelete(order.id)}
-                  >
-                    삭제
-                  </button>
-                </div>
-
-                {isExpanded && (
-                  <div style={{ marginTop: 12 }}>
-                    {(order.logs || []).length === 0 ? (
-                      <div style={{ color: '#9ca3af', fontSize: 13 }}>주문 로그가 없습니다.</div>
-                    ) : (
-                      <table style={styles.logTable}>
-                        <thead>
-                          <tr>
-                            <th style={styles.th}>도매상</th>
-                            <th style={styles.th}>수량</th>
-                            <th style={styles.th}>성공</th>
-                            <th style={styles.th}>시간</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {order.logs.map((log, i) => (
-                            <tr key={i}>
-                              <td style={styles.td}>{log.supplier}</td>
-                              <td style={styles.td}>{log.ordered_quantity}</td>
-                              <td style={styles.td}>
-                                <span
-                                  style={{
-                                    color: log.success ? '#16a34a' : '#dc2626',
-                                    fontWeight: 600,
-                                  }}
-                                >
-                                  {log.success ? '성공' : '실패'}
-                                </span>
-                              </td>
-                              <td style={styles.td}>
-                                {log.created_at
-                                  ? new Date(log.created_at).toLocaleString('ko-KR')
-                                  : '-'}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })
-        )}
-      </div>
+      {/* Done/Cancelled Tab */}
+      {activeTab === 'done' && (
+        <div>
+          {loading ? (
+            <div className="empty-state">불러오는 중...</div>
+          ) : doneOrders.length === 0 ? (
+            <div className="empty-state">완료/취소된 주문이 없습니다.</div>
+          ) : (
+            doneOrders.map(renderOrderCard)
+          )}
+        </div>
+      )}
     </div>
   );
 }
