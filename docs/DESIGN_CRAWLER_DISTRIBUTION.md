@@ -1161,7 +1161,22 @@ DOMAE_SIGNING_PRIVATE_KEY=MC4CAQAwBQYDK2VwBCIEI...  # 위에서 생성한 개인
 
 ---
 
-## 9. API 키 발급 UI (팜스퀘어 프론트엔드)
+## 9. 어드민 API (master 전용)
+
+모든 어드민 엔드포인트는 `requireMaster` 미들웨어로 보호 (`req.session.user.role === 'master'`).
+
+| 메서드 | 경로 | 설명 |
+|--------|------|------|
+| GET | `/api/domae/admin/stats` | 대시보드 통계 (API키/크롤러 수, 최근 활성 사용자) |
+| GET | `/api/domae/admin/api-keys` | API 키 전체 목록 (사용 통계 포함) |
+| PUT | `/api/domae/admin/api-keys/:id` | API 키 수정 (isActive, tier) |
+| DELETE | `/api/domae/admin/api-keys/:id` | API 키 삭제 |
+| GET | `/api/domae/admin/crawlers` | 크롤러 전체 목록 |
+| PUT | `/api/domae/admin/crawlers/:id` | 크롤러 수정 (isActive, supportsOrder) |
+
+---
+
+## 10. API 키 발급 UI (팜스퀘어 프론트엔드)
 
 ```
 팜스퀘어 대시보드 > 도매 통합검색 메뉴:
@@ -1192,26 +1207,26 @@ DOMAE_SIGNING_PRIVATE_KEY=MC4CAQAwBQYDK2VwBCIEI...  # 위에서 생성한 개인
 
 ---
 
-## 10. 구현 순서
+## 11. 구현 순서
 
 ```
-Step 1 (서버): Prisma 스키마 + 마이그레이션              (0.5일)
-Step 2 (서버): Ed25519 키 생성 + 환경변수 설정            (0.5시간)
-Step 3 (서버): /api/domae/* 라우터 구현                  (1일)
-Step 4 (서버): 기존 크롤러 10개 코드를 DB에 시딩           (0.5일)
-Step 5 (로컬): loader.py 구현                           (1일)
-Step 6 (로컬): registry.py 변경 + 기존 크롤러 파일 제거    (0.5일)
-Step 7 (로컬): server.py, mcp_server.py 시작 흐름 변경   (0.5일)
-Step 8 (통합): 전체 흐름 테스트                          (0.5일)
-Step 9 (서버): 어드민 API + 크롤러 관리 페이지             (1일)
-Step 10(서버): API 키 발급 UI (팜스퀘어 프론트)           (1일)
-─────────────────────────────────────────────────────
-합계: 약 6~7일
+Step 0 (설계): 크롤러 서버 배포 설계 문서 + 3회 검증       ✅ 완료
+Step 1 (서버): Prisma 스키마 + 마이그레이션               ✅ 완료
+Step 2 (서버): Ed25519 키 생성 + 환경변수 설정             ✅ 완료
+Step 3 (서버): /api/domae/* 라우터 구현                   ✅ 완료
+Step 4 (서버): 기존 크롤러 10개 코드를 DB에 시딩            ✅ 완료
+Step 5 (로컬): loader.py 구현                            ✅ 완료
+Step 6 (로컬): registry.py 변경 + 기존 크롤러 파일 제거     ✅ 완료
+Step 7 (로컬): 셋업 위자드 UI + API 키 검증 엔드포인트      ✅ 완료
+Step 8 (통합): 전체 흐름 테스트                           ✅ 완료
+Step 8.5(로컬): 프론트엔드 빌드 + static 배포              ✅ 완료
+Step 9 (서버): 어드민 API (master 전용)                   ✅ 완료
+Step 10(문서): 설계 문서 최종 업데이트                     ✅ 완료
 ```
 
 ---
 
-## 11. 위험 요소
+## 12. 위험 요소
 
 | 위험 | 대응 |
 |------|------|
