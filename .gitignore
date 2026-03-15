@@ -17,6 +17,9 @@ env/
 node_modules/
 frontend/dist/
 
+# 사용자 데이터 (로컬 설정)
+.maipharm-domae-mcp/
+
 .DS_Store
 *.swp
 *.swo
