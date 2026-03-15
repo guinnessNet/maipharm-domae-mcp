@@ -1,0 +1,92 @@
+"""크롤러 기본 클래스 및 데이터 모델"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+
+import requests
+from bs4 import BeautifulSoup
+
+
+@dataclass
+class SearchResult:
+    """검색 결과 단건"""
+    maker: str = ""
+    product_name: str = ""
+    unit: str = ""
+    insurance_code: str = ""
+    quantity: int = 0
+    price: int = 0
+    supplier: str = ""
+    product_id: str = ""
+
+
+@dataclass
+class OrderResult:
+    """주문 결과"""
+    success: bool = False
+    message: str = ""
+    order_id: str = ""
+
+
+class CrawlerError(Exception):
+    """크롤러 예외"""
+    pass
+
+
+class BaseCrawler(ABC):
+    """도매상 크롤러 기본 클래스.
+
+    모든 크롤러는 이 클래스를 상속하여 login, search, order를 구현.
+    세션은 requests.Session으로 관리하며, 메모리에서만 유지.
+    """
+
+    SUPPLIER_NAME: str = ""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+        self._logged_in = False
+
+    @abstractmethod
+    def login(self, login_id: str, login_pw: str) -> bool:
+        """로그인. 성공 시 True 반환."""
+        ...
+
+    @abstractmethod
+    def search(self, keyword: str) -> list[SearchResult]:
+        """키워드 검색. 결과 리스트 반환."""
+        ...
+
+    def order(self, product_id: str, quantity: int) -> OrderResult:
+        """주문 실행. 미구현 크롤러는 기본 실패 반환."""
+        return OrderResult(success=False, message="주문 미지원 도매상입니다.")
+
+    def get_cart(self) -> list[dict]:
+        """장바구니 조회. 미구현 크롤러는 빈 리스트 반환."""
+        return []
+
+    def ensure_login(self, login_id: str, login_pw: str) -> bool:
+        """로그인 상태 확인 후 필요 시 로그인."""
+        if not self._logged_in:
+            self._logged_in = self.login(login_id, login_pw)
+        return self._logged_in
+
+    def _soup(self, html: str, parser: str = "lxml") -> BeautifulSoup:
+        """HTML → BeautifulSoup"""
+        return BeautifulSoup(html, parser)
+
+    def _safe_int(self, value: str, default: int = 0) -> int:
+        """문자열 → int (쉼표, 공백 제거)"""
+        if not value:
+            return default
+        try:
+            return int(str(value).replace(",", "").replace(" ", "").strip())
+        except (ValueError, TypeError):
+            return default

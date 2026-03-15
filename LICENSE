@@ -1,0 +1,43 @@
+Business Source License 1.1
+
+Parameters
+
+Licensor:             MaiPharm (마이팜)
+Licensed Work:        maipharm-domae-mcp v1.0.0
+                      The Licensed Work is (c) 2026 MaiPharm
+
+Additional Use Grant: You may make use of the Licensed Work, provided that
+                      you may not use the Licensed Work for a Coverage
+                      Purpose. A "Coverage Purpose" is defined as follows:
+
+                      1. Operating a hosted or SaaS service using the
+                         Licensed Work
+                      2. Redistributing modified versions that circumvent
+                         the monitoring interval limit (60 minutes)
+                      3. Operating a service targeting 10 or more
+                         pharmacies
+                      4. Commercial forking and redistribution
+
+                      The following uses are explicitly permitted:
+                      1. Use by an individual or single pharmacy for
+                         their own business operations on a local machine
+                      2. Use for educational and learning purposes
+
+Change Date:          2029-03-15
+
+Change License:       Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed
+Work, please contact: kjh@maipharm.com
+
+Notice
+
+Business Source License 1.1 (BUSL-1.1)
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

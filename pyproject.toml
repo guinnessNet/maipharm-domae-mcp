@@ -18,7 +18,11 @@ dependencies = [
     "python-telegram-bot>=20.0",
     "sendgrid>=6.10.0",
     "cryptography>=41.0.0",
+    "httpx>=0.24.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+domae_mcp = ["static/**/*"]

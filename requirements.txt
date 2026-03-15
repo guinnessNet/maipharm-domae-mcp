@@ -21,3 +21,6 @@ sendgrid>=6.10.0
 
 # 암호화 (계정 정보)
 cryptography>=41.0.0
+
+# HTTP 클라이언트 (API 키 검증)
+httpx>=0.24.0
