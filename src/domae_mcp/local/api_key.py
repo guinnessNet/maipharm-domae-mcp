@@ -10,8 +10,8 @@ from domae_mcp.local.config import ConfigManager
 
 logger = logging.getLogger(__name__)
 
-VERIFY_URL = "https://api.domae.kr/api/verify"
-HEARTBEAT_URL = "https://api.domae.kr/api/heartbeat"
+VERIFY_URL = "https://api.pharmsq.com/api/domae/verify"
+HEARTBEAT_URL = "https://api.pharmsq.com/api/domae/heartbeat"
 OFFLINE_GRACE_DAYS = 7
 
 
