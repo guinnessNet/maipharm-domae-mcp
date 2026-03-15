@@ -29,3 +29,16 @@ frontend/dist/
 .vscode/
 *.iml
 .claude-personal/
+
+# 크롤러 원본 코드 (비공개 — 팜스퀘어 서버에서 배포)
+# base.py, registry.py, loader.py, __init__.py는 커밋 대상
+src/domae_mcp/core/crawlers/geoweb.py
+src/domae_mcp/core/crawlers/boksan.py
+src/domae_mcp/core/crawlers/inchun.py
+src/domae_mcp/core/crawlers/tjpharm.py
+src/domae_mcp/core/crawlers/hmpmall.py
+src/domae_mcp/core/crawlers/beakje.py
+src/domae_mcp/core/crawlers/picomall.py
+src/domae_mcp/core/crawlers/saeropharm.py
+src/domae_mcp/core/crawlers/sdpharm.py
+src/domae_mcp/core/crawlers/upharmmall.py

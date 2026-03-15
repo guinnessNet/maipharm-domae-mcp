@@ -20,6 +20,8 @@ SEED_CREDENTIALS = {
     "백제": {"login_id": "2024782", "login_pw": "a123456"},
     "피코": {"login_id": "ptopenpharm", "login_pw": "open8864!!"},
     "새로팜": {"login_id": "ptopen2900", "login_pw": "open2900"},
+    "신덕팜": {"login_id": "starlightph1", "login_pw": "qwertyu71!"},
+    "대전동원약품": {"login_id": "starlightph1", "login_pw": "qwertyu71!"},
 }
 
 TEST_KEYWORD = "아목시실린"

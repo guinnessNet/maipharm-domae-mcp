@@ -44,6 +44,8 @@ def _register_all():
     from domae_mcp.core.crawlers.beakje import BeakjeCrawler
     from domae_mcp.core.crawlers.picomall import PicomallCrawler
     from domae_mcp.core.crawlers.saeropharm import SaeropharmCrawler
+    from domae_mcp.core.crawlers.sdpharm import SdpharmCrawler
+    from domae_mcp.core.crawlers.upharmmall import UpharmmallCrawler
 
     CrawlerRegistry.register("지오영", GeoWebCrawler)
     CrawlerRegistry.register("복산", BoksanCrawler)
@@ -53,6 +55,8 @@ def _register_all():
     CrawlerRegistry.register("백제", BeakjeCrawler)
     CrawlerRegistry.register("피코", PicomallCrawler)
     CrawlerRegistry.register("새로팜", SaeropharmCrawler)
+    CrawlerRegistry.register("신덕팜", SdpharmCrawler)
+    CrawlerRegistry.register("대전동원약품", UpharmmallCrawler)
 
 
 _register_all()
