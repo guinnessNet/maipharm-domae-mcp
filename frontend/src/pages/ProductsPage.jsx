@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import client from '../api/client';
 
 const styles = {
@@ -23,13 +23,6 @@ const styles = {
   section: {
     marginBottom: 32,
   },
-  card: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    padding: 16,
-    background: '#fff',
-    marginBottom: 12,
-  },
   statusBar: {
     display: 'flex',
     alignItems: 'center',
@@ -41,45 +34,10 @@ const styles = {
     marginBottom: 24,
     flexWrap: 'wrap',
   },
-  statusDot: (running) => ({
-    width: 10,
-    height: 10,
-    borderRadius: '50%',
-    background: running ? '#16a34a' : '#9ca3af',
-    flexShrink: 0,
-  }),
   statusText: {
     fontSize: 14,
     color: '#374151',
     flex: 1,
-  },
-  btn: (color = '#2563eb') => ({
-    padding: '8px 16px',
-    borderRadius: 6,
-    border: 'none',
-    background: color,
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: 500,
-    cursor: 'pointer',
-  }),
-  btnSmall: (color = '#dc2626') => ({
-    padding: '4px 12px',
-    borderRadius: 6,
-    border: 'none',
-    background: color,
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: 500,
-    cursor: 'pointer',
-  }),
-  input: {
-    padding: '8px 12px',
-    borderRadius: 6,
-    border: '1px solid #d1d5db',
-    fontSize: 14,
-    outline: 'none',
-    boxSizing: 'border-box',
   },
   addForm: {
     display: 'flex',
@@ -87,53 +45,6 @@ const styles = {
     alignItems: 'center',
     marginBottom: 16,
     flexWrap: 'wrap',
-  },
-  tableWrap: {
-    overflowX: 'auto',
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    background: '#fff',
-  },
-  table: {
-    width: '100%',
-    borderCollapse: 'collapse',
-    fontSize: 14,
-  },
-  th: {
-    textAlign: 'left',
-    padding: '10px 12px',
-    borderBottom: '2px solid #e5e7eb',
-    background: '#f9fafb',
-    color: '#6b7280',
-    fontWeight: 600,
-    fontSize: 12,
-  },
-  td: {
-    padding: '10px 12px',
-    borderBottom: '1px solid #f3f4f6',
-    color: '#111',
-  },
-  empty: {
-    textAlign: 'center',
-    color: '#9ca3af',
-    padding: 40,
-    fontSize: 14,
-  },
-  error: {
-    color: '#dc2626',
-    fontSize: 14,
-    padding: '8px 12px',
-    background: '#fef2f2',
-    borderRadius: 6,
-    marginBottom: 12,
-  },
-  success: {
-    color: '#16a34a',
-    fontSize: 14,
-    padding: '8px 12px',
-    background: '#f0fdf4',
-    borderRadius: 6,
-    marginBottom: 12,
   },
 };
 
@@ -148,6 +59,7 @@ export default function ProductsPage() {
   // Monitor status
   const [monitorStatus, setMonitorStatus] = useState({ running: false, last_run: null });
   const [monitorLoading, setMonitorLoading] = useState(false);
+  const pollRef = useRef(null);
 
   const fetchProducts = useCallback(async () => {
     try {
@@ -176,6 +88,24 @@ export default function ProductsPage() {
     fetchProducts();
     fetchMonitorStatus();
   }, [fetchProducts, fetchMonitorStatus]);
+
+  // Auto-poll monitor status when running (15s)
+  useEffect(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    if (monitorStatus.running) {
+      pollRef.current = setInterval(() => {
+        fetchMonitorStatus();
+      }, 15000);
+    }
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+      }
+    };
+  }, [monitorStatus.running, fetchMonitorStatus]);
 
   const handleAdd = async (e) => {
     e.preventDefault();
@@ -242,14 +172,19 @@ export default function ProductsPage() {
     <div style={styles.container}>
       <h1 style={styles.h1}>모니터링 제품 관리</h1>
 
-      {error && <div style={styles.error}>{error}</div>}
-      {message && <div style={styles.success}>{message}</div>}
+      {error && <div className="error-box" style={{ marginBottom: '0.75rem' }}>{error}</div>}
+      {message && <div className="success-box" style={{ marginBottom: '0.75rem' }}>{message}</div>}
 
       {/* Monitor Status */}
       <div style={styles.statusBar}>
-        <div style={styles.statusDot(monitorStatus.running)} />
+        <span className={`status-dot ${monitorStatus.running ? 'status-dot-active' : 'status-dot-inactive'}`} />
         <span style={styles.statusText}>
           모니터링 {monitorStatus.running ? '실행 중' : '중지됨'}
+          {monitorStatus.running && (
+            <span className="text-secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+              (15초마다 상태 갱신)
+            </span>
+          )}
           {monitorStatus.last_run && (
             <span style={{ color: '#9ca3af', marginLeft: 12, fontSize: 13 }}>
               마지막 실행: {new Date(monitorStatus.last_run).toLocaleString('ko-KR')}
@@ -258,7 +193,7 @@ export default function ProductsPage() {
         </span>
         {monitorStatus.running ? (
           <button
-            style={styles.btn('#dc2626')}
+            className="btn-danger"
             onClick={handleMonitorStop}
             disabled={monitorLoading}
           >
@@ -266,7 +201,7 @@ export default function ProductsPage() {
           </button>
         ) : (
           <button
-            style={styles.btn('#16a34a')}
+            className="btn-success"
             onClick={handleMonitorStart}
             disabled={monitorLoading}
           >
@@ -280,12 +215,13 @@ export default function ProductsPage() {
         <h2 style={styles.h2}>제품 추가</h2>
         <form onSubmit={handleAdd} style={styles.addForm}>
           <input
-            style={{ ...styles.input, flex: 1, minWidth: 200 }}
+            type="text"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             placeholder="보험코드 또는 제품명 입력"
+            style={{ flex: 1, minWidth: 200 }}
           />
-          <button type="submit" style={styles.btn('#2563eb')} disabled={adding}>
+          <button type="submit" className="btn-primary" disabled={adding}>
             {adding ? '추가 중...' : '추가'}
           </button>
         </form>
@@ -295,41 +231,39 @@ export default function ProductsPage() {
       <div style={styles.section}>
         <h2 style={styles.h2}>제품 목록</h2>
         {loading ? (
-          <div style={styles.empty}>불러오는 중...</div>
+          <div className="empty-state">불러오는 중...</div>
         ) : products.length === 0 ? (
-          <div style={styles.empty}>등록된 모니터링 제품이 없습니다.</div>
+          <div className="empty-state">등록된 모니터링 제품이 없습니다.</div>
         ) : (
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>ID</th>
-                  <th style={styles.th}>제품명 / 보험코드</th>
-                  <th style={styles.th}>설명</th>
-                  <th style={{ ...styles.th, textAlign: 'center' }}>관리</th>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>제품명 / 보험코드</th>
+                <th>설명</th>
+                <th style={{ textAlign: 'center' }}>관리</th>
+              </tr>
+            </thead>
+            <tbody>
+              {products.map((product) => (
+                <tr key={product.id}>
+                  <td className="text-secondary" style={{ width: 60 }}>{product.id}</td>
+                  <td>{product.name}</td>
+                  <td className="text-secondary">
+                    {product.description || '-'}
+                  </td>
+                  <td style={{ textAlign: 'center', width: 80 }}>
+                    <button
+                      className="btn-danger btn-sm"
+                      onClick={() => handleDelete(product.id)}
+                    >
+                      삭제
+                    </button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {products.map((product) => (
-                  <tr key={product.id}>
-                    <td style={{ ...styles.td, color: '#9ca3af', width: 60 }}>{product.id}</td>
-                    <td style={styles.td}>{product.name}</td>
-                    <td style={{ ...styles.td, color: '#6b7280' }}>
-                      {product.description || '-'}
-                    </td>
-                    <td style={{ ...styles.td, textAlign: 'center', width: 80 }}>
-                      <button
-                        style={styles.btnSmall('#dc2626')}
-                        onClick={() => handleDelete(product.id)}
-                      >
-                        삭제
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import client from '../api/client';
 
 const PAGE_SIZE = 50;
@@ -16,42 +16,6 @@ const styles = {
     marginBottom: 24,
     color: '#111',
   },
-  tableWrap: {
-    overflowX: 'auto',
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    background: '#fff',
-  },
-  table: {
-    width: '100%',
-    borderCollapse: 'collapse',
-    fontSize: 14,
-    minWidth: 700,
-  },
-  th: {
-    textAlign: 'left',
-    padding: '10px 12px',
-    borderBottom: '2px solid #e5e7eb',
-    background: '#f9fafb',
-    color: '#6b7280',
-    fontWeight: 600,
-    fontSize: 12,
-    whiteSpace: 'nowrap',
-  },
-  td: {
-    padding: '10px 12px',
-    borderBottom: '1px solid #f3f4f6',
-    color: '#111',
-  },
-  badge: (success) => ({
-    display: 'inline-block',
-    padding: '2px 10px',
-    borderRadius: 12,
-    fontSize: 12,
-    fontWeight: 600,
-    color: '#fff',
-    background: success ? '#16a34a' : '#dc2626',
-  }),
   pagination: {
     display: 'flex',
     alignItems: 'center',
@@ -59,33 +23,9 @@ const styles = {
     gap: 16,
     marginTop: 16,
   },
-  btn: (disabled) => ({
-    padding: '8px 18px',
-    borderRadius: 6,
-    border: '1px solid #d1d5db',
-    background: disabled ? '#f3f4f6' : '#fff',
-    color: disabled ? '#9ca3af' : '#374151',
-    fontSize: 14,
-    cursor: disabled ? 'default' : 'pointer',
-    fontWeight: 500,
-  }),
   pageInfo: {
     fontSize: 14,
     color: '#6b7280',
-  },
-  empty: {
-    textAlign: 'center',
-    color: '#9ca3af',
-    padding: 40,
-    fontSize: 14,
-  },
-  error: {
-    color: '#dc2626',
-    fontSize: 14,
-    padding: '8px 12px',
-    background: '#fef2f2',
-    borderRadius: 6,
-    marginBottom: 12,
   },
   message: {
     maxWidth: 200,
@@ -102,6 +42,11 @@ export default function HistoryPage() {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
 
+  // Client-side filters
+  const [filterSupplier, setFilterSupplier] = useState('');
+  const [filterResult, setFilterResult] = useState('all'); // all | success | fail
+  const [filterKeyword, setFilterKeyword] = useState('');
+
   const fetchOrders = useCallback(async (currentOffset) => {
     try {
       setLoading(true);
@@ -110,7 +55,6 @@ export default function HistoryPage() {
         params: { limit: PAGE_SIZE, offset: currentOffset },
       });
       const data = res.data;
-      // API may return {orders: [...]} or just an array
       const list = Array.isArray(data) ? data : data.orders || [];
       setOrders(list);
       setHasMore(list.length >= PAGE_SIZE);
@@ -125,66 +69,128 @@ export default function HistoryPage() {
     fetchOrders(offset);
   }, [offset, fetchOrders]);
 
+  // Unique supplier names for dropdown
+  const supplierOptions = useMemo(() => {
+    const set = new Set(orders.map((o) => o.supplier).filter(Boolean));
+    return Array.from(set).sort();
+  }, [orders]);
+
+  // Filtered orders
+  const filteredOrders = useMemo(() => {
+    return orders.filter((order) => {
+      if (filterSupplier && order.supplier !== filterSupplier) return false;
+      if (filterResult === 'success' && !order.success) return false;
+      if (filterResult === 'fail' && order.success) return false;
+      if (filterKeyword) {
+        const kw = filterKeyword.toLowerCase();
+        const name = (order.product_name || '').toLowerCase();
+        if (!name.includes(kw)) return false;
+      }
+      return true;
+    });
+  }, [orders, filterSupplier, filterResult, filterKeyword]);
+
   const page = Math.floor(offset / PAGE_SIZE) + 1;
 
   return (
     <div style={styles.container}>
       <h1 style={styles.h1}>주문이력</h1>
 
-      {error && <div style={styles.error}>{error}</div>}
+      {error && <div className="error-box" style={{ marginBottom: '0.75rem' }}>{error}</div>}
 
       {loading ? (
-        <div style={styles.empty}>불러오는 중...</div>
+        <div className="empty-state">불러오는 중...</div>
       ) : orders.length === 0 ? (
-        <div style={styles.empty}>주문 이력이 없습니다.</div>
+        <div className="empty-state">주문 이력이 없습니다.</div>
       ) : (
         <>
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>날짜</th>
-                  <th style={styles.th}>도매상</th>
-                  <th style={styles.th}>제품명</th>
-                  <th style={styles.th}>단위</th>
-                  <th style={styles.th}>수량</th>
-                  <th style={styles.th}>가격</th>
-                  <th style={styles.th}>결과</th>
-                  <th style={styles.th}>메시지</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map((order, idx) => (
-                  <tr key={order.id || idx}>
-                    <td style={{ ...styles.td, whiteSpace: 'nowrap', fontSize: 13 }}>
-                      {order.created_at
-                        ? new Date(order.created_at).toLocaleString('ko-KR')
-                        : '-'}
-                    </td>
-                    <td style={styles.td}>{order.supplier || '-'}</td>
-                    <td style={styles.td}>{order.product_name || '-'}</td>
-                    <td style={styles.td}>{order.unit || '-'}</td>
-                    <td style={styles.td}>{order.quantity ?? '-'}</td>
-                    <td style={styles.td}>
-                      {order.price != null ? order.price.toLocaleString() + '원' : '-'}
-                    </td>
-                    <td style={styles.td}>
-                      <span style={styles.badge(order.success)}>
-                        {order.success ? '성공' : '실패'}
-                      </span>
-                    </td>
-                    <td style={{ ...styles.td, ...styles.message }} title={order.message || ''}>
-                      {order.message || '-'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {/* Filter Bar */}
+          <div className="filter-bar">
+            <select
+              value={filterSupplier}
+              onChange={(e) => setFilterSupplier(e.target.value)}
+            >
+              <option value="">전체 도매상</option>
+              {supplierOptions.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+
+            <button
+              className={filterResult === 'all' ? 'btn-primary btn-sm' : 'btn-sm'}
+              onClick={() => setFilterResult('all')}
+            >
+              전체
+            </button>
+            <button
+              className={filterResult === 'success' ? 'btn-success btn-sm' : 'btn-sm'}
+              onClick={() => setFilterResult('success')}
+            >
+              성공
+            </button>
+            <button
+              className={filterResult === 'fail' ? 'btn-danger btn-sm' : 'btn-sm'}
+              onClick={() => setFilterResult('fail')}
+            >
+              실패
+            </button>
+
+            <input
+              type="text"
+              value={filterKeyword}
+              onChange={(e) => setFilterKeyword(e.target.value)}
+              placeholder="제품명 검색"
+              style={{ minWidth: 140 }}
+            />
+
+            <span className="text-secondary" style={{ fontSize: '0.85rem', marginLeft: 'auto' }}>
+              전체 {filteredOrders.length}건
+            </span>
           </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>날짜</th>
+                <th>도매상</th>
+                <th>제품명</th>
+                <th>단위</th>
+                <th>수량</th>
+                <th>가격</th>
+                <th>결과</th>
+                <th>메시지</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredOrders.map((order, idx) => (
+                <tr key={order.id || idx}>
+                  <td style={{ whiteSpace: 'nowrap', fontSize: '0.8rem' }}>
+                    {order.ordered_at
+                      ? new Date(order.ordered_at).toLocaleString('ko-KR')
+                      : '-'}
+                  </td>
+                  <td>{order.supplier || '-'}</td>
+                  <td>{order.product_name || '-'}</td>
+                  <td>{order.unit || '-'}</td>
+                  <td>{order.quantity ?? '-'}</td>
+                  <td>
+                    {order.price != null ? order.price.toLocaleString() + '원' : '-'}
+                  </td>
+                  <td>
+                    <span className={`badge ${order.success ? 'badge-success' : 'badge-error'}`}>
+                      {order.success ? '성공' : '실패'}
+                    </span>
+                  </td>
+                  <td style={styles.message} title={order.message || ''}>
+                    {order.message || '-'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
 
           <div style={styles.pagination}>
             <button
-              style={styles.btn(offset === 0)}
               disabled={offset === 0}
               onClick={() => setOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
             >
@@ -192,7 +198,6 @@ export default function HistoryPage() {
             </button>
             <span style={styles.pageInfo}>페이지 {page}</span>
             <button
-              style={styles.btn(!hasMore)}
               disabled={!hasMore}
               onClick={() => setOffset((prev) => prev + PAGE_SIZE)}
             >
