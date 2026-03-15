@@ -127,7 +127,7 @@ echo [2/3] pip 업그레이드 중...
 python -m pip install --upgrade pip --quiet 2>nul
 
 echo [3/3] 도매 통합검색 설치 중...
-pip install -e . --quiet
+pip install . --quiet
 if errorlevel 1 (
     echo.
     echo [오류] 패키지 설치에 실패했습니다.
@@ -144,7 +144,9 @@ echo.
 echo   실행: start.bat 더블클릭
 echo   접속: http://localhost:5900
 echo.
-echo   처음 사용하시면 docs\USER_GUIDE.md를
-echo   읽어보세요.
+echo   처음 사용 시:
+echo   1. 팜스퀘어(pharmsq.com)에서 무료 가입
+echo   2. 설정 ^> 도매 통합검색 ^> API 키 발급
+echo   3. start.bat 실행 ^> 설정 ^> API 키 입력
 echo.
 pause
