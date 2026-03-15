@@ -16,19 +16,39 @@ sys.path.insert(0, "src")
 
 from domae_mcp.core.crawlers.base import BaseCrawler
 
-# domae-v2 _seed_credentials() 기반
-SEED_CREDENTIALS = {
-    "지오영": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***"},
-    "복산": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***"},
-    "인천": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***!!"},
-    "티제이팜": {"login_id": "***REMOVED***", "login_pw": "2900"},
-    "HMP": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***!!"},
-    "백제": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***"},
-    "피코": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***!!"},
-    "새로팜": {"login_id": "pt***REMOVED***", "login_pw": "***REMOVED***"},
-    "신덕팜": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***"},
-    "대전동원약품": {"login_id": "***REMOVED***", "login_pw": "***REMOVED***"},
-}
+# 크리덴셜은 로컬 설정 파일에서 로드 (공개 레포에 노출 금지)
+# ~/.maipharm-domae-mcp/config.json의 credentials 또는
+# tests/.test_credentials.json (gitignore 대상) 사용
+def _load_test_credentials() -> dict:
+    """테스트용 크리덴셜 로드. 로컬 설정 파일 → 테스트 전용 파일 순."""
+    # 1) ConfigManager에서 로드 시도
+    try:
+        from domae_mcp.local.config import ConfigManager, SUPPLIERS
+        config = ConfigManager()
+        creds = {}
+        for supplier in SUPPLIERS:
+            c = config.get_credentials(supplier)
+            if c.get("login_id") and c.get("login_pw"):
+                creds[supplier] = c
+        if creds:
+            return creds
+    except Exception:
+        pass
+
+    # 2) tests/.test_credentials.json 에서 로드
+    cred_file = Path(__file__).parent / ".test_credentials.json"
+    if cred_file.exists():
+        import json
+        return json.loads(cred_file.read_text(encoding="utf-8"))
+
+    print("⚠️  테스트 크리덴셜 없음. 다음 중 하나를 설정하세요:")
+    print("   1) ~/.maipharm-domae-mcp/config.json에 도매 계정 등록")
+    print("   2) tests/.test_credentials.json 파일 생성")
+    print('      예: {"지오영": {"login_id": "xxx", "login_pw": "yyy"}, ...}')
+    return {}
+
+
+SEED_CREDENTIALS = _load_test_credentials()
 
 # 크롤러 모듈명 → 도매상명 매핑
 CRAWLER_MODULES = {

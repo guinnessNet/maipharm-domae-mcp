@@ -36,31 +36,80 @@ export default function SettingsPage() {
 /* ---------- API Key Tab ---------- */
 function ApiKeyTab() {
   const [apiKey, setApiKey] = useState('');
+  const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState(null);
+  const [info, setInfo] = useState(null);
 
-  const handleVerify = () => {
-    // TODO: 실제 검증 로직 구현
-    setStatus({ success: true, message: '검증 기능은 추후 구현됩니다.' });
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await client.get('/settings/setup-status');
+        if (data.api_key_set) {
+          setApiKey(data.api_key_prefix);
+          setInfo({
+            crawlerCount: data.crawler_count,
+            credentialsConfigured: data.credentials_configured,
+          });
+        }
+      } catch {}
+    })();
+  }, []);
+
+  const handleVerify = async () => {
+    if (!apiKey.trim()) return;
+    setLoading(true);
+    setStatus(null);
+    try {
+      const { data } = await client.post('/settings/api-key/verify', { api_key: apiKey.trim() });
+      setStatus(data);
+      if (data.valid) {
+        setInfo({ crawlerCount: data.crawler_count });
+      }
+    } catch (err) {
+      setStatus({ valid: false, message: err.response?.data?.detail || '서버 연결 실패' });
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
     <div className="card">
       <h3 style={{ marginBottom: '1rem' }}>API 키 설정</h3>
+
+      {info && info.crawlerCount > 0 && (
+        <div className="success-box" style={{ marginBottom: '1rem', maxWidth: '500px' }}>
+          크롤러 {info.crawlerCount}개 활성
+          {info.credentialsConfigured !== undefined && ` | 계정 ${info.credentialsConfigured}개 설정됨`}
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: '0.5rem', maxWidth: '500px' }}>
         <input
           type="text"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
-          placeholder="API 키를 입력하세요"
-          style={{ flex: 1 }}
+          placeholder="dmk_free_xxxxxxxxxxxxxxxx"
+          style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
+          onKeyDown={(e) => e.key === 'Enter' && handleVerify()}
         />
-        <button className="btn-primary" onClick={handleVerify}>검증</button>
+        <button className="btn-primary" onClick={handleVerify} disabled={loading || !apiKey.trim()}>
+          {loading ? <span className="loading-spinner" /> : '검증 및 저장'}
+        </button>
       </div>
       {status && (
-        <div className={status.success ? 'success-box' : 'error-box'} style={{ marginTop: '0.75rem', maxWidth: '500px' }}>
-          {status.message}
+        <div className={status.valid ? 'success-box' : 'error-box'} style={{ marginTop: '0.75rem', maxWidth: '500px' }}>
+          <div>{status.message}</div>
+          {status.valid && status.tier && (
+            <div style={{ fontSize: '0.8rem', marginTop: '0.3rem' }}>
+              등급: {status.tier} | 약국: {status.pharmacy_name || '-'}
+            </div>
+          )}
         </div>
       )}
+
+      <p className="text-secondary" style={{ fontSize: '0.8rem', marginTop: '0.75rem', maxWidth: '500px' }}>
+        API 키를 변경하면 기존 크롤러 캐시가 무효화되고 새로 다운로드됩니다.
+      </p>
     </div>
   );
 }

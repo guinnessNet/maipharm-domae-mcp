@@ -40,7 +40,7 @@ class ApiKeyManager:
                 "pharmacy_name": "마이약국",
                 "features": {
                     "min_interval": 60,
-                    "max_crawlers": 8,
+                    "max_crawlers": 10,
                     "telegram": True,
                     "kakao": False,
                 },
@@ -51,9 +51,9 @@ class ApiKeyManager:
         """
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
+                resp = await client.post(
                     VERIFY_URL,
-                    params={"key": api_key},
+                    headers={"Authorization": f"Bearer {api_key}"},
                     timeout=5.0,
                 )
 
@@ -80,7 +80,7 @@ class ApiKeyManager:
                     "pharmacy_name": "",
                     "features": {
                         "min_interval": 60,
-                        "max_crawlers": 8,
+                        "max_crawlers": 10,
                         "telegram": True,
                         "kakao": False,
                     },
@@ -121,12 +121,11 @@ class ApiKeyManager:
             async with httpx.AsyncClient() as client:
                 await client.post(
                     HEARTBEAT_URL,
+                    headers={"Authorization": f"Bearer {api_key}"},
                     json={
-                        "key": api_key,
                         "version": __version__,
                         "search_count": stats.get("search_count", 0),
                         "order_count": stats.get("order_count", 0),
-                        "active_monitors": stats.get("active_monitors", 0),
                     },
                     timeout=5.0,
                 )
