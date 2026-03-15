@@ -1,121 +1,111 @@
 """지오영 크롤러
 
-기본 패턴의 도매상 크롤러.
-로그인 → 세션 쿠키 유지 → 검색/주문 수행.
+domae-v2에서 이식. 로그인 → 세션 쿠키 유지 → 검색/주문 수행.
 """
 
-from domae_mcp.core.crawlers.base import (
-    BaseCrawler,
-    CrawlerError,
-    OrderResult,
-    SearchResult,
-)
+import urllib3
+from typing import List
+from bs4 import BeautifulSoup as bs
+from domae_mcp.core.crawlers.base import BaseCrawler, SearchResult, OrderResult
 
-# TODO: 실제 도메인으로 교체
-BASE_URL = "https://www.geoweb.co.kr"
-LOGIN_URL = f"{BASE_URL}/member/login_proc.asp"
-SEARCH_URL = f"{BASE_URL}/product/search.asp"
-ORDER_URL = f"{BASE_URL}/order/order_proc.asp"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class GeoWebCrawler(BaseCrawler):
-    """지오영 도매 크롤러.
-
-    - 표준 form POST 로그인
-    - 검색: GET 파라미터로 키워드 전달, HTML 테이블 파싱
-    - 주문: POST로 product_id + 수량 전달
-    """
-
     SUPPLIER_NAME = "지오영"
 
     def login(self, login_id: str, login_pw: str) -> bool:
-        """지오영 로그인.
-
-        POST form 데이터로 아이디/비밀번호 전송.
-        성공 시 세션 쿠키가 유지됨.
-        """
-        try:
-            # TODO: 실제 form 필드명 확인 필요
-            payload = {
-                "user_id": login_id,
-                "user_pw": login_pw,
-            }
-            resp = self.session.post(LOGIN_URL, data=payload)
-            resp.raise_for_status()
-
-            # TODO: 로그인 성공 판별 로직 (리다이렉트 URL, 응답 내 특정 문자열 등)
-            # 예: "로그아웃" 텍스트가 응답에 있으면 성공
-            if "logout" in resp.text.lower() or "로그아웃" in resp.text:
-                self._logged_in = True
-                return True
-
-            return False
-        except Exception as e:
-            raise CrawlerError(f"[지오영] 로그인 실패: {e}") from e
+        self._login_id = login_id
+        self._login_pw = login_pw
+        login_url = "https://order.geoweb.kr/Member/Login"
+        login_info = {
+            "LoginID": login_id,
+            "Password": login_pw,
+        }
+        resp = self.session.post(login_url, data=login_info, verify=False)
+        if resp.status_code == 200:
+            self._logged_in = True
+            return True
+        return False
 
     def search(self, keyword: str) -> list[SearchResult]:
-        """지오영 검색.
+        self.ensure_login(self._login_id, self._login_pw)
+        results = []
 
-        GET 요청으로 키워드 전달 → HTML 테이블에서 결과 파싱.
-        """
-        try:
-            # TODO: 실제 파라미터명 확인 필요
-            params = {"search_word": keyword}
-            resp = self.session.get(SEARCH_URL, params=params)
-            resp.raise_for_status()
+        search_url = "https://order.geoweb.kr/Home/PartialSearchProduct"
+        ajax_url = "https://order.geoweb.kr/Home/PartialProductInfo/"
 
-            soup = self._soup(resp.text)
-            results: list[SearchResult] = []
-
-            # TODO: 실제 HTML 구조에 맞게 셀렉터 수정
-            rows = soup.select("table.product-list tr")
-            for row in rows:
-                cols = row.select("td")
-                if len(cols) < 6:
-                    continue
-
-                results.append(SearchResult(
-                    maker=cols[0].get_text(strip=True),
-                    product_name=cols[1].get_text(strip=True),
-                    unit=cols[2].get_text(strip=True),
-                    insurance_code=cols[3].get_text(strip=True),
-                    quantity=self._safe_int(cols[4].get_text(strip=True)),
-                    price=self._safe_int(cols[5].get_text(strip=True)),
-                    supplier=self.SUPPLIER_NAME,
-                    # TODO: product_id 추출 방식 확인 (hidden input, data 속성 등)
-                    product_id=row.get("data-id", ""),
-                ))
-
+        resp = self.session.post(search_url, data={"srchText": keyword}, verify=False)
+        if resp.status_code != 200:
             return results
-        except CrawlerError:
-            raise
-        except Exception as e:
-            raise CrawlerError(f"[지오영] 검색 실패: {e}") from e
+
+        soup = bs(resp.text, "html.parser")
+        trs = soup.find_all("tr")
+
+        for tr in trs:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+
+            if tds[0].text == "검색된 제품이 없습니다.":
+                break
+
+            li_element = tds[6].select_one("li:first-child")
+            if not li_element:
+                continue
+
+            product_code = li_element.get_text(strip=True)
+            resp2 = self.session.post(ajax_url + product_code, data={"num": 0}, verify=False)
+            soup2 = bs(resp2.text, "html.parser")
+
+            # 타센터 재고 합산
+            other_center = soup2.select_one("div.another_center_board > table > tbody > tr > td:nth-child(2)")
+            other_qty = int(other_center.get_text(strip=True).replace(",", "")) if other_center else 0
+
+            price_td = soup2.select_one("table > tbody > tr:nth-child(3) > td")
+            price = price_td.get_text(strip=True) if price_td else "0"
+
+            local_qty = int(tds[5].get_text(strip=True).replace(",", ""))
+            total_qty = local_qty + other_qty
+
+            try:
+                price_int = int(str(price).replace(",", ""))
+            except ValueError:
+                price_int = 0
+
+            results.append(SearchResult(
+                maker=tds[2].get_text(strip=True),
+                product_name=tds[3].get_text(strip=True),
+                unit=tds[4].get_text(strip=True),
+                insurance_code=tds[1].get_text(strip=True),
+                quantity=total_qty,
+                supplier=self.SUPPLIER_NAME,
+                price=price_int,
+                product_id=product_code,
+            ))
+
+        return results
 
     def order(self, product_id: str, quantity: int) -> OrderResult:
-        """지오영 주문.
+        """지오영 주문: 장바구니 담기 → 주문 전송"""
+        self.ensure_login(self._login_id, self._login_pw)
 
-        POST로 상품 ID와 수량을 전달하여 주문 실행.
-        """
-        try:
-            # TODO: 실제 form 필드명 확인 필요
-            payload = {
-                "product_id": product_id,
-                "qty": str(quantity),
-            }
-            resp = self.session.post(ORDER_URL, data=payload)
-            resp.raise_for_status()
+        # 1. 장바구니 담기
+        cart_url = "https://order.geoweb.kr/Home/DataCart/add"
+        cart_data = {
+            "productCode": product_id,
+            "moveCode": "",
+            "orderQty": str(quantity),
+        }
+        resp = self.session.post(cart_url, data=cart_data, verify=False)
+        if resp.status_code != 200:
+            return OrderResult(success=False, message=f"장바구니 담기 실패 (status: {resp.status_code})")
 
-            # TODO: 주문 성공 판별 로직
-            if "주문완료" in resp.text or "success" in resp.text.lower():
-                return OrderResult(
-                    success=True,
-                    message="주문 성공",
-                    order_id="",  # TODO: 응답에서 주문번호 파싱
-                )
-
-            return OrderResult(success=False, message="주문 실패: 응답 확인 필요")
-        except CrawlerError:
-            raise
-        except Exception as e:
-            raise CrawlerError(f"[지오영] 주문 실패: {e}") from e
+        # 2. 주문 전송
+        order_url = "https://order.geoweb.kr/Home/DataOrder"
+        order_data = {"p_desc": ""}
+        resp2 = self.session.post(order_url, data=order_data, verify=False)
+        if resp2.status_code == 200:
+            return OrderResult(success=True, message="주문 전송 완료")
+        else:
+            return OrderResult(success=False, message=f"주문 전송 실패 (status: {resp2.status_code})")

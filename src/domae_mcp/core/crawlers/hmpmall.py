@@ -2,172 +2,174 @@
 
 특이사항:
 - DWR(Direct Web Remoting) 프로토콜 기반
-- 일반 HTML form이 아닌 DWR 호출로 데이터 조회
 - 주문 기능 미구현
 """
 
-from domae_mcp.core.crawlers.base import (
-    BaseCrawler,
-    CrawlerError,
-    SearchResult,
-)
+import re
+import json
+from typing import List
 
-# TODO: 실제 도메인으로 교체
-BASE_URL = "https://www.hmpmall.co.kr"
-LOGIN_URL = f"{BASE_URL}/member/login_proc.asp"
-# DWR 엔드포인트: 검색은 DWR 프로토콜로 호출
-DWR_URL = f"{BASE_URL}/dwr/call/plaincall/"
+from bs4 import BeautifulSoup as bs
+
+from domae_mcp.core.crawlers.base import BaseCrawler, SearchResult, OrderResult
 
 
 class HmpMallCrawler(BaseCrawler):
-    """HMP 도매 크롤러 (DWR 프로토콜).
-
-    - 로그인: 표준 form POST
-    - 검색: DWR(Direct Web Remoting) 프로토콜 호출
-      - DWR은 Java 서버의 메서드를 JavaScript에서 호출하는 프레임워크
-      - HTTP POST로 특수 포맷의 요청 전송, 커스텀 응답 파싱 필요
-    - 주문: 미구현 (복잡한 DWR 주문 프로세스)
-    """
+    """HMP 도매 크롤러 (DWR 프로토콜)."""
 
     SUPPLIER_NAME = "HMP"
 
-    def __init__(self):
-        super().__init__()
-        # DWR 세션 파라미터
-        self._http_session_id = ""
-        self._script_session_id = ""
-        self._batch_id = 0
-
     def login(self, login_id: str, login_pw: str) -> bool:
-        """HMP 로그인.
+        headers = {
+            "Content-Type": "text/plain",
+            "Origin": "https://www.hmpmall.co.kr",
+            "Referer": "https://www.hmpmall.co.kr/login.do",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        }
 
-        표준 form POST 로그인 후, DWR 세션 ID를 초기화.
-        """
-        try:
-            payload = {
-                "user_id": login_id,
-                "user_pw": login_pw,
-            }
-            resp = self.session.post(LOGIN_URL, data=payload)
-            resp.raise_for_status()
+        # DWR 프로토콜 로그인
+        data = (
+            "callCount=1\n"
+            "nextReverseAjaxIndex=0\n"
+            "c0-scriptName=common/Login\n"
+            "c0-methodName=execute\n"
+            "c0-id=0\n"
+            "c0-e1=string:\n"
+            "c0-e2=string:2350001\n"
+            f"c0-e3=string:{login_id}\n"
+            f"c0-e4=string:{login_pw}\n"
+            "c0-param0=Object_Object:{mallDivCode:reference:c0-e1, loginPathDivCode:reference:c0-e2, memId:reference:c0-e3, memPw:reference:c0-e4}\n"
+            "batchId=0\n"
+            "instanceId=0\n"
+            "page=%2Flogin.do\n"
+            "scriptSessionId=local/5m9LVKo-1FYR59k9p\n"
+        )
 
-            # TODO: 로그인 성공 판별
-            if "logout" in resp.text.lower() or "로그아웃" in resp.text:
-                self._logged_in = True
-                # DWR 세션 초기화
-                self._init_dwr_session()
-                return True
+        resp = self.session.post(
+            "https://www.hmpmall.co.kr/dwr/call/plaincall/common/Login.execute.dwr",
+            headers=headers,
+            data=data,
+        )
+        self.session.get("https://www.hmpmall.co.kr/home.do")
+        self._logged_in = True
+        return resp.status_code == 200
 
-            return False
-        except Exception as e:
-            raise CrawlerError(f"[HMP] 로그인 실패: {e}") from e
+    def _search_second_step(self, product_master_id: int) -> dict:
+        """개별 제품 상세 정보 (판매자별 재고/가격)"""
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.hmpmall.co.kr/search/searchTwoStepList.do",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        }
+        params = {
+            "productMasterId": product_master_id,
+            "fromGubun": "2480000",
+            "orderByProductSeller": "",
+            "orderbySellerId": "",
+            "preProductMasterId": "19257",
+            "groupCategoryNumber": "1",
+            "imgPath": "/statics/imgs",
+            "imgPathX": "/statics/imgs",
+        }
 
-    def _init_dwr_session(self):
-        """DWR 세션 초기화.
+        resp = self.session.get(
+            "https://www.hmpmall.co.kr/search/SearchProductSellerListJson.do",
+            params=params,
+            headers=headers,
+        )
+        data = json.loads(resp.text)
 
-        DWR 엔진 페이지를 로드하여 세션 파라미터를 추출.
-        """
-        try:
-            # TODO: DWR 엔진 초기화 URL 확인
-            resp = self.session.get(f"{BASE_URL}/dwr/engine.js")
-            # httpSessionId, scriptSessionId 등을 응답에서 파싱
-            # TODO: 실제 파싱 로직 구현
-            self._http_session_id = ""
-            self._script_session_id = ""
-        except Exception:
-            # DWR 초기화 실패해도 로그인 자체는 유지
-            pass
+        stock_qty = 0
+        price = None
+        for seller in data.get("sellerSaleProductList", []):
+            stock_qty += int(seller.get("stockQuantity", 0))
+            try:
+                seller_price = seller.get("minProductUnitPrice", 0)
+                if price is None or (seller_price < price and int(seller.get("stockQuantity", 0)) != 0):
+                    price = seller_price
+            except (TypeError, ValueError):
+                pass
 
-    def _build_dwr_request(self, class_name: str, method_name: str,
-                           params: list[str]) -> str:
-        """DWR 요청 본문 생성.
+        basic_info = data.get("productBasicInfo", {})
+        insurance_code = basic_info.get("insuranceCode", "")
 
-        DWR 프로토콜 형식:
-        callCount=1
-        page=/xxx
-        httpSessionId=xxx
-        scriptSessionId=xxx
-        c0-scriptName=ClassName
-        c0-methodName=methodName
-        c0-id=0
-        c0-param0=string:value
-        batchId=0
-        """
-        self._batch_id += 1
-        lines = [
-            "callCount=1",
-            f"page={BASE_URL}/",
-            f"httpSessionId={self._http_session_id}",
-            f"scriptSessionId={self._script_session_id}",
-            f"c0-scriptName={class_name}",
-            f"c0-methodName={method_name}",
-            "c0-id=0",
-        ]
-        for i, param in enumerate(params):
-            lines.append(f"c0-param{i}=string:{param}")
-        lines.append(f"batchId={self._batch_id}")
-        return "\n".join(lines)
-
-    def _parse_dwr_response(self, text: str) -> list[dict]:
-        """DWR 응답 파싱.
-
-        DWR 응답은 JavaScript 콜백 형태:
-        //#DWR-INSERT
-        //#DWR-REPLY
-        var s0=...;
-        dwr.engine._remoteHandleCallback('batch_id','0',s0);
-
-        TODO: 실제 응답 형식에 맞춰 파싱 로직 구현
-        """
-        results: list[dict] = []
-        # DWR 응답에서 데이터 추출
-        # TODO: 정규식 또는 문자열 파싱으로 객체 배열 추출
-        return results
+        return {
+            "maker": basic_info.get("manufacturerName", ""),
+            "product_name": basic_info.get("productName", ""),
+            "unit": basic_info.get("packingUnit", ""),
+            "insurance_code": insurance_code or "",
+            "quantity": stock_qty,
+            "price": price or 0,
+        }
 
     def search(self, keyword: str) -> list[SearchResult]:
-        """HMP 검색 (DWR 프로토콜).
+        # ensure_login은 외부에서 login_id/login_pw를 전달받아 호출해야 함
+        # search 단독 호출 시에는 이미 로그인된 상태라고 가정
+        results = []
 
-        DWR 호출로 검색 메서드를 실행하고 결과를 파싱.
-        """
-        try:
-            # DWR 검색 요청 생성
-            # TODO: 실제 클래스명/메서드명 확인
-            dwr_body = self._build_dwr_request(
-                class_name="ProductService",
-                method_name="searchProduct",
-                params=[keyword],
-            )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.hmpmall.co.kr",
+            "Referer": "https://www.hmpmall.co.kr/home.do",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        }
+        data = {
+            "sellerId": "", "productMasterId": "",
+            "productName": keyword, "manufacturerName": "",
+            "ingredient": "", "dracClsfName": "",
+            "insuranceCode": "", "groupCategoryNumber": "",
+            "largeCategoryNumber": "", "middleCategoryNumber": "",
+            "smallCategoryNumber": "", "orderFieldName": "",
+            "orderType": "", "autoCompleteSelectYn": "",
+            "searchKeyword": keyword, "headerSearchKeyword": keyword,
+            "skip": "1", "max": "20", "yuhaTest": "false",
+            "makingId": "productName", "paramSellerId": "",
+            "sellerIdList": "", "productNameList": "",
+            "manufacturerNameList": "", "ingredientList": "",
+            "categoryTreeSearch": "", "categoryTreeSearchLevel": "",
+            "preWhereSetStr": "", "fromGubun": "",
+            "preProductMasterId": "", "delvBpcoDivCd": "",
+            "pageDtlNum": "", "hanmiProductIdx": "",
+            "treatmentDeptNumber": "", "promotionKindDivCode": "",
+            "menuId": "", "subMenuId": "",
+        }
 
-            headers = {
-                "Content-Type": "text/plain",
-            }
-            resp = self.session.post(
-                f"{DWR_URL}ProductService.searchProduct.dwr",
-                data=dwr_body,
-                headers=headers,
-            )
-            resp.raise_for_status()
+        resp = self.session.post(
+            "https://www.hmpmall.co.kr/search/searchTwoStepList.do",
+            headers=headers,
+            data=data,
+        )
 
-            # DWR 응답 파싱
-            raw_results = self._parse_dwr_response(resp.text)
-            results: list[SearchResult] = []
+        soup = bs(resp.text, "html.parser")
 
-            for item in raw_results:
-                results.append(SearchResult(
-                    maker=item.get("maker", ""),
-                    product_name=item.get("product_name", ""),
-                    unit=item.get("unit", ""),
-                    insurance_code=item.get("insurance_code", ""),
-                    quantity=self._safe_int(str(item.get("quantity", 0))),
-                    price=self._safe_int(str(item.get("price", 0))),
-                    supplier=self.SUPPLIER_NAME,
-                    product_id=item.get("product_id", ""),
-                ))
+        # 제품 ID 추출
+        pattern = r"searchTwoStepList\.searchSubList\(\s*'\d','\d{5,6}'"
+        product_ids = set()
+        for a_tag in soup.find_all("a"):
+            href = str(a_tag.get("href", ""))
+            if re.search(pattern, href):
+                match = re.search(r"\d{5,6}", href)
+                if match:
+                    product_ids.add(int(match.group()))
 
-            return results
-        except CrawlerError:
-            raise
-        except Exception as e:
-            raise CrawlerError(f"[HMP] 검색 실패: {e}") from e
+        # 개별 제품 상세 조회
+        for pid in product_ids:
+            try:
+                info = self._search_second_step(pid)
+            except Exception:
+                continue
 
-    # order()는 미구현 — BaseCrawler 기본 동작(주문 미지원) 사용
+            results.append(SearchResult(
+                maker=info["maker"],
+                product_name=info["product_name"],
+                unit=info["unit"],
+                insurance_code=info["insurance_code"],
+                quantity=info["quantity"],
+                supplier=self.SUPPLIER_NAME,
+                price=info["price"],
+            ))
+
+        return results
+
+    def order(self, product_id: str, quantity: int) -> OrderResult:
+        return OrderResult(success=False, message="미구현")

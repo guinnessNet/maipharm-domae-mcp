@@ -1,155 +1,201 @@
 """백제 크롤러
 
 특이사항:
-- JWT Bearer 토큰 인증 방식 (세션 쿠키가 아닌 Authorization 헤더)
+- JWT Bearer 토큰 인증 방식
 - product_id 형식: ITEM_CD|ITEM_GB_CD (파이프로 구분된 복합 키)
-- API 기반 (HTML 파싱이 아닌 JSON 응답)
+- API 기반 (JSON 응답)
 """
 
-from domae_mcp.core.crawlers.base import (
-    BaseCrawler,
-    CrawlerError,
-    OrderResult,
-    SearchResult,
-)
+import json
+from typing import List
 
-# TODO: 실제 도메인으로 교체
-BASE_URL = "https://www.beakje.co.kr"
-LOGIN_URL = f"{BASE_URL}/api/auth/login"
-SEARCH_URL = f"{BASE_URL}/api/product/search"
-ORDER_URL = f"{BASE_URL}/api/order/create"
+from domae_mcp.core.crawlers.base import BaseCrawler, SearchResult, OrderResult
+
+BASE_URL = "https://www.ibjp.co.kr"
 
 
 class BeakjeCrawler(BaseCrawler):
-    """백제 도매 크롤러 (JWT Bearer 인증).
-
-    - 로그인: JSON POST → JWT 토큰 수신 → 이후 요청에 Bearer 헤더 부착
-    - 검색: API 호출 → JSON 응답 파싱 (HTML 파싱 불필요)
-    - 주문: product_id는 ITEM_CD|ITEM_GB_CD 형식의 복합 키
-    """
+    """백제 도매 크롤러 (JWT Bearer 인증)."""
 
     SUPPLIER_NAME = "백제"
 
     def __init__(self):
         super().__init__()
-        self._jwt_token: str = ""
+        self.jwt_token = None
+        self._cust_cd = ""
+        self._login_id = ""
+        self._login_pw = ""
+
+    def _auth_headers(self) -> dict:
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://ibjp.co.kr",
+            "Referer": "https://ibjp.co.kr/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        }
+        if self.jwt_token:
+            headers["Authorization"] = f"Bearer {self.jwt_token}"
+        return headers
 
     def login(self, login_id: str, login_pw: str) -> bool:
-        """백제 로그인 (JWT 방식).
+        self._login_id = login_id
+        self._login_pw = login_pw
+        self._cust_cd = login_id
 
-        JSON POST로 인증 → JWT 토큰 수신.
-        이후 모든 요청에 Authorization: Bearer {token} 헤더 부착.
-        """
-        try:
-            payload = {
-                "userId": login_id,
-                "userPw": login_pw,
-            }
-            headers = {
-                "Content-Type": "application/json",
-            }
-            resp = self.session.post(LOGIN_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-
-            data = resp.json()
-            # TODO: 실제 응답 필드명 확인
-            token = data.get("token") or data.get("accessToken", "")
-            if token:
-                self._jwt_token = token
-                # 세션에 Bearer 헤더 설정
-                self.session.headers.update({
-                    "Authorization": f"Bearer {self._jwt_token}",
-                })
-                self._logged_in = True
-                return True
-
-            return False
-        except Exception as e:
-            raise CrawlerError(f"[백제] 로그인 실패: {e}") from e
+        self.session.get("http://ibjp.co.kr")
+        login_data = {
+            "companyYn": "N",
+            "loginId": login_id,
+            "pwd": login_pw,
+        }
+        resp = self.session.post(f"{BASE_URL}/jwt/login", json=login_data)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                self.jwt_token = data.get("token") or data.get("accessToken") or data.get("access_token")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            self._logged_in = True
+            return True
+        return False
 
     def search(self, keyword: str) -> list[SearchResult]:
-        """백제 검색 (JSON API).
+        self.ensure_login(self._login_id, self._login_pw)
+        results = []
 
-        Bearer 토큰 인증 후 검색 API 호출.
-        응답은 JSON 배열.
-        """
+        params = {
+            "keyword": keyword, "makerNm": "", "history": "N",
+            "excludingOutOfOtock": "N", "custCd": self._cust_cd,
+            "custGbCd": "01", "ordMakerCd": "", "userGbCd": "30",
+            "ing": "N", "eff": "N", "ingno": "AAAAAAAAAAAAAA",
+            "effno": "AAAAAAAAAAAA", "searchAll": "Y",
+            "professionalYn": "N", "generalYn": "N",
+            "paymentYn": "N", "nonPaymentYn": "N", "searchOption": "0",
+        }
+
+        resp = self.session.get(f"{BASE_URL}/ord/itemSearch", params=params, headers=self._auth_headers())
+
         try:
-            params = {
-                "keyword": keyword,
-            }
-            resp = self.session.get(SEARCH_URL, params=params)
-            resp.raise_for_status()
+            items = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            return results
 
-            data = resp.json()
-            results: list[SearchResult] = []
+        if not isinstance(items, list):
+            return results
 
-            # TODO: 실제 JSON 응답 구조에 맞게 필드명 수정
-            items = data.get("items", data.get("list", []))
-            for item in items:
-                # product_id: ITEM_CD|ITEM_GB_CD 복합 키 형식
-                item_cd = item.get("ITEM_CD", "")
-                item_gb_cd = item.get("ITEM_GB_CD", "")
-                product_id = f"{item_cd}|{item_gb_cd}"
+        # 동일 제품 수량 합산 로직
+        seen = {}
+        for item in items:
+            maker = item.get("MAKER_NM", "")
+            name = item.get("ITEM_NM", "")
+            unit = item.get("UNIT", "")
+            stock = item.get("AVAIL_STOCK", 0)
+            insurance_code = item.get("BOHUM_CD", "")
+            item_cd = item.get("ITEM_CD", "")
+            item_gb_cd = item.get("ITEM_GB_CD", "")
 
+            key = (maker, name, unit)
+            if key in seen:
+                results[seen[key]].quantity += stock
+            else:
+                seen[key] = len(results)
                 results.append(SearchResult(
-                    maker=item.get("MAKER", item.get("maker", "")),
-                    product_name=item.get("ITEM_NM", item.get("productName", "")),
-                    unit=item.get("UNIT", item.get("unit", "")),
-                    insurance_code=item.get("INS_CODE", item.get("insuranceCode", "")),
-                    quantity=self._safe_int(str(item.get("QTY", item.get("quantity", 0)))),
-                    price=self._safe_int(str(item.get("PRICE", item.get("price", 0)))),
+                    maker=maker,
+                    product_name=name,
+                    unit=unit,
+                    insurance_code=insurance_code,
+                    quantity=stock,
                     supplier=self.SUPPLIER_NAME,
-                    product_id=product_id,
+                    price=0,
+                    product_id=f"{item_cd}|{item_gb_cd}",
                 ))
 
-            return results
-        except CrawlerError:
-            raise
-        except Exception as e:
-            raise CrawlerError(f"[백제] 검색 실패: {e}") from e
+        return results
+
+    def _get_basket(self) -> list:
+        """장바구니 조회"""
+        params = {"userGbCd": "30", "custCd": self._cust_cd, "basketGbCd": "01", "gDlvBrchFlag": ""}
+        resp = self.session.get(f"{BASE_URL}/ord/basketList", params=params, headers=self._auth_headers())
+        try:
+            return json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    def _add_to_basket(self, item_cd: str, item_gb_cd: str, quantity: int):
+        """장바구니 담기"""
+        data = {
+            "basketGbCd": "01",
+            "saveItemCd": item_cd,
+            "saveItemGbCd": item_gb_cd,
+            "dlvBrchCd": "",
+            "saveItemQty": str(quantity),
+            "userId": self._login_id,
+            "custCd": self._cust_cd,
+        }
+        resp = self.session.post(f"{BASE_URL}/ord/addBasket", json=data, headers=self._auth_headers())
+        return resp.status_code == 200
+
+    def _delete_from_basket(self, item_cd: str, item_gb_cd: str):
+        """장바구니에서 제품 삭제"""
+        params = {"saveItemGbCd": item_gb_cd, "saveItemCd": item_cd, "dlvBrchCd": ""}
+        self.session.delete(f"{BASE_URL}/ord/deleteComOrdBasket", params=params, headers=self._auth_headers())
+
+    def _submit_order(self, memo: str = "") -> bool:
+        """주문 등록"""
+        basket = self._get_basket()
+        if not basket:
+            return False
+
+        # 각 항목에 필수 필드 추가
+        for item in basket:
+            item["ORD_MEMO"] = memo
+            item["BRCH_CD"] = item.get("BRCH_CD", "")
+            item["CUST_CD"] = self._cust_cd
+            item["DEPT_CD"] = ""
+            item["EMP_ID"] = ""
+            item["USER_ID"] = self._login_id
+
+        resp = self.session.post(f"{BASE_URL}/ord/orderReg", json=basket, headers=self._auth_headers())
+        return resp.status_code == 200
 
     def order(self, product_id: str, quantity: int) -> OrderResult:
-        """백제 주문 (JWT 인증 API).
+        """백제 주문: 장바구니 캐싱 → 비우기 → 담기 → 전송 → 복원"""
+        self.ensure_login(self._login_id, self._login_pw)
 
-        product_id는 ITEM_CD|ITEM_GB_CD 형식.
-        파이프 구분자로 분리하여 각각 전송.
-        """
+        # product_id = "ITEM_CD|ITEM_GB_CD"
+        parts = product_id.split("|")
+        if len(parts) != 2:
+            return OrderResult(success=False, message="잘못된 product_id 형식")
+        item_cd, item_gb_cd = parts
+
+        saved_items = []
         try:
-            # product_id 파싱: "ITEM_CD|ITEM_GB_CD"
-            parts = product_id.split("|")
-            if len(parts) != 2:
-                return OrderResult(
-                    success=False,
-                    message=f"잘못된 product_id 형식: {product_id} (ITEM_CD|ITEM_GB_CD 필요)",
-                )
+            # 1. 기존 장바구니 캐싱
+            saved_items = self._get_basket()
 
-            item_cd, item_gb_cd = parts
+            # 2. 기존 장바구니 비우기
+            for item in saved_items:
+                self._delete_from_basket(item.get("ITEM_CD", ""), item.get("ITEM_GB_CD", ""))
 
-            payload = {
-                "ITEM_CD": item_cd,
-                "ITEM_GB_CD": item_gb_cd,
-                "QTY": quantity,
-            }
-            headers = {
-                "Content-Type": "application/json",
-            }
-            resp = self.session.post(ORDER_URL, json=payload, headers=headers)
-            resp.raise_for_status()
+            # 3. 주문 제품 담기
+            self._add_to_basket(item_cd, item_gb_cd, quantity)
 
-            data = resp.json()
-            # TODO: 실제 응답 구조에 맞게 성공 판별
-            if data.get("success") or data.get("result") == "OK":
-                return OrderResult(
-                    success=True,
-                    message="주문 성공",
-                    order_id=data.get("orderId", data.get("ORDER_NO", "")),
-                )
+            # 4. 주문 전송
+            success = self._submit_order()
 
-            return OrderResult(
-                success=False,
-                message=data.get("message", "주문 실패"),
-            )
-        except CrawlerError:
-            raise
+            # 5. 기존 장바구니 복원
+            for item in saved_items:
+                self._add_to_basket(item.get("ITEM_CD", ""), item.get("ITEM_GB_CD", ""), item.get("ITEM_QTY", 1))
+
+            if success:
+                return OrderResult(success=True, message="주문 전송 완료")
+            else:
+                return OrderResult(success=False, message="주문 전송 실패")
+
         except Exception as e:
-            raise CrawlerError(f"[백제] 주문 실패: {e}") from e
+            try:
+                for item in saved_items:
+                    self._add_to_basket(item.get("ITEM_CD", ""), item.get("ITEM_GB_CD", ""), item.get("ITEM_QTY", 1))
+            except Exception:
+                pass
+            return OrderResult(success=False, message=f"주문 에러: {e}")
