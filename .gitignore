@@ -42,3 +42,6 @@ src/domae_mcp/core/crawlers/picomall.py
 src/domae_mcp/core/crawlers/saeropharm.py
 src/domae_mcp/core/crawlers/sdpharm.py
 src/domae_mcp/core/crawlers/upharmmall.py
+
+# 테스트 크리덴셜 (공개 레포에 노출 금지)
+tests/.test_credentials.json
