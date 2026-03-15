@@ -1,14 +1,20 @@
 """
 도매 크롤러 통합 테스트 (domae-v2 시드 계정 사용)
 Usage: python -m tests.test_crawlers [도매상명]
+
+크롤러 파일은 서버에서 배포되지만, 로컬 개발 시에는
+src/domae_mcp/core/crawlers/ 디렉토리에 .py 파일이 존재한다.
+이 테스트는 로컬 크롤러 파일을 직접 import하여 테스트한다.
 """
+import importlib
 import sys
 import time
 import traceback
+from pathlib import Path
 
 sys.path.insert(0, "src")
 
-from domae_mcp.core.crawlers.registry import CrawlerRegistry
+from domae_mcp.core.crawlers.base import BaseCrawler
 
 # domae-v2 _seed_credentials() 기반
 SEED_CREDENTIALS = {
@@ -24,7 +30,58 @@ SEED_CREDENTIALS = {
     "대전동원약품": {"login_id": "starlightph1", "login_pw": "qwertyu71!"},
 }
 
+# 크롤러 모듈명 → 도매상명 매핑
+CRAWLER_MODULES = {
+    "지오영": "geoweb",
+    "복산": "boksan",
+    "인천": "inchun",
+    "티제이팜": "tjpharm",
+    "HMP": "hmpmall",
+    "백제": "beakje",
+    "피코": "picomall",
+    "새로팜": "saeropharm",
+    "신덕팜": "sdpharm",
+    "대전동원약품": "upharmmall",
+}
+
 TEST_KEYWORD = "아목시실린"
+
+
+def load_crawler(name: str) -> BaseCrawler | None:
+    """로컬 크롤러 파일에서 직접 크롤러 인스턴스 생성."""
+    module_name = CRAWLER_MODULES.get(name)
+    if not module_name:
+        print(f"  ❌ 모듈 매핑 없음: {name}")
+        return None
+
+    crawler_path = Path("src/domae_mcp/core/crawlers") / f"{module_name}.py"
+    if not crawler_path.exists():
+        print(f"  ❌ 크롤러 파일 없음: {crawler_path}")
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"domae_mcp.core.crawlers.{module_name}", str(crawler_path)
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # BaseCrawler 서브클래스 찾기
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, BaseCrawler)
+                and attr is not BaseCrawler
+            ):
+                return attr()
+
+        print(f"  ❌ BaseCrawler 서브클래스를 찾을 수 없음")
+        return None
+    except Exception as e:
+        print(f"  ❌ 모듈 로드 실패: {e}")
+        traceback.print_exc()
+        return None
 
 
 def test_crawler(name: str):
@@ -34,7 +91,9 @@ def test_crawler(name: str):
         print(f"  ❌ 계정 정보 없음")
         return False
 
-    crawler = CrawlerRegistry.get(name)
+    crawler = load_crawler(name)
+    if not crawler:
+        return False
 
     # 1) 로그인
     print(f"  로그인 시도... ", end="", flush=True)
@@ -75,8 +134,6 @@ def test_crawler(name: str):
 
 
 def main():
-    # registry.py import 시 _register_all() 자동 실행됨
-
     targets = sys.argv[1:] if len(sys.argv) > 1 else list(SEED_CREDENTIALS.keys())
 
     print(f"=== 도매 크롤러 테스트 (키워드: {TEST_KEYWORD}) ===\n")
