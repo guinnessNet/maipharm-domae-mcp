@@ -43,6 +43,17 @@ def _init_services():
     _config = ConfigManager()
     init_db(_config)
     _session_factory = _get_session_factory(_config)
+
+    # 크롤러 동적 로드 (MCP 모드 — 동기)
+    api_key = _config.get_api_key()
+    if api_key:
+        from domae_mcp.core.crawlers.loader import CrawlerLoader
+        loader = CrawlerLoader(_config.base_dir, api_key)
+        try:
+            crawlers = loader.load()
+            CrawlerRegistry.register_all(crawlers)
+        except RuntimeError as e:
+            logger.warning("크롤러 로드 실패: %s", e)
     _search_service = SearchService()
     _order_service = OrderService()
 
