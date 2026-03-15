@@ -38,13 +38,19 @@ class OrderService:
         Returns:
             OrderResult.
         """
-        try:
-            crawler = CrawlerRegistry.get(supplier)
-            crawler.ensure_login(credentials["login_id"], credentials["login_pw"])
-            result = crawler.order(product_id, quantity)
-        except Exception as e:
-            logger.error("주문 실패: %s %s", supplier, product_name, exc_info=True)
-            result = OrderResult(success=False, message=str(e))
+        if not CrawlerRegistry.is_loaded():
+            result = OrderResult(
+                success=False,
+                message="크롤러가 로드되지 않았습니다. API 키를 확인하세요.",
+            )
+        else:
+            try:
+                crawler = CrawlerRegistry.get(supplier)
+                crawler.ensure_login(credentials["login_id"], credentials["login_pw"])
+                result = crawler.order(product_id, quantity)
+            except Exception as e:
+                logger.error("주문 실패: %s %s", supplier, product_name, exc_info=True)
+                result = OrderResult(success=False, message=str(e))
 
         # DB 저장
         order = Order(

@@ -32,6 +32,10 @@ class SearchService:
         if credentials is None:
             credentials = {}
 
+        if not CrawlerRegistry.is_loaded():
+            logger.warning("크롤러 미로드 — API 키를 확인하세요.")
+            return []
+
         target_suppliers = suppliers or CrawlerRegistry.list_all()
 
         all_results: list[SearchResult] = []

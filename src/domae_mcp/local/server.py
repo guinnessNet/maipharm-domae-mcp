@@ -1,5 +1,7 @@
 """FastAPI 웹서버: 127.0.0.1 바인딩, 로컬 전용"""
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,16 +11,37 @@ from fastapi.staticfiles import StaticFiles
 
 from domae_mcp.local.config import ConfigManager
 from domae_mcp.local.database import init_db
+from domae_mcp.core.crawlers.loader import CrawlerLoader
+from domae_mcp.core.crawlers.registry import CrawlerRegistry
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """앱 시작/종료 이벤트"""
-    # 시작: DB 초기화
     config = ConfigManager()
     init_db(config)
+
+    # 크롤러 서버 로드 (동기 loader를 asyncio.to_thread로 래핑)
+    api_key = config.get_api_key()
+    loader = None
+    if api_key:
+        try:
+            loader = CrawlerLoader(config.base_dir, api_key)
+            crawlers = await asyncio.to_thread(loader.load)
+            CrawlerRegistry.register_all(crawlers)
+        except RuntimeError as e:
+            # 크롤러 로드 실패해도 서버는 시작 (설정 페이지 접근 필요)
+            logger.warning("크롤러 로드 실패: %s", e)
+    else:
+        logger.warning("API 키 미설정 — 크롤러 없이 시작. 설정 페이지에서 API 키를 등록하세요.")
+
+    app.state.config = config
+    app.state.crawler_loader = loader
+
     yield
-    # 종료: 정리 작업 (현재 없음)
+    # 종료: 정리 작업
 
 
 app = FastAPI(
