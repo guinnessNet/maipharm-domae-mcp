@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          cp -r dist/* ../src/domae_mcp/static/
+
+      - name: Build Python package
+        run: |
+          pip install build
+          python -m build --sdist --wheel
+
+      - name: Create release zip
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          ZIP_NAME="maipharm-domae-mcp-${VERSION}.zip"
+
+          # zip에 포함할 파일들
+          zip -r "$ZIP_NAME" \
+            src/ \
+            install.bat \
+            install.sh \
+            start.bat \
+            update.bat \
+            requirements.txt \
+            pyproject.toml \
+            README.md \
+            docs/USER_GUIDE.md \
+            -x "src/domae_mcp/core/crawlers/geoweb.py" \
+            -x "src/domae_mcp/core/crawlers/boksan.py" \
+            -x "src/domae_mcp/core/crawlers/inchun.py" \
+            -x "src/domae_mcp/core/crawlers/tjpharm.py" \
+            -x "src/domae_mcp/core/crawlers/hmpmall.py" \
+            -x "src/domae_mcp/core/crawlers/beakje.py" \
+            -x "src/domae_mcp/core/crawlers/picomall.py" \
+            -x "src/domae_mcp/core/crawlers/saeropharm.py" \
+            -x "src/domae_mcp/core/crawlers/sdpharm.py" \
+            -x "src/domae_mcp/core/crawlers/upharmmall.py" \
+            -x "**/__pycache__/**" \
+            -x "**/.git/**"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            maipharm-domae-mcp-*.zip
+            dist/*.whl
+          generate_release_notes: true
+          body: |
+            ## 설치 방법
+
+            ### Windows
+            1. `maipharm-domae-mcp-${{ github.ref_name }}.zip` 다운로드
+            2. 원하는 폴더에 압축 해제
+            3. `install.bat` 더블클릭 (Python 자동 설치)
+            4. `start.bat` 더블클릭 → 브라우저 자동 열림
+
+            ### Mac/Linux
+            ```bash
+            unzip maipharm-domae-mcp-${{ github.ref_name }}.zip
+            cd maipharm-domae-mcp-${{ github.ref_name }}
+            bash install.sh
+            python3 -m domae_mcp
+            ```
+
+            ### pip (개발자)
+            ```bash
+            pip install maipharm_domae_mcp-*.whl
+            python -m domae_mcp
+            ```
+
+            > 처음 사용하시면 [사용자 가이드](docs/USER_GUIDE.md)를 읽어보세요.
