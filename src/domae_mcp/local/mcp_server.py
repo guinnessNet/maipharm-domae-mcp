@@ -90,7 +90,7 @@ def _json_response(data) -> list[TextContent]:
 TOOLS = [
     Tool(
         name="search_inventory",
-        description="의약품 키워드로 10개 도매상(지오영, 복산, 인천, 티제이팜, HMP, 백제, 피코, 새로팜, 신덕팜, 대전동원약품)의 재고를 통합 검색합니다.",
+        description="의약품 키워드로 11개 도매상(지오영, 복산, 인천, 티제이팜, HMP, 백제, 피코, 새로팜, 신덕팜, 대전동원약품, 경동사)의 재고를 통합 검색합니다.",
         inputSchema={
             "type": "object",
             "properties": {
