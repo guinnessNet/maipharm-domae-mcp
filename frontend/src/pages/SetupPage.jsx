@@ -288,16 +288,37 @@ function DoneStep({ onFinish }) {
         텔레그램 알림, 스케줄 설정은 메뉴 &gt; 설정에서 추가로 구성할 수 있습니다.
       </p>
 
-      {/* MCP 연결 가이드 */}
-      <div style={{ textAlign: 'left', marginBottom: '1.5rem', padding: '1rem', background: 'var(--color-bg-secondary, #f8fafc)', borderRadius: '0.5rem' }}>
-        <p style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: '0.5rem' }}>Claude AI로 사용하기 (선택)</p>
-        <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.5rem' }}>
-          Claude Desktop 앱에서 AI에게 말로 검색/주문을 시킬 수 있습니다.
-        </p>
-        <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.3rem' }}>
-          Claude Desktop 설정 파일에 아래를 추가하세요:
-        </p>
-        <div style={{ position: 'relative' }}>
+      {/* MCP 연결 가이드 (접이식) */}
+      <McpGuide />
+
+      <button className="btn-primary" onClick={onFinish} style={{ padding: '0.6rem 2rem' }}>
+        검색 시작하기
+      </button>
+    </div>
+  );
+}
+
+/* ---------- MCP Guide (접이식) ---------- */
+function McpGuide() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div style={{ textAlign: 'left', marginBottom: '1.5rem' }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary, #94a3b8)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+      >
+        {open ? '▾' : '▸'} 고급: Claude AI와 연결하기 (개발자용)
+      </button>
+
+      {open && (
+        <div style={{ marginTop: '0.5rem', padding: '1rem', background: 'var(--color-bg-secondary, #f8fafc)', borderRadius: '0.5rem' }}>
+          <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.5rem' }}>
+            Claude Desktop 앱에서 AI에게 말로 검색/주문을 시킬 수 있습니다.
+          </p>
+          <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.3rem' }}>
+            Claude Desktop 설정 파일에 아래를 추가하세요:
+          </p>
           <pre style={{ background: '#1e293b', color: '#e2e8f0', padding: '0.75rem', borderRadius: '0.4rem', fontSize: '0.75rem', overflow: 'auto', lineHeight: 1.5 }}>
 {`{
   "mcpServers": {
@@ -308,15 +329,11 @@ function DoneStep({ onFinish }) {
   }
 }`}
           </pre>
+          <p className="text-secondary" style={{ fontSize: '0.7rem', marginTop: '0.5rem' }}>
+            파일 위치: <code>%APPDATA%\Claude\claude_desktop_config.json</code>
+          </p>
         </div>
-        <p className="text-secondary" style={{ fontSize: '0.75rem', marginTop: '0.5rem' }}>
-          설정 파일 위치: <code style={{ fontSize: '0.7rem' }}>%APPDATA%\Claude\claude_desktop_config.json</code>
-        </p>
-      </div>
-
-      <button className="btn-primary" onClick={onFinish} style={{ padding: '0.6rem 2rem' }}>
-        검색 시작하기
-      </button>
+      )}
     </div>
   );
 }
