@@ -267,6 +267,7 @@ function TelegramTab() {
   const [chatId, setChatId] = useState('');
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState(null);
+  const [showGuide, setShowGuide] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -275,7 +276,7 @@ function TelegramTab() {
         setToken(data.token || '');
         setChatId(data.chat_id || '');
       } catch {
-        // ignore - might not be configured yet
+        // ignore
       } finally {
         setLoading(false);
       }
@@ -295,16 +296,48 @@ function TelegramTab() {
   if (loading) return <div className="empty-state"><span className="loading-spinner" /></div>;
 
   return (
-    <div className="card" style={{ maxWidth: '500px' }}>
-      <h3 style={{ marginBottom: '1rem' }}>텔레그램 알림 설정</h3>
+    <div className="card" style={{ maxWidth: '550px' }}>
+      <h3 style={{ marginBottom: '0.5rem' }}>텔레그램 알림 설정</h3>
+      <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '1rem' }}>
+        가격 변동, 긴급주문 체결 등의 알림을 텔레그램으로 받을 수 있습니다.
+      </p>
+
+      {/* 설정 가이드 토글 */}
+      <button
+        onClick={() => setShowGuide(!showGuide)}
+        style={{ fontSize: '0.8rem', color: 'var(--color-primary, #3b82f6)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: '0.75rem', padding: 0 }}
+      >
+        {showGuide ? '안내 닫기' : '처음이신가요? 설정 방법 보기'}
+      </button>
+
+      {showGuide && (
+        <div style={{ background: 'var(--color-bg-secondary, #f8fafc)', padding: '1rem', borderRadius: '0.5rem', marginBottom: '1rem', fontSize: '0.8rem', lineHeight: 1.7 }}>
+          <strong>1단계: 텔레그램 봇 만들기</strong>
+          <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0.75rem' }}>
+            <li>텔레그램 앱에서 <strong>@BotFather</strong> 검색 → 대화 시작</li>
+            <li><code>/newbot</code> 입력 → 봇 이름, 사용자명 지정</li>
+            <li>발급된 <strong>봇 토큰</strong>을 아래에 입력</li>
+          </ol>
+          <strong>2단계: Chat ID 알아내기</strong>
+          <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0' }}>
+            <li>방금 만든 봇에게 아무 메시지 보내기 (예: "안녕")</li>
+            <li>브라우저에서 아래 주소 접속 (토큰 부분 교체):</li>
+            <li style={{ wordBreak: 'break-all' }}>
+              <code>https://api.telegram.org/bot[토큰]/getUpdates</code>
+            </li>
+            <li>응답에서 <code>"chat":{'"'}id":숫자{'}'}</code> 부분의 숫자가 Chat ID</li>
+          </ol>
+        </div>
+      )}
+
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
         <div>
           <label style={{ display: 'block', marginBottom: '0.3rem', fontWeight: 500, fontSize: '0.85rem' }}>봇 토큰</label>
-          <input type="text" value={token} onChange={(e) => setToken(e.target.value)} style={{ width: '100%' }} placeholder="123456:ABC..." />
+          <input type="text" value={token} onChange={(e) => setToken(e.target.value)} style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.85rem' }} placeholder="7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxx" />
         </div>
         <div>
           <label style={{ display: 'block', marginBottom: '0.3rem', fontWeight: 500, fontSize: '0.85rem' }}>Chat ID</label>
-          <input type="text" value={chatId} onChange={(e) => setChatId(e.target.value)} style={{ width: '100%' }} placeholder="987654321" />
+          <input type="text" value={chatId} onChange={(e) => setChatId(e.target.value)} style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.85rem' }} placeholder="987654321" />
         </div>
         <div>
           <button className="btn-primary" onClick={handleSave}>저장</button>
@@ -383,7 +416,9 @@ function ScheduleTab() {
             const current = editing[i] || sch;
             return (
               <tr key={i}>
-                <td>{sch.time_range || sch.label || `${sch.start_hour || ''}~${sch.end_hour || ''}`}</td>
+                <td style={{ opacity: (current.enabled ?? true) ? 1 : 0.4 }}>
+                  {`${String(sch.start_hour).padStart(2, '0')}:00 ~ ${String(sch.end_hour).padStart(2, '0')}:00`}
+                </td>
                 <td>
                   <input
                     type="number"

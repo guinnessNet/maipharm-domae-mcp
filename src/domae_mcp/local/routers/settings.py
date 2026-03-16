@@ -54,6 +54,7 @@ class ScheduleItem(BaseModel):
     start_hour: int
     end_hour: int
     interval_minutes: int
+    enabled: bool = True
 
 
 class ScheduleListResponse(BaseModel):
@@ -65,6 +66,7 @@ class ScheduleUpdateItem(BaseModel):
     start_hour: int
     end_hour: int
     interval_minutes: int
+    enabled: bool = True
 
 
 class ScheduleUpdateRequest(BaseModel):
@@ -249,6 +251,7 @@ def get_schedules(db: Session = Depends(get_db)):
                 start_hour=s.start_hour,
                 end_hour=s.end_hour,
                 interval_minutes=s.interval_minutes,
+                enabled=s.enabled,
             )
             for s in schedules
         ]
@@ -267,6 +270,7 @@ def update_schedules(req: ScheduleUpdateRequest, db: Session = Depends(get_db)):
             start_hour=item.start_hour,
             end_hour=item.end_hour,
             interval_minutes=item.interval_minutes,
+            enabled=item.enabled,
         )
         db.add(schedule)
 
