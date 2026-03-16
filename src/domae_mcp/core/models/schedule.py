@@ -1,6 +1,6 @@
 """모니터링 스케줄 모델"""
 
-from sqlalchemy import Integer
+from sqlalchemy import Boolean, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from domae_mcp.core.models.base import Base
@@ -13,3 +13,4 @@ class MonitorSchedule(Base):
     start_hour: Mapped[int] = mapped_column(Integer, nullable=False)
     end_hour: Mapped[int] = mapped_column(Integer, nullable=False)
     interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
