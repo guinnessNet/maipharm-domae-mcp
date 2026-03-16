@@ -53,7 +53,13 @@ class CloudScheduler:
                 return
 
             products = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            credentials = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+            raw_creds = row[2]
+            # 암호화된 문자열이면 복호화, 아니면 평문 JSON 호환
+            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
+                from domae_mcp.cloud.crypto import decrypt_credentials
+                credentials = decrypt_credentials(raw_creds)
+            else:
+                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
             telegram_token = row[3]
             telegram_chat_id = row[4]
             tier = row[6]
