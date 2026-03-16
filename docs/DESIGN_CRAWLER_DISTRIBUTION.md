@@ -1054,6 +1054,9 @@ def _init_services():
   src/domae_mcp/core/crawlers/saeropharm.py
   src/domae_mcp/core/crawlers/sdpharm.py
   src/domae_mcp/core/crawlers/upharmmall.py
+  src/domae_mcp/core/crawlers/ndrug.py
+  src/domae_mcp/core/crawlers/dohyunpharm.py
+  src/domae_mcp/core/crawlers/samsungpharm.py
 ```
 
 ---

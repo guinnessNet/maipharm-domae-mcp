@@ -43,6 +43,14 @@ src/domae_mcp/core/crawlers/saeropharm.py
 src/domae_mcp/core/crawlers/sdpharm.py
 src/domae_mcp/core/crawlers/upharmmall.py
 src/domae_mcp/core/crawlers/ndrug.py
+src/domae_mcp/core/crawlers/dohyunpharm.py
+src/domae_mcp/core/crawlers/samsungpharm.py
+
+# Playwright MCP 로그
+.playwright-mcp/
+
+# 테스트 스크린샷
+*.png
 
 # 테스트 크리덴셜 (공개 레포에 노출 금지)
 tests/.test_credentials.json

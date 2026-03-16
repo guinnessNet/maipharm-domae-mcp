@@ -24,7 +24,7 @@ if errorlevel 1 (
 
 echo.
 echo  Maipharm Domae
-echo  ────────────────────
+echo  --------------------
 echo  Open http://localhost:5900 in your browser.
 echo  Close this window to stop the server.
 echo.
@@ -32,5 +32,11 @@ echo.
 :: Open browser after 2 seconds
 start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5900"
 
-:: Run server
+:: Run server (errors will show here)
 python -m domae_mcp
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Server crashed. See error above.
+    echo.
+)
+pause

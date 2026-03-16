@@ -62,6 +62,9 @@ CRAWLER_MODULES = {
     "새로팜": "saeropharm",
     "신덕팜": "sdpharm",
     "대전동원약품": "upharmmall",
+    "경동사": "ndrug",
+    "도현팜": "dohyunpharm",
+    "삼성팜": "samsungpharm",
 }
 
 TEST_KEYWORD = "아목시실린"
