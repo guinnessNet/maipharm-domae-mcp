@@ -1,0 +1,98 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+import os
+import sys
+
+block_cipher = None
+
+a = Analysis(
+    ['src/domae_mcp/desktop/app.py'],
+    pathex=['src'],
+    binaries=[],
+    datas=[
+        ('src/domae_mcp/static', 'domae_mcp/static'),
+    ],
+    hiddenimports=[
+        'domae_mcp',
+        'domae_mcp.__main__',
+        'domae_mcp.local.server',
+        'domae_mcp.local.config',
+        'domae_mcp.local.database',
+        'domae_mcp.local.scheduler',
+        'domae_mcp.local.mcp_server',
+        'domae_mcp.local.api_key',
+        'domae_mcp.local.startup',
+        'domae_mcp.local.routers.search',
+        'domae_mcp.local.routers.order',
+        'domae_mcp.local.routers.urgent',
+        'domae_mcp.local.routers.products',
+        'domae_mcp.local.routers.settings',
+        'domae_mcp.local.routers.monitor',
+        'domae_mcp.local.routers.supplier_request',
+        'domae_mcp.local.routers.update',
+        'domae_mcp.core.crawlers',
+        'domae_mcp.core.crawlers.base',
+        'domae_mcp.core.crawlers.registry',
+        'domae_mcp.core.crawlers.loader',
+        'domae_mcp.core.models',
+        'domae_mcp.core.services.search_service',
+        'domae_mcp.core.services.order_service',
+        'domae_mcp.core.services.monitor_service',
+        'domae_mcp.core.services.telegram_service',
+        'domae_mcp.desktop',
+        'domae_mcp.desktop.tray',
+        'domae_mcp.desktop.updater',
+        'domae_mcp.desktop.startup',
+        'uvicorn',
+        'uvicorn.logging',
+        'uvicorn.loops',
+        'uvicorn.loops.auto',
+        'uvicorn.protocols',
+        'uvicorn.protocols.http',
+        'uvicorn.protocols.http.auto',
+        'uvicorn.protocols.websockets',
+        'uvicorn.protocols.websockets.auto',
+        'uvicorn.lifespan',
+        'uvicorn.lifespan.on',
+        'fastapi',
+        'sqlalchemy',
+        'sqlalchemy.dialects.sqlite',
+        'cryptography',
+        'httpx',
+        'pystray',
+        'PIL',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['tkinter.test', 'unittest'],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='MaipharmDomae',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,  # GUI 모드 (콘솔 창 없음)
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None,  # TODO: 아이콘 파일 추가 시 여기에 경로
+)

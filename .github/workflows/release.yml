@@ -9,6 +9,41 @@ permissions:
   contents: write
 
 jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          Copy-Item -Recurse dist/* ../src/domae_mcp/static/ -Force
+
+      - name: Install dependencies
+        run: |
+          pip install .
+          pip install pyinstaller pystray Pillow
+
+      - name: Build exe
+        run: pyinstaller domae.spec
+
+      - name: Upload exe to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MaipharmDomae.exe
+
   release:
     runs-on: ubuntu-latest
     steps:
