@@ -64,9 +64,6 @@ class CloudScheduler:
             telegram_chat_id = row[4]
             tier = row[6]
 
-            # TODO: credentials AES-256-GCM 복호화 (Phase 2)
-            # credential_key = os.environ.get("DOMAE_CREDENTIAL_KEY")
-
             # 2. 크롤러 로드 (최초 1회)
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
@@ -89,10 +86,20 @@ class CloudScheduler:
             )
             conn.commit()
 
-            # 6. 알림 (변동 감지 시)
-            # TODO: 이전 결과 비교 + 알림 발송
+            # 6. 변동 감지 + 알림
+            all_changes = []
+            for keyword in products:
+                keyword_results = [r for r in all_results if r["keyword"] == keyword]
+                if keyword_results:
+                    changes = self._detect_changes(conn, monitor_id, keyword, keyword_results)
+                    all_changes.extend(changes)
 
-            logger.info("모니터 %s 완료: %d건 검색", monitor_id, len(all_results))
+            if all_changes and (telegram_token or telegram_chat_id):
+                from domae_mcp.cloud.notifier import Notifier
+                message = f"🔔 도매 모니터링 알림\n\n" + "\n".join(all_changes)
+                Notifier.send_telegram(telegram_token, telegram_chat_id, message)
+
+            logger.info("모니터 %s 완료: %d건 검색, %d건 변동", monitor_id, len(all_results), len(all_changes))
 
         except Exception as e:
             conn.rollback()
@@ -179,3 +186,46 @@ class CloudScheduler:
                 _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
                 r.get("unit"), r.get("price"), r.get("quantity"), r.get("product_id"),
             ))
+
+    def _detect_changes(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
+        """이전 검색 결과와 비교하여 변동 사항 감지.
+
+        Returns:
+            변동 메시지 리스트. 예: ["[지오영] 아모잘탄정 가격 하락: 12,500 → 11,800"]
+        """
+        cur = conn.cursor()
+        # 직전 검색 결과 (현재 검색 직전의 searchedAt 기준)
+        cur.execute("""
+            SELECT DISTINCT ON (supplier, "productName")
+                   supplier, "productName", price, quantity
+            FROM domae_cloud_results
+            WHERE "monitorId" = %s AND keyword = %s
+            AND "searchedAt" < (SELECT MAX("searchedAt") FROM domae_cloud_results WHERE "monitorId" = %s AND keyword = %s)
+            ORDER BY supplier, "productName", "searchedAt" DESC
+        """, (monitor_id, keyword, monitor_id, keyword))
+
+        prev_map = {}
+        for row in cur.fetchall():
+            key = f"{row[0]}|{row[1]}"  # supplier|productName
+            prev_map[key] = {"price": row[2], "quantity": row[3]}
+
+        if not prev_map:
+            return []  # 첫 검색이면 비교 불가
+
+        changes = []
+        for r in new_results:
+            key = f"{r['supplier']}|{r['product_name']}"
+            prev = prev_map.get(key)
+
+            if prev is None:
+                # 새로 등장한 제품
+                changes.append(f"🆕 [{r['supplier']}] {r['product_name']} 신규 등장 (가격: {r.get('price', '?')}원)")
+                continue
+
+            # 가격 하락
+            if prev["price"] and r.get("price") and r["price"] < prev["price"]:
+                changes.append(f"📉 [{r['supplier']}] {r['product_name']} 가격 하락: {prev['price']:,} → {r['price']:,}원")
+
+            # 재고 증가 (0 → N)
+            if (not prev["quantity"] or prev["quantity"] == 0) and r.get("quantity") and r["quantity"] > 0:
+                changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {r['quantity']}개")
