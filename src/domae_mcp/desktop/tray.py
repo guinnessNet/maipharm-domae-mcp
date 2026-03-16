@@ -105,10 +105,32 @@ class TrayApp:
         # 서버 시작
         _start_server()
 
-        # 2초 후 브라우저 열기 (첫 실행 시)
+        # 2초 후 브라우저 열기
         timer = threading.Timer(2.0, _open_browser)
         timer.daemon = True
         timer.start()
+
+        # 첫 실행 시 시작프로그램 등록 제안 (3초 후)
+        def _ask_startup():
+            from domae_mcp.desktop.startup import is_startup_registered, toggle_startup
+            if not is_startup_registered():
+                try:
+                    import tkinter as tk
+                    from tkinter import messagebox
+                    root = tk.Tk()
+                    root.withdraw()
+                    if messagebox.askyesno(
+                        "도매 통합검색",
+                        "PC를 켤 때 자동으로 실행되도록 등록할까요?\n\n(트레이 아이콘에서 나중에 변경할 수 있습니다)"
+                    ):
+                        toggle_startup(True)
+                    root.destroy()
+                except Exception:
+                    pass
+
+        startup_timer = threading.Timer(3.0, _ask_startup)
+        startup_timer.daemon = True
+        startup_timer.start()
 
         # 트레이 아이콘 메뉴
         menu = pystray.Menu(
