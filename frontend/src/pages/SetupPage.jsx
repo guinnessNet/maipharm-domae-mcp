@@ -86,9 +86,17 @@ function ApiKeyStep({ onNext }) {
   return (
     <div className="card">
       <h3 style={{ marginBottom: '0.5rem' }}>API 키 등록</h3>
-      <p className="text-secondary" style={{ fontSize: '0.85rem', marginBottom: '1rem' }}>
-        팜스퀘어(pharmsq.com)에서 무료 회원가입 후 API 키를 발급받으세요.
+      <p className="text-secondary" style={{ fontSize: '0.85rem', marginBottom: '0.5rem' }}>
+        팜스퀘어에서 무료 회원가입 후 API 키를 발급받으세요.
       </p>
+      <a
+        href="https://pharmsq.com/settings"
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ display: 'inline-block', fontSize: '0.85rem', marginBottom: '1rem', color: 'var(--color-primary, #3b82f6)' }}
+      >
+        pharmsq.com에서 API 키 발급받기 →
+      </a>
 
       <div style={{ display: 'flex', gap: '0.5rem' }}>
         <input
@@ -276,9 +284,35 @@ function DoneStep({ onFinish }) {
         </div>
       )}
 
-      <p className="text-secondary" style={{ fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+      <p className="text-secondary" style={{ fontSize: '0.85rem', marginBottom: '1rem' }}>
         텔레그램 알림, 스케줄 설정은 메뉴 &gt; 설정에서 추가로 구성할 수 있습니다.
       </p>
+
+      {/* MCP 연결 가이드 */}
+      <div style={{ textAlign: 'left', marginBottom: '1.5rem', padding: '1rem', background: 'var(--color-bg-secondary, #f8fafc)', borderRadius: '0.5rem' }}>
+        <p style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: '0.5rem' }}>Claude AI로 사용하기 (선택)</p>
+        <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.5rem' }}>
+          Claude Desktop 앱에서 AI에게 말로 검색/주문을 시킬 수 있습니다.
+        </p>
+        <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '0.3rem' }}>
+          Claude Desktop 설정 파일에 아래를 추가하세요:
+        </p>
+        <div style={{ position: 'relative' }}>
+          <pre style={{ background: '#1e293b', color: '#e2e8f0', padding: '0.75rem', borderRadius: '0.4rem', fontSize: '0.75rem', overflow: 'auto', lineHeight: 1.5 }}>
+{`{
+  "mcpServers": {
+    "domae": {
+      "command": "python",
+      "args": ["-m", "domae_mcp", "--mcp"]
+    }
+  }
+}`}
+          </pre>
+        </div>
+        <p className="text-secondary" style={{ fontSize: '0.75rem', marginTop: '0.5rem' }}>
+          설정 파일 위치: <code style={{ fontSize: '0.7rem' }}>%APPDATA%\Claude\claude_desktop_config.json</code>
+        </p>
+      </div>
 
       <button className="btn-primary" onClick={onFinish} style={{ padding: '0.6rem 2rem' }}>
         검색 시작하기
