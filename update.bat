@@ -1,56 +1,57 @@
 @echo off
-chcp 65001 >nul
+
 echo.
 echo ========================================
-echo   마이팜 도매 통합검색 - 업데이트
+echo   Maipharm Domae - Update
 echo ========================================
 echo.
 
-:: Python 확인
+:: Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [오류] Python이 설치되어 있지 않습니다.
-    echo        먼저 install.bat를 실행해주세요.
+    echo [ERROR] Python is not installed.
+    echo         Please run install.bat first.
     pause
     exit /b 1
 )
 
-:: git 확인
+:: Check git
 git --version >nul 2>&1
 if errorlevel 1 (
-    echo [!] git이 없습니다. 수동 업데이트가 필요합니다.
+    echo [!] git is not installed.
     echo.
-    echo 1. https://github.com/guinnessNet/maipharm-domae-mcp 에서 최신 버전 다운로드
-    echo 2. 기존 폴더에 덮어쓰기
-    echo 3. install.bat 실행
+    echo Manual update:
+    echo 1. Download latest from GitHub Releases
+    echo 2. Extract to this folder (overwrite)
+    echo 3. Run install.bat
     echo.
     pause
     exit /b 1
 )
 
-echo [1/2] 최신 버전 다운로드 중...
+echo [1/2] Downloading latest version...
 git pull --ff-only
 if errorlevel 1 (
     echo.
-    echo [!] 자동 업데이트 실패. 수동 업데이트를 시도하세요.
-    echo     git stash 후 다시 시도하거나, 새로 다운로드하세요.
+    echo [!] Auto-update failed.
+    echo     Try: git stash then run again, or download fresh.
     pause
     exit /b 1
 )
 
-echo [2/2] 패키지 재설치 중...
+echo [2/2] Reinstalling package...
 pip install . --quiet
 if errorlevel 1 (
-    echo [오류] 패키지 설치 실패. install.bat를 다시 실행해주세요.
+    echo [ERROR] Package install failed. Run install.bat again.
     pause
     exit /b 1
 )
 
 echo.
 echo ========================================
-echo   업데이트 완료!
+echo   Update Complete!
 echo ========================================
 echo.
-echo   start.bat로 실행하세요.
+echo   Run start.bat to start.
 echo.
 pause
