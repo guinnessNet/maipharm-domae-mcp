@@ -3,10 +3,24 @@ import importlib.util
 import json
 import logging
 import os
+import random
+import string
 import sys
 import tempfile
 import time
 from datetime import datetime
+
+
+def _generate_cuid() -> str:
+    """Prisma cuid() 호환 ID 생성 (25자, 'c'로 시작)."""
+    ts = int(time.time() * 1000)
+    ts_part = ""
+    base = 36
+    while ts > 0:
+        ts_part = string.digits[ts % base] if ts % base < 10 else chr(ord('a') + ts % base - 10) + ts_part
+        ts //= base
+    rand_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+    return f"c{ts_part}{rand_part}"[:25]
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +168,8 @@ class CloudScheduler:
             cur.execute("""
                 INSERT INTO domae_cloud_results
                 (id, "monitorId", keyword, supplier, "productName", unit, price, quantity, "productId", "searchedAt")
-                VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """, (
-                monitor_id, r["keyword"], r["supplier"], r["product_name"],
+                _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
                 r.get("unit"), r.get("price"), r.get("quantity"), r.get("product_id"),
             ))
