@@ -1,37 +1,36 @@
 @echo off
-chcp 65001 >nul
 
-:: Python 확인
+:: Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [오류] Python이 설치되어 있지 않습니다.
-    echo        먼저 install.bat를 실행해주세요.
+    echo [ERROR] Python is not installed.
+    echo         Please run install.bat first.
     echo.
     pause
     exit /b 1
 )
 
-:: 패키지 설치 확인
+:: Check package
 python -c "import domae_mcp" >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [오류] 도매 통합검색이 설치되어 있지 않습니다.
-    echo        먼저 install.bat를 실행해주세요.
+    echo [ERROR] Maipharm Domae is not installed.
+    echo         Please run install.bat first.
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo  마이팜 도매 통합검색
+echo  Maipharm Domae
 echo  ────────────────────
-echo  브라우저에서 http://localhost:5900 접속하세요.
-echo  종료하려면 이 창을 닫으세요.
+echo  Open http://localhost:5900 in your browser.
+echo  Close this window to stop the server.
 echo.
 
-:: 2초 후 브라우저 자동 열기
+:: Open browser after 2 seconds
 start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5900"
 
-:: 서버 실행
+:: Run server
 python -m domae_mcp
