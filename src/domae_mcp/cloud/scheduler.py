@@ -334,12 +334,236 @@ class CloudScheduler:
             self._db_pool.putconn(conn)
 
     def order(self, job: dict):
-        """단건 주문 (F-2에서 구현)"""
-        logger.info("order: %s (미구현)", job.get("monitor_id"))
+        """단건 주문 실행 — response_key로 결과 반환"""
+        monitor_id = job["monitor_id"]
+        response_key = job["response_key"]
+        supplier_name = job["supplier"]
+        product_id = job["product_id"]
+        quantity = job["quantity"]
+
+        conn = self._db_pool.getconn()
+        try:
+            # 1. credentials 조회
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT m.credentials
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s AND m."isActive" = true
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                self._redis.lpush(response_key, json.dumps({"success": False, "message": "모니터 없음"}))
+                return
+
+            raw_creds = row[0]
+            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
+                from domae_mcp.cloud.crypto import decrypt_credentials
+                credentials = decrypt_credentials(raw_creds)
+            else:
+                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+
+            # 2. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            cred = credentials.get(supplier_name)
+            if not cred:
+                self._redis.lpush(response_key, json.dumps({
+                    "success": False, "message": f"{supplier_name} 계정 미등록"
+                }))
+                return
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                self._redis.lpush(response_key, json.dumps({
+                    "success": False, "message": f"{supplier_name} 크롤러 없음"
+                }))
+                return
+
+            # 3. 주문 실행
+            crawler = crawler_cls()
+            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            result = crawler.order(product_id, quantity)
+
+            self._redis.lpush(response_key, json.dumps({
+                "success": result.success,
+                "order_id": getattr(result, "order_id", None),
+                "message": getattr(result, "message", ""),
+            }))
+
+            logger.info("order 완료: monitor=%s supplier=%s success=%s", monitor_id, supplier_name, result.success)
+
+        except Exception as e:
+            logger.error("order 실패 [%s]: %s", monitor_id, e, exc_info=True)
+            self._redis.lpush(response_key, json.dumps({"success": False, "message": str(e)}))
+        finally:
+            self._db_pool.putconn(conn)
 
     def batch_order(self, job: dict):
-        """일괄 주문 (F-2에서 구현)"""
-        logger.info("batch_order: %s (미구현)", job.get("monitor_id"))
+        """일괄 주문 — DB에 직접 결과 기록 (비동기 배치)"""
+        monitor_id = job["monitor_id"]
+        batch_id = job["batch_id"]
+        items = job.get("items", [])
+
+        conn = self._db_pool.getconn()
+        try:
+            cur = conn.cursor()
+
+            # 1. batch status → processing
+            utc_now = datetime.now(timezone.utc)
+            cur.execute(
+                'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
+                ("processing", batch_id, monitor_id)
+            )
+            conn.commit()
+
+            # 2. credentials 조회
+            cur.execute("""
+                SELECT m.credentials, m."telegramToken", m."telegramChatId"
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    'UPDATE domae_order_batches SET status = %s WHERE id = %s',
+                    ("failed", batch_id)
+                )
+                conn.commit()
+                return
+
+            raw_creds = row[0]
+            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
+                from domae_mcp.cloud.crypto import decrypt_credentials
+                credentials = decrypt_credentials(raw_creds)
+            else:
+                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+
+            telegram_token = row[1]
+            telegram_chat_id = row[2]
+
+            # 3. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            # 4. 순차 주문 처리
+            success_count = 0
+            fail_count = 0
+            logged_in_crawlers = {}  # 도매상별 로그인 캐시
+
+            for item in items:
+                supplier_name = item.get("supplier")
+                product_id_val = item.get("product_id")
+                product_name = item.get("product_name", "")
+                insurance_code = item.get("insurance_code")
+                unit = item.get("unit")
+                qty = item.get("quantity", 1)
+                cart_item_id = item.get("cart_item_id")
+
+                order_success = False
+                order_id_val = None
+                order_message = ""
+                order_price = item.get("price")
+
+                try:
+                    if not supplier_name:
+                        order_message = "도매상 미지정"
+                        raise ValueError(order_message)
+
+                    cred = credentials.get(supplier_name)
+                    if not cred:
+                        order_message = f"{supplier_name} 계정 미등록"
+                        raise ValueError(order_message)
+
+                    crawler_cls = self._crawlers.get(supplier_name)
+                    if not crawler_cls:
+                        order_message = f"{supplier_name} 크롤러 없음"
+                        raise ValueError(order_message)
+
+                    # 도매상별 로그인 캐시
+                    if supplier_name not in logged_in_crawlers:
+                        crawler = crawler_cls()
+                        crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+                        logged_in_crawlers[supplier_name] = crawler
+
+                    crawler = logged_in_crawlers[supplier_name]
+                    result = crawler.order(product_id_val, qty)
+                    order_success = result.success
+                    order_id_val = getattr(result, "order_id", None)
+                    order_message = getattr(result, "message", "")
+
+                except Exception as e:
+                    order_message = order_message or str(e)
+
+                # DomaeCloudOrder INSERT
+                utc_now = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO domae_cloud_orders
+                    (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
+                     quantity, price, success, "productId", "orderId", message, "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), monitor_id, batch_id, supplier_name or "",
+                    product_name, unit, insurance_code,
+                    qty, order_price, order_success,
+                    product_id_val, order_id_val, order_message, utc_now,
+                ))
+
+                if order_success:
+                    success_count += 1
+                    # 장바구니에서 제거
+                    if cart_item_id:
+                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                else:
+                    fail_count += 1
+                    # 장바구니에 실패 사유 기록
+                    if cart_item_id:
+                        cur.execute(
+                            'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                            (utc_now, order_message, cart_item_id)
+                        )
+
+                # batch 카운트 업데이트
+                cur.execute("""
+                    UPDATE domae_order_batches
+                    SET "successCount" = %s, "failCount" = %s
+                    WHERE id = %s
+                """, (success_count, fail_count, batch_id))
+                conn.commit()
+
+                time.sleep(2)  # 주문 간 딜레이
+
+            # 5. batch 완료
+            utc_now = datetime.now(timezone.utc)
+            cur.execute("""
+                UPDATE domae_order_batches
+                SET status = %s, "completedAt" = %s
+                WHERE id = %s
+            """, ("completed", utc_now, batch_id))
+            conn.commit()
+
+            # 6. 텔레그램 알림
+            if telegram_token or telegram_chat_id:
+                try:
+                    from domae_mcp.cloud.notifier import Notifier
+                    msg = f"📦 도매 일괄주문 완료\n\n성공: {success_count}건\n실패: {fail_count}건"
+                    Notifier.send_telegram(telegram_token, telegram_chat_id, msg)
+                except Exception as e:
+                    logger.warning("텔레그램 알림 실패: %s", e)
+
+            logger.info("batch_order 완료: batch=%s success=%d fail=%d", batch_id, success_count, fail_count)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("batch_order 실패 [%s]: %s", batch_id, e, exc_info=True)
+            try:
+                cur = conn.cursor()
+                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                conn.commit()
+            except Exception:
+                pass
+        finally:
+            self._db_pool.putconn(conn)
 
     def urgent_order_immediate(self, job: dict):
         """긴급주문 즉시 실행 (F-4에서 구현)"""
