@@ -146,20 +146,26 @@ API 키 없으면 크롤러 0개 → 검색/주문 불가.
 ## 시놀로지 프록시 (클라우드 워커용)
 
 일부 도매 사이트(티제이팜 등)가 NCloud 데이터센터 IP(49.50.135.x)를 차단함.
-시놀로지 NAS에 tinyproxy Docker 컨테이너를 띄워 가정용 IP로 우회.
+시놀로지 NAS에 tinyproxy Docker 컨테이너를 띄워 가정용 IP(121.168.79.102)로 우회.
 
 ### 구성
-- **시놀로지**: 192.168.0.4 (내부) / 121.168.79.102 (외부), SSH 포트 24
-- **프록시**: tinyproxy Docker, `--network host`, 포트 8888
-- **IP 화이트리스트**: 서버1(49.50.135.173), 서버2(49.50.135.178)만 허용
-- **공유기 포트포워딩**: 외부 8888 → 192.168.0.4:8888
+
+| 항목 | 값 |
+|------|-----|
+| 시놀로지 내부 IP | 192.168.0.4 |
+| 시놀로지 외부 IP | 121.168.79.102 |
+| SSH | 포트 24, 계정 guinness90 / R4wBNJGSJAwthnL |
+| 프록시 | tinyproxy Docker, `--network host`, 포트 8888 |
+| IP 화이트리스트 | 서버1(49.50.135.173), 서버2(49.50.135.178)만 허용 |
+| 공유기 포트포워딩 | 외부 TCP 8888 → 192.168.0.4:8888 |
+| 시놀로지 방화벽 | 8888 포트 허용 필요 |
 
 ### 프록시 컨테이너 관리
 ```bash
 # SSH 접속
 sshpass -p 'R4wBNJGSJAwthnL' ssh -p 24 guinness90@192.168.0.4
 
-# 재생성 (IP 화이트리스트 적용)
+# 재생성 (IP 화이트리스트 적용, --network host 필수)
 sudo docker rm -f domae-proxy
 sudo docker run -d --name domae-proxy --restart unless-stopped \
   --network host monokal/tinyproxy 49.50.135.178 49.50.135.173
@@ -171,18 +177,56 @@ sudo docker logs domae-proxy --tail 20
 sudo docker ps | grep proxy
 ```
 
-### 크롤러 적용
-티제이팜 크롤러는 환경변수 `DOMAE_PROXY_URL`이 설정되면 자동으로 프록시 경유:
+> **주의**: `--network host`를 사용해야 실제 클라이언트 IP로 화이트리스트가 동작함.
+> Docker 브릿지 네트워크(-p 포트매핑)를 쓰면 모든 요청이 172.17.0.1로 보여서 화이트리스트가 무효화됨.
+
+### 워커 환경변수
+
+서버2 `/opt/domae-worker/.env`에 추가:
 ```
 DOMAE_PROXY_URL=http://121.168.79.102:8888
 ```
-서버2 워커의 PM2 환경변수에 추가 필요.
 
-### 새 도매상 차단 시
-1. NCloud 서버에서 직접 접속 테스트 → 차단 확인
-2. 해당 크롤러 `__init__`에 `DOMAE_PROXY_URL` 프록시 설정 추가
-3. seed-crawlers.ts 재실행
-4. 워커 재시작
+### 워커 PM2 시작 명령
+
+`.env` 파일을 source해야 환경변수가 Python 프로세스에 전달됨:
+```bash
+pm2 delete domae-cloud-worker
+pm2 start /usr/bin/bash --name domae-cloud-worker --cwd /opt/domae-worker \
+  -- -c 'set -a; source /opt/domae-worker/.env; set +a; venv/bin/python3 -m domae_mcp.cloud'
+pm2 save
+```
+
+> **주의**: `pm2 restart`는 `--update-env` 없이 환경변수를 갱신하지 않음.
+> `.env` 변경 시 `pm2 delete` 후 재시작 필요.
+
+### 크롤러에 프록시 적용하는 방법
+
+차단된 도매상 크롤러의 `__init__`에 추가:
+```python
+import os
+
+class XxxCrawler(BaseCrawler):
+    PROXY_URL = os.environ.get("DOMAE_PROXY_URL", "")
+
+    def __init__(self):
+        super().__init__()
+        if self.PROXY_URL:
+            self.session.proxies = {"http": self.PROXY_URL, "https": self.PROXY_URL}
+```
+
+### 새 도매상 차단 확인 및 대응
+1. 서버2에서 직접 접속 테스트:
+   ```bash
+   /opt/domae-worker/venv/bin/python -c "import requests; r=requests.get('https://도매상URL'); print(r.status_code, r.text[:200])"
+   ```
+2. "접근 경로가 올바르지 않습니다" 또는 로그인 세션 미생성 → IP 차단 확인
+3. 해당 크롤러에 위 프록시 코드 추가 (`pharmsquare-server-main/prisma/seeds/domae-crawlers/`)
+4. 서버1: `npx ts-node prisma/seed-crawlers.ts`
+5. 서버2: `pm2 restart domae-cloud-worker`
+
+### 현재 차단 확인된 도매상
+- **티제이팜** (tjp.co.kr) — NCloud IP 차단, 프록시 경유 적용 완료
 
 ## Git Commit
 - 커밋 메시지는 항상 한글로 간략하게 작성한다 (1줄, 50자 이내 권장)
