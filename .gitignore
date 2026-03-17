@@ -45,6 +45,7 @@ src/domae_mcp/core/crawlers/upharmmall.py
 src/domae_mcp/core/crawlers/ndrug.py
 src/domae_mcp/core/crawlers/dohyunpharm.py
 src/domae_mcp/core/crawlers/samsungpharm.py
+src/domae_mcp/core/crawlers/familypharm.py
 
 # Playwright MCP 로그
 .playwright-mcp/
