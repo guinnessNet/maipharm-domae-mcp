@@ -163,6 +163,7 @@ class CloudScheduler:
                         "supplier": supplier_name,
                         "product_name": r.product_name,
                         "unit": r.unit,
+                        "insurance_code": getattr(r, "insurance_code", None),
                         "price": r.price,
                         "quantity": r.quantity,
                         "product_id": r.product_id,
@@ -182,11 +183,11 @@ class CloudScheduler:
         for r in results:
             cur.execute("""
                 INSERT INTO domae_cloud_results
-                (id, "monitorId", keyword, supplier, "productName", unit, price, quantity, "productId", "searchedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (id, "monitorId", keyword, supplier, "productName", unit, "insuranceCode", price, quantity, "productId", "searchedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
-                r.get("unit"), r.get("price"), r.get("quantity"), r.get("product_id"), utc_now,
+                r.get("unit"), r.get("insurance_code"), r.get("price"), r.get("quantity"), r.get("product_id"), utc_now,
             ))
 
     def _detect_changes(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
@@ -231,3 +232,19 @@ class CloudScheduler:
             # 재고 증가 (0 → N)
             if (not prev["quantity"] or prev["quantity"] == 0) and r.get("quantity") and r["quantity"] > 0:
                 changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {r['quantity']}개")
+
+    def search_on_demand(self, job: dict):
+        """온디맨드 검색 (F-1에서 구현)"""
+        logger.info("search_on_demand: %s (미구현)", job.get("monitor_id"))
+
+    def order(self, job: dict):
+        """단건 주문 (F-2에서 구현)"""
+        logger.info("order: %s (미구현)", job.get("monitor_id"))
+
+    def batch_order(self, job: dict):
+        """일괄 주문 (F-2에서 구현)"""
+        logger.info("batch_order: %s (미구현)", job.get("monitor_id"))
+
+    def urgent_order_immediate(self, job: dict):
+        """긴급주문 즉시 실행 (F-4에서 구현)"""
+        logger.info("urgent_order_immediate: %s (미구현)", job.get("monitor_id"))

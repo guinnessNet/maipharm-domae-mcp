@@ -49,16 +49,29 @@ class CloudWorker:
                 _, job_data = result
                 job = json.loads(job_data)
                 monitor_id = job.get("monitor_id")
+                action = job.get("action", "monitor")
 
-                logger.info("잡 수신: %s", monitor_id)
+                logger.info("잡 수신: monitor=%s action=%s", monitor_id, action)
 
                 try:
-                    self._scheduler.execute(job)
+                    if action == "monitor":
+                        self._scheduler.execute(job)
+                    elif action == "search_on_demand":
+                        self._scheduler.search_on_demand(job)
+                    elif action == "order":
+                        self._scheduler.order(job)
+                    elif action == "batch_order":
+                        self._scheduler.batch_order(job)
+                    elif action == "urgent_order_immediate":
+                        self._scheduler.urgent_order_immediate(job)
+                    else:
+                        logger.warning("알 수 없는 action: %s", action)
                 except Exception as e:
-                    logger.error("잡 실행 실패 [%s]: %s", monitor_id, e)
+                    logger.error("잡 실행 실패 [%s/%s]: %s", monitor_id, action, e)
                 finally:
-                    # 실행 완료 → 락 해제
-                    self._redis.delete(f"domae:running:{monitor_id}")
+                    # 실행 완료 → 락 해제 (모니터링 잡만)
+                    if action == "monitor":
+                        self._redis.delete(f"domae:running:{monitor_id}")
 
             except redis.ConnectionError:
                 logger.warning("Redis 연결 끊김, 5초 후 재시도")
