@@ -152,7 +152,7 @@ Base URL: `http://localhost:5900/api`
 ```json
 {
   "credentials": [
-    { "supplier": "지오영", "login_id": "***REMOVED***", "login_pw": "****", "configured": true },
+    { "supplier": "지오영", "login_id": "your_id", "login_pw": "****", "configured": true },
     { "supplier": "복산", "login_id": "", "login_pw": "", "configured": false }
   ]
 }
@@ -166,8 +166,8 @@ Base URL: `http://localhost:5900/api`
 ```json
 {
   "supplier": "지오영",
-  "login_id": "***REMOVED***",
-  "login_pw": "***REMOVED***"
+  "login_id": "your_id",
+  "login_pw": "your_password"
 }
 ```
 
