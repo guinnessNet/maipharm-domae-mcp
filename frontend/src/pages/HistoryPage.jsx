@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import client from '../api/client';
+import { addToCart } from '../utils/cart.js';
 
 const PAGE_SIZE = 50;
 
@@ -42,10 +43,26 @@ export default function HistoryPage() {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
 
+  const [toast, setToast] = useState('');
+
   // Client-side filters
   const [filterSupplier, setFilterSupplier] = useState('');
   const [filterResult, setFilterResult] = useState('all'); // all | success | fail
   const [filterKeyword, setFilterKeyword] = useState('');
+
+  const handleReorder = (order) => {
+    addToCart({
+      supplier: order.supplier,
+      productName: order.product_name,
+      unit: order.unit,
+      productId: order.product_id,
+      price: order.price,
+      quantity: order.quantity || 1,
+    });
+    window.dispatchEvent(new CustomEvent('cart-updated'));
+    setToast('장바구니에 추가됨');
+    setTimeout(() => setToast(''), 2000);
+  };
 
   const fetchOrders = useCallback(async (currentOffset) => {
     try {
@@ -159,6 +176,7 @@ export default function HistoryPage() {
                 <th>가격</th>
                 <th>결과</th>
                 <th>메시지</th>
+                <th>재주문</th>
               </tr>
             </thead>
             <tbody>
@@ -184,6 +202,20 @@ export default function HistoryPage() {
                   <td style={styles.message} title={order.message || ''}>
                     {order.message || '-'}
                   </td>
+                  <td>
+                    {order.success && order.product_id ? (
+                      <button
+                        className="btn-reorder btn-sm"
+                        onClick={() => handleReorder(order)}
+                      >
+                        재주문
+                      </button>
+                    ) : (
+                      <span className="text-secondary" style={{ fontSize: '0.8rem' }}>
+                        {order.success ? '검색 필요' : '-'}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -206,6 +238,8 @@ export default function HistoryPage() {
           </div>
         </>
       )}
+
+      {toast && <div className="cart-toast">{toast}</div>}
     </div>
   );
 }

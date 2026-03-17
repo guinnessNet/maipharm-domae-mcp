@@ -55,6 +55,7 @@ class OrderService:
         # DB 저장
         order = Order(
             supplier=supplier,
+            product_id=product_id,
             product_name=product_name,
             quantity=quantity,
             success=result.success,

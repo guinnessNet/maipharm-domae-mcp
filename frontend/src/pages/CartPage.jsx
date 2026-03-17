@@ -38,35 +38,46 @@ export default function CartPage() {
     if (cart.length === 0) return;
     if (!window.confirm(`${cart.length}건의 주문을 일괄 실행하시겠습니까?`)) return;
 
-    const results = [];
-    setCheckoutProgress({ current: 0, total: cart.length, results });
+    setCheckoutProgress({ current: 0, total: cart.length, results: [] });
 
-    for (let i = 0; i < cart.length; i++) {
-      const item = cart[i];
-      setCheckoutProgress((prev) => ({ ...prev, current: i + 1 }));
+    // Group by supplier
+    const groups = {};
+    cart.forEach((item) => {
+      const key = item.supplier || '알 수 없음';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
+    });
 
-      try {
-        const { data } = await client.post('/orders', {
-          supplier: item.supplier,
-          product_id: item.productId,
-          product_name: item.productName,
-          quantity: item.quantity || 1,
-        });
-        results.push({ ...item, success: true, message: data.message || '주문 완료' });
-      } catch (err) {
-        results.push({
-          ...item,
-          success: false,
-          message: err.response?.data?.detail || '주문 실패',
-        });
+    let completed = 0;
+    const allResults = [];
+
+    // Parallel by supplier, sequential within supplier
+    const promises = Object.entries(groups).map(async ([, items]) => {
+      for (const item of items) {
+        let result;
+        try {
+          const { data } = await client.post('/orders', {
+            supplier: item.supplier,
+            product_id: item.productId,
+            product_name: item.productName,
+            quantity: item.quantity || 1,
+          });
+          result = { ...item, success: true, message: data.message || '주문 완료' };
+        } catch (err) {
+          result = { ...item, success: false, message: err.response?.data?.detail || '주문 실패' };
+        }
+        completed++;
+        allResults.push(result);
+        setCheckoutProgress((prev) => ({ ...prev, current: completed, results: [...allResults] }));
       }
+    });
 
-      setCheckoutProgress((prev) => ({ ...prev, results: [...results] }));
-    }
+    await Promise.allSettled(promises);
 
     // Clear cart after checkout
     setCart(clearCart());
     window.dispatchEvent(new Event('cart-updated'));
+    setCheckoutProgress((prev) => ({ ...prev, current: cart.length, results: [...allResults] }));
   };
 
   // Group items by supplier

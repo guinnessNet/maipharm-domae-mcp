@@ -112,7 +112,7 @@ def get_setup_status():
 
     return SetupStatusResponse(
         api_key_set=bool(api_key),
-        api_key_prefix=api_key[:16] + "..." if api_key and len(api_key) > 16 else (api_key or ""),
+        api_key_prefix=api_key[:4] + "..." if api_key and len(api_key) > 4 else (api_key or ""),
         credentials_configured=configured,
         credentials_total=len(creds),
         telegram_set=bool(tg.get("token") and tg.get("chat_id")),

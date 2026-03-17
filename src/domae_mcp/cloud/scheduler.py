@@ -130,13 +130,14 @@ class CloudScheduler:
 
         for name, code, code_hash in rows:
             # SHA-256 해시 검증
-            if code_hash is not None:
-                computed = hashlib.sha256(code.encode("utf-8")).hexdigest()
-                if computed != code_hash:
-                    logger.warning("크롤러 코드 해시 불일치 [%s]: expected=%s actual=%s — 스킵", name, code_hash, computed)
-                    continue
-            else:
-                logger.warning("크롤러 코드 해시 없음 [%s]: codeHash=NULL — 해시 검증 없이 로드", name)
+            if code_hash is None:
+                logger.error("크롤러 [%s] 로드 거부: codeHash가 NULL입니다. 보안 정책에 의해 해시 없는 코드는 실행할 수 없습니다.", name)
+                continue
+
+            computed = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            if computed != code_hash:
+                logger.error("크롤러 [%s] 로드 거부: 코드 해시 불일치 (expected=%s, computed=%s)", name, code_hash[:16], computed[:16])
+                continue
 
             try:
                 file_path = os.path.join(cache_dir, f"{name}.py")

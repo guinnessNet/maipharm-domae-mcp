@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import JSONResponse
 
 from domae_mcp.local.config import ConfigManager
 from domae_mcp.local.database import init_db
@@ -51,6 +52,13 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def localhost_only(request: Request, call_next):
+    client_ip = request.client.host if request.client else None
+    if client_ip not in ("127.0.0.1", "::1"):
+        return JSONResponse(status_code=403, content={"detail": "로컬 접근만 허용됩니다"})
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,

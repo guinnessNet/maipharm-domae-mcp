@@ -36,6 +36,7 @@ class PlaceOrderResponse(BaseModel):
 class OrderHistoryItem(BaseModel):
     id: int
     supplier: str
+    product_id: Optional[str] = None
     product_name: str
     unit: Optional[str] = None
     quantity: Optional[int] = None
@@ -107,6 +108,7 @@ def get_orders(
         OrderHistoryItem(
             id=o.id,
             supplier=o.supplier,
+            product_id=o.product_id,
             product_name=o.product_name,
             unit=o.unit,
             quantity=o.quantity,

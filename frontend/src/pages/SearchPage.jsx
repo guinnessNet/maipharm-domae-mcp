@@ -157,7 +157,7 @@ export default function SearchPage() {
                   <td>
                     {row.productName}
                     {row.maker && (
-                      <span className="text-secondary" style={{ fontSize: '0.78rem', display: 'block' }}>
+                      <span className="text-secondary" style={{ fontSize: '0.85rem', display: 'block' }}>
                         {row.maker}
                       </span>
                     )}
@@ -177,7 +177,7 @@ export default function SearchPage() {
                       style={{ width: '4rem' }}
                     />
                   </td>
-                  <td style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
+                  <td style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
                     {status?.loading ? (
                       <span className="loading-spinner" />
                     ) : status?.success === true ? (
@@ -250,7 +250,7 @@ export default function SearchPage() {
                   <td>
                     {orderConfirm.productName}
                     {orderConfirm.maker && (
-                      <span className="text-secondary" style={{ fontSize: '0.78rem', marginLeft: '0.4rem' }}>
+                      <span className="text-secondary" style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>
                         ({orderConfirm.maker})
                       </span>
                     )}
@@ -261,10 +261,18 @@ export default function SearchPage() {
                   <td>{orderConfirm.qty}</td>
                 </tr>
                 {orderConfirm.price != null && (
-                  <tr>
-                    <th>단가</th>
-                    <td>{orderConfirm.price.toLocaleString()}원</td>
-                  </tr>
+                  <>
+                    <tr>
+                      <th>단가</th>
+                      <td>{orderConfirm.price.toLocaleString()}원</td>
+                    </tr>
+                    <tr>
+                      <th>총 금액</th>
+                      <td style={{ fontWeight: 700, color: 'var(--color-primary)' }}>
+                        {(orderConfirm.price * orderConfirm.qty).toLocaleString()}원
+                      </td>
+                    </tr>
+                  </>
                 )}
               </tbody>
             </table>
