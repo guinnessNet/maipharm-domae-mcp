@@ -320,6 +320,8 @@ class CloudScheduler:
                 self._load_crawlers(conn)
 
             # 3. 대상 도매상 결정
+            logger.info("크롤러 목록: %s", list(self._crawlers.keys()))
+            logger.info("credentials 목록: %s", list(credentials.keys()))
             target_suppliers = {}
             for supplier_name, crawler_cls in self._crawlers.items():
                 if requested_suppliers and supplier_name not in requested_suppliers:
@@ -339,6 +341,7 @@ class CloudScheduler:
                     for keyword in keywords:
                         try:
                             search_results = crawler.search(keyword)
+                            logger.debug("검색 결과 [%s/%s]: %d건", supplier_name, keyword, len(search_results))
                             for r in search_results:
                                 supplier_results.append({
                                     "keyword": keyword,
