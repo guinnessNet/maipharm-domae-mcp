@@ -54,7 +54,7 @@ class CloudWorker:
                 logger.info("잡 수신: monitor=%s action=%s", monitor_id, action)
 
                 try:
-                    if action == "monitor":
+                    if action in ("monitor", "search"):
                         self._scheduler.execute(job)
                     elif action == "search_on_demand":
                         self._scheduler.search_on_demand(job)
@@ -72,7 +72,7 @@ class CloudWorker:
                     logger.error("잡 실행 실패 [%s/%s]: %s", monitor_id, action, e)
                 finally:
                     # 실행 완료 → 락 해제 (모니터링 잡만)
-                    if action == "monitor":
+                    if action in ("monitor", "search") and monitor_id:
                         self._redis.delete(f"domae:running:{monitor_id}")
 
             except redis.ConnectionError:
