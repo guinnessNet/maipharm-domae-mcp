@@ -134,7 +134,7 @@ API 키 없으면 크롤러 0개 → 검색/주문 불가.
 - requirements.txt에 포함된 패키지만 사용 가능 (새 의존성 추가 시 requirements.txt 먼저 업데이트)
 
 ### 도매상별 주의사항
-- 티제이팜: login_p=2, referer 필수, ItemToken 캐싱
+- 티제이팜: login_p=2, referer 필수, X-Requested-With: XMLHttpRequest 필수 (없으면 9999 에러), ItemToken 캐싱
 - 인천/복산 (NicePharm): 장바구니 읽기는 Bag.asp
 - 백제: JWT Bearer, product_id는 ITEM_CD|ITEM_GB_CD
 - HMP: DWR 프로토콜, 주문 미구현
