@@ -192,6 +192,16 @@ class CloudScheduler:
                 _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
                 r.get("unit"), r.get("insurance_code"), r.get("price"), r.get("quantity"), r.get("product_id"), utc_now,
             ))
+            # 스냅샷 저장
+            cur.execute("""
+                INSERT INTO domae_inventory_snapshots
+                (id, "monitorId", supplier, "productName", unit, "insuranceCode", quantity, price, "productId", "scannedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                _generate_cuid(), monitor_id, r["supplier"], r["product_name"],
+                r.get("unit"), r.get("insurance_code"), r.get("quantity"), r.get("price"),
+                r.get("product_id"), utc_now,
+            ))
 
     def _detect_changes(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
         """이전 검색 결과와 비교하여 변동 사항 감지.
