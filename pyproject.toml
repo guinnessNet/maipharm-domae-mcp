@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maipharm-domae-mcp"
-version = "1.1.0"
+version = "1.2.0"
 description = "의약품 도매 통합 검색/주문 MCP 서버"
 requires-python = ">=3.10"
 dependencies = [
