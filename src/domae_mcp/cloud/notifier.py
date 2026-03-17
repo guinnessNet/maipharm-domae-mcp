@@ -6,7 +6,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("DOMAE_TELEGRAM_BOT_TOKEN", "8741731287:AAEpV6wwn2ubQ-fEQzsPerP9djIRxHPGtWs")
+BOT_TOKEN = os.environ.get("DOMAE_TELEGRAM_BOT_TOKEN", "")
 
 
 class Notifier:
