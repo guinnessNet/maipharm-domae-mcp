@@ -1,19 +1,22 @@
 """알림 발송 (텔레그램/카카오)"""
 import logging
+import os
 
 import requests
 
 logger = logging.getLogger(__name__)
 
+BOT_TOKEN = os.environ.get("DOMAE_TELEGRAM_BOT_TOKEN", "8741731287:AAEpV6wwn2ubQ-fEQzsPerP9djIRxHPGtWs")
+
 
 class Notifier:
     @staticmethod
-    def send_telegram(token: str, chat_id: str, message: str) -> bool:
-        if not token or not chat_id:
+    def send_telegram(chat_id: str, message: str) -> bool:
+        if not BOT_TOKEN or not chat_id:
             return False
         try:
             resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
                 timeout=10,
             )

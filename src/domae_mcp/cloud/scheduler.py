@@ -51,7 +51,7 @@ class CloudScheduler:
             cur = conn.cursor()
             cur.execute("""
                 SELECT m.id, m.products, m.credentials,
-                       m."telegramToken", m."telegramChatId", m."kakaoUserId",
+                       m."telegramChatId", m."kakaoUserId",
                        k.tier
                 FROM domae_cloud_monitors m
                 JOIN domae_api_keys k ON m."apiKeyId" = k.id
@@ -65,9 +65,8 @@ class CloudScheduler:
             products = json.loads(row[1]) if isinstance(row[1], str) else row[1]
             raw_creds = row[2]
             credentials = self._decrypt_creds(raw_creds)
-            telegram_token = row[3]
-            telegram_chat_id = row[4]
-            tier = row[6]
+            telegram_chat_id = row[3]
+            tier = row[5]
 
             # 2. 크롤러 로드 (최초 1회)
             if not self._crawlers_loaded:
@@ -100,10 +99,10 @@ class CloudScheduler:
                     changes = self._detect_changes(conn, monitor_id, keyword, keyword_results)
                     all_changes.extend(changes)
 
-            if all_changes and (telegram_token or telegram_chat_id):
+            if all_changes and telegram_chat_id:
                 from domae_mcp.cloud.notifier import Notifier
                 message = f"🔔 도매 모니터링 알림\n\n" + "\n".join(all_changes)
-                Notifier.send_telegram(telegram_token, telegram_chat_id, message)
+                Notifier.send_telegram(telegram_chat_id, message)
 
             logger.info("모니터 %s 완료: %d건 검색, %d건 변동", monitor_id, len(all_results), len(all_changes))
 
@@ -441,7 +440,7 @@ class CloudScheduler:
 
             # 2. credentials 조회
             cur.execute("""
-                SELECT m.credentials, m."telegramToken", m."telegramChatId"
+                SELECT m.credentials, m."telegramChatId"
                 FROM domae_cloud_monitors m
                 WHERE m.id = %s
             """, (monitor_id,))
@@ -457,8 +456,7 @@ class CloudScheduler:
             raw_creds = row[0]
             credentials = self._decrypt_creds(raw_creds)
 
-            telegram_token = row[1]
-            telegram_chat_id = row[2]
+            telegram_chat_id = row[1]
 
             # 3. 크롤러 로드
             if not self._crawlers_loaded:
@@ -561,11 +559,11 @@ class CloudScheduler:
             conn.commit()
 
             # 6. 텔레그램 알림
-            if telegram_token or telegram_chat_id:
+            if telegram_chat_id:
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     msg = f"📦 도매 일괄주문 완료\n\n성공: {success_count}건\n실패: {fail_count}건"
-                    Notifier.send_telegram(telegram_token, telegram_chat_id, msg)
+                    Notifier.send_telegram(telegram_chat_id, msg)
                 except Exception as e:
                     logger.warning("텔레그램 알림 실패: %s", e)
 
@@ -638,6 +636,7 @@ class CloudScheduler:
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
                     # 재고 확인
+                    scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     search_results = crawler.search(product_id_val)
                     available = 0
                     for sr in search_results:
@@ -651,9 +650,9 @@ class CloudScheduler:
                         utc_now = datetime.now(timezone.utc)
                         cur.execute("""
                             INSERT INTO domae_urgent_logs
-                            (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """, (_generate_cuid(), urgent_order_id, supplier_name, 0, False, "재고 없음", utc_now))
+                            (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (_generate_cuid(), urgent_order_id, supplier_name, 0, False, "재고 없음", scanned_at, utc_now))
                         conn.commit()
                         continue
 
@@ -664,10 +663,10 @@ class CloudScheduler:
                     utc_now = datetime.now(timezone.utc)
                     cur.execute("""
                         INSERT INTO domae_urgent_logs
-                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (_generate_cuid(), urgent_order_id, supplier_name, order_qty, result.success,
-                          getattr(result, "message", ""), utc_now))
+                          getattr(result, "message", ""), scanned_at, utc_now))
 
                     if result.success:
                         filled += order_qty
@@ -817,6 +816,7 @@ class CloudScheduler:
                     crawler = crawler_cls()
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
+                    scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     search_results = crawler.search(product_id_val)
                     available = 0
                     for sr in search_results:
@@ -833,10 +833,10 @@ class CloudScheduler:
                     utc_now = datetime.now(timezone.utc)
                     cur.execute("""
                         INSERT INTO domae_urgent_logs
-                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (_generate_cuid(), uo_id, supplier_name, order_qty, result.success,
-                          getattr(result, "message", ""), utc_now))
+                          getattr(result, "message", ""), scanned_at, utc_now))
 
                     if result.success:
                         filled_this_round += order_qty
@@ -867,11 +867,11 @@ class CloudScheduler:
                     )
                     # 텔레그램 알림
                     try:
-                        cur.execute('SELECT "telegramToken", "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
+                        cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
                         tg_row = cur.fetchone()
-                        if tg_row and (tg_row[0] or tg_row[1]):
+                        if tg_row and tg_row[0]:
                             from domae_mcp.cloud.notifier import Notifier
-                            Notifier.send_telegram(tg_row[0], tg_row[1],
+                            Notifier.send_telegram(tg_row[0],
                                 f"✅ 긴급주문 완료: {product_name} {total_qty}통 확보")
                     except Exception as e:
                         logger.warning("긴급주문 알림 실패: %s", e)
