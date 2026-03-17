@@ -73,7 +73,7 @@ class CloudScheduler:
             for keyword in products:
                 results = self._search_all(keyword, credentials)
                 all_results.extend(results)
-                time.sleep(1)  # 제품 간 딜레이
+                time.sleep(0.5)  # 제품 간 딜레이
 
             # 4. 결과 저장
             if all_results:
@@ -172,7 +172,7 @@ class CloudScheduler:
                         "product_id": r.product_id,
                     })
 
-                time.sleep(2)  # 도매사이트별 2초 딜레이
+                time.sleep(0.3)  # 도매사이트별 딜레이 (서로 다른 서버)
 
             except Exception as e:
                 logger.warning("검색 실패 [%s/%s]: %s", supplier_name, keyword, e)
@@ -330,7 +330,7 @@ class CloudScheduler:
                         "error": str(e),
                     }))
 
-                time.sleep(2)  # 도매상 간 딜레이
+                time.sleep(0.3)  # 도매상 간 딜레이 (서로 다른 서버)
 
             # 5. 전체 완료
             self._redis.lpush(stream_key, json.dumps({"type": "done"}))
@@ -544,7 +544,7 @@ class CloudScheduler:
                 """, (success_count, fail_count, batch_id))
                 conn.commit()
 
-                time.sleep(2)  # 주문 간 딜레이
+                time.sleep(1)  # 주문 간 딜레이 (같은 서버 연속 주문)
 
             # 5. batch 완료
             utc_now = datetime.now(timezone.utc)
@@ -681,7 +681,7 @@ class CloudScheduler:
                     details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": str(e)})
                     logger.warning("urgent immediate [%s/%s]: %s", supplier_name, urgent_order_id, e)
 
-                time.sleep(2)
+                time.sleep(0.5)
 
             # filledQuantity 업데이트
             if filled > 0:
@@ -840,7 +840,7 @@ class CloudScheduler:
                         filled_this_round += order_qty
 
                     conn.commit()
-                    time.sleep(2)
+                    time.sleep(0.5)
 
                 except Exception as e:
                     logger.warning("urgent process [%s/%s]: %s", uo_id, supplier_name, e)
