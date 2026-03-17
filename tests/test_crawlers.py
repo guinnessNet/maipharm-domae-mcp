@@ -65,6 +65,7 @@ CRAWLER_MODULES = {
     "경동사": "ndrug",
     "도현팜": "dohyunpharm",
     "삼성팜": "samsungpharm",
+    "훼미리팜": "familypharm",
 }
 
 TEST_KEYWORD = "아목시실린"
