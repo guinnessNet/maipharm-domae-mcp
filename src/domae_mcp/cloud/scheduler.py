@@ -328,6 +328,10 @@ class CloudScheduler:
                     continue
                 cred = credentials.get(supplier_name)
                 if not cred:
+                    logger.info("스킵 [%s]: cred=%s", supplier_name, repr(cred))
+                    continue
+                if not cred.get("login_id") or not cred.get("login_pw"):
+                    logger.info("스킵 [%s]: login_id/pw 비어있음", supplier_name)
                     continue
                 target_suppliers[supplier_name] = (crawler_cls, cred)
 
