@@ -84,8 +84,8 @@ class CloudScheduler:
             if all_results:
                 self._save_results(conn, monitor_id, all_results)
 
-            # 5. lastRunAt 업데이트
-            utc_now = datetime.now()
+            # 5. lastRunAt 업데이트 (Express 크론이 Date.now() UTC와 비교하므로 반드시 UTC)
+            utc_now = datetime.now(timezone.utc)
             cur.execute(
                 'UPDATE domae_cloud_monitors SET "lastRunAt" = %s, "updatedAt" = %s WHERE id = %s',
                 (utc_now, utc_now, monitor_id)
