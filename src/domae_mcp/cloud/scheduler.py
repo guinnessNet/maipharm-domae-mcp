@@ -234,8 +234,104 @@ class CloudScheduler:
                 changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {r['quantity']}개")
 
     def search_on_demand(self, job: dict):
-        """온디맨드 검색 (F-1에서 구현)"""
-        logger.info("search_on_demand: %s (미구현)", job.get("monitor_id"))
+        """온디맨드 검색 — 도매상별로 stream_key에 결과를 실시간 전송"""
+        monitor_id = job["monitor_id"]
+        stream_key = job["stream_key"]
+        keywords = job.get("keywords", [])
+        requested_suppliers = job.get("suppliers", [])
+
+        conn = self._db_pool.getconn()
+        try:
+            # 1. 모니터 정보 조회 (credentials 가져오기)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT m.credentials
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s AND m."isActive" = true
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                self._redis.lpush(stream_key, json.dumps({"type": "error", "message": "모니터 없음 또는 비활성"}))
+                self._redis.lpush(stream_key, json.dumps({"type": "done"}))
+                return
+
+            raw_creds = row[0]
+            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
+                from domae_mcp.cloud.crypto import decrypt_credentials
+                credentials = decrypt_credentials(raw_creds)
+            else:
+                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+
+            # 2. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            # 3. 대상 도매상 결정
+            target_suppliers = {}
+            for supplier_name, crawler_cls in self._crawlers.items():
+                if requested_suppliers and supplier_name not in requested_suppliers:
+                    continue
+                cred = credentials.get(supplier_name)
+                if not cred:
+                    continue
+                target_suppliers[supplier_name] = (crawler_cls, cred)
+
+            # 4. 도매상별 검색 + 즉시 stream 전송
+            for supplier_name, (crawler_cls, cred) in target_suppliers.items():
+                try:
+                    crawler = crawler_cls()
+                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+                    supplier_results = []
+                    for keyword in keywords:
+                        try:
+                            search_results = crawler.search(keyword)
+                            for r in search_results:
+                                supplier_results.append({
+                                    "keyword": keyword,
+                                    "supplier": supplier_name,
+                                    "product_name": r.product_name,
+                                    "unit": r.unit,
+                                    "insurance_code": getattr(r, "insurance_code", None),
+                                    "quantity": r.quantity,
+                                    "price": r.price,
+                                    "product_id": r.product_id,
+                                })
+                        except Exception as e:
+                            logger.warning("검색 실패 [%s/%s]: %s", supplier_name, keyword, e)
+                        time.sleep(1)
+
+                    # 도매상 1곳 완료 → stream 전송
+                    self._redis.lpush(stream_key, json.dumps({
+                        "type": "partial",
+                        "supplier": supplier_name,
+                        "results": supplier_results,
+                    }))
+
+                except Exception as e:
+                    logger.warning("도매상 검색 실패 [%s]: %s", supplier_name, e)
+                    self._redis.lpush(stream_key, json.dumps({
+                        "type": "partial",
+                        "supplier": supplier_name,
+                        "results": [],
+                        "error": str(e),
+                    }))
+
+                time.sleep(2)  # 도매상 간 딜레이
+
+            # 5. 전체 완료
+            self._redis.lpush(stream_key, json.dumps({"type": "done"}))
+            logger.info("search_on_demand 완료: monitor=%s, %d개 도매상", monitor_id, len(target_suppliers))
+
+        except Exception as e:
+            logger.error("search_on_demand 실패 [%s]: %s", monitor_id, e, exc_info=True)
+            try:
+                self._redis.lpush(stream_key, json.dumps({"type": "error", "message": str(e)}))
+                self._redis.lpush(stream_key, json.dumps({"type": "done"}))
+            except Exception:
+                pass
+        finally:
+            self._db_pool.putconn(conn)
 
     def order(self, job: dict):
         """단건 주문 (F-2에서 구현)"""
