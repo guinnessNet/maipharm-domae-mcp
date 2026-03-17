@@ -38,4 +38,9 @@ export const clearCart = () => {
   return [];
 };
 
+export const setCartItems = (items) => {
+  localStorage.setItem(CART_KEY, JSON.stringify(items));
+  return items;
+};
+
 export const getCartCount = () => getCart().length;

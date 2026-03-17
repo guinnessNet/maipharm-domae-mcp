@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import client from '../api/client';
 import { addToCart } from '../utils/cart';
+import { addFavorite } from '../utils/favorites';
 
 export default function SearchPage() {
   const navigate = useNavigate();
@@ -13,6 +14,7 @@ export default function SearchPage() {
   const [quantities, setQuantities] = useState({});
   const [orderConfirm, setOrderConfirm] = useState(null);
   const [cartToast, setCartToast] = useState(null);
+  const [favToast, setFavToast] = useState(null);
 
   const handleSearch = async (e) => {
     e.preventDefault();
@@ -49,7 +51,7 @@ export default function SearchPage() {
         productId: sup.product_id,
       }))
     )
-    .sort((a, b) => a.price - b.price);
+    .sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
 
   const handleQuantityChange = (key, value) => {
     setQuantities((prev) => ({ ...prev, [key]: value }));
@@ -108,6 +110,21 @@ export default function SearchPage() {
     window.dispatchEvent(new Event('cart-updated'));
     setCartToast(row.productName);
     setTimeout(() => setCartToast(null), 2000);
+  };
+
+  const handleAddFavorite = (row) => {
+    addFavorite({
+      supplier: row.supplier,
+      productName: row.productName,
+      maker: row.maker,
+      unit: row.unit,
+      insuranceCode: row.insuranceCode,
+      productId: row.productId,
+      price: row.price,
+      defaultQuantity: 1,
+    });
+    setFavToast(row.productName);
+    setTimeout(() => setFavToast(null), 2000);
   };
 
   return (
@@ -191,6 +208,9 @@ export default function SearchPage() {
                         </button>
                         <button className="btn-sm btn-cart" onClick={() => handleAddToCart(row)}>
                           담기
+                        </button>
+                        <button className="btn-sm btn-star" onClick={() => handleAddFavorite(row)} title="즐겨찾기 추가">
+                          ★
                         </button>
                         <button
                           className="btn-sm"
@@ -286,6 +306,10 @@ export default function SearchPage() {
 
       {cartToast && (
         <div className="cart-toast">장바구니에 추가됨</div>
+      )}
+
+      {favToast && (
+        <div className="cart-toast">즐겨찾기에 추가됨</div>
       )}
     </div>
   );

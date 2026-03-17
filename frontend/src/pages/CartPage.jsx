@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import client from '../api/client';
-import { getCart, removeFromCart, updateQuantity, clearCart } from '../utils/cart';
+import { getCart, removeFromCart, updateQuantity, clearCart, setCartItems } from '../utils/cart';
 
 export default function CartPage() {
   const [cart, setCart] = useState([]);
@@ -74,8 +74,13 @@ export default function CartPage() {
 
     await Promise.allSettled(promises);
 
-    // Clear cart after checkout
-    setCart(clearCart());
+    // Only remove successful items; keep failed items in cart for retry
+    const failedItems = allResults.filter((r) => !r.success).map((r) => {
+      // Strip result-specific fields before saving back to cart
+      const { success, message, ...cartItem } = r;
+      return cartItem;
+    });
+    setCart(setCartItems(failedItems));
     window.dispatchEvent(new Event('cart-updated'));
     setCheckoutProgress((prev) => ({ ...prev, current: cart.length, results: [...allResults] }));
   };
@@ -106,6 +111,11 @@ export default function CartPage() {
         <div className={successCount === checkoutProgress.total ? 'success-box' : 'error-box'} style={{ marginBottom: '1rem' }}>
           총 {checkoutProgress.total}건 중 {successCount}건 성공{failCount > 0 ? `, ${failCount}건 실패` : ''}
         </div>
+        {failCount > 0 && (
+          <div className="error-box" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+            실패한 {failCount}건은 장바구니에 남아있습니다.
+          </div>
+        )}
         <table>
           <thead>
             <tr>
@@ -132,8 +142,16 @@ export default function CartPage() {
             ))}
           </tbody>
         </table>
-        <div style={{ marginTop: '1rem' }}>
-          <button className="btn-primary" onClick={() => setCheckoutProgress(null)}>
+        <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>
+          {failCount > 0 && (
+            <button className="btn-primary" onClick={() => {
+              setCart(getCart());
+              setCheckoutProgress(null);
+            }}>
+              실패 건 재주문 ({failCount}건)
+            </button>
+          )}
+          <button className={failCount > 0 ? 'btn-sm' : 'btn-primary'} onClick={() => setCheckoutProgress(null)}>
             돌아가기
           </button>
         </div>

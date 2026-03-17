@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import client from '../api/client';
+import { getFontSize, setFontSize } from '../utils/fontSize';
 
 const TABS = [
   { key: 'apikey', label: 'API 키' },
@@ -10,9 +11,34 @@ const TABS = [
 
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState('apikey');
+  const [currentFontSize, setCurrentFontSize] = useState(getFontSize() || 'normal');
+
+  const handleFontChange = (size) => {
+    setFontSize(size);
+    setCurrentFontSize(size);
+  };
 
   return (
     <div>
+      {/* 글씨 크기 설정 */}
+      <div className="card" style={{ marginBottom: '1.25rem', maxWidth: '500px' }}>
+        <h3 style={{ marginBottom: '0.5rem' }}>글씨 크기</h3>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className={currentFontSize === 'normal' ? 'btn-primary' : ''}
+            onClick={() => handleFontChange('normal')}
+          >
+            보통
+          </button>
+          <button
+            className={currentFontSize === 'large' ? 'btn-primary' : ''}
+            onClick={() => handleFontChange('large')}
+          >
+            큰 글씨
+          </button>
+        </div>
+      </div>
+
       <div className="tabs">
         {TABS.map((tab) => (
           <button

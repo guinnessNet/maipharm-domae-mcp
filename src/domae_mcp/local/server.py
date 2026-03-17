@@ -1,6 +1,7 @@
-"""FastAPI 웹서버: 127.0.0.1 바인딩, 로컬 전용"""
+"""FastAPI 웹서버: 0.0.0.0 바인딩, 로컬 네트워크 전용"""
 
 import asyncio
+import ipaddress
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -54,15 +55,20 @@ app = FastAPI(
 )
 
 @app.middleware("http")
-async def localhost_only(request: Request, call_next):
+async def local_network_only(request: Request, call_next):
     client_ip = request.client.host if request.client else None
-    if client_ip not in ("127.0.0.1", "::1"):
-        return JSONResponse(status_code=403, content={"detail": "로컬 접근만 허용됩니다"})
+    if client_ip:
+        try:
+            addr = ipaddress.ip_address(client_ip)
+            if not (addr.is_loopback or addr.is_private):
+                return JSONResponse(status_code=403, content={"detail": "로컬 네트워크 접근만 허용됩니다"})
+        except ValueError:
+            return JSONResponse(status_code=403, content={"detail": "잘못된 접근입니다"})
     return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5900", "http://127.0.0.1:5900"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -86,10 +92,10 @@ if static_dir.is_dir():
 
 
 def run_web_server(port: int = 5900) -> None:
-    """웹서버 실행 (127.0.0.1 바인딩)"""
+    """웹서버 실행 (0.0.0.0 바인딩 — 로컬 네트워크 허용)"""
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=port,
         log_level="info",
     )

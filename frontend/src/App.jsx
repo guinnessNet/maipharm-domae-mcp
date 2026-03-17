@@ -3,21 +3,34 @@ import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import client from './api/client';
 import SearchPage from './pages/SearchPage';
 import CartPage from './pages/CartPage';
+import FavoritesPage from './pages/FavoritesPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupPage from './pages/SetupPage';
 import UrgentPage from './pages/UrgentPage';
 import HistoryPage from './pages/HistoryPage';
 import ProductsPage from './pages/ProductsPage';
 import MonitorAlertsPage from './pages/MonitorAlertsPage';
+import FontSizeModal from './components/FontSizeModal';
 import { getCartCount } from './utils/cart';
+import { getFontSize, applyFontSize } from './utils/fontSize';
 
 export default function App() {
   const [setupDone, setSetupDone] = useState(null); // null=로딩, true/false
   const [cartCount, setCartCount] = useState(0);
+  const [showFontModal, setShowFontModal] = useState(false);
   const location = useLocation();
 
   const refreshCartCount = useCallback(() => {
     setCartCount(getCartCount());
+  }, []);
+
+  useEffect(() => {
+    const saved = getFontSize();
+    if (saved) {
+      applyFontSize(saved);
+    } else {
+      setShowFontModal(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -53,11 +66,13 @@ export default function App() {
 
   return (
     <>
+      {showFontModal && <FontSizeModal onClose={() => setShowFontModal(false)} />}
       <header className="app-header">
         <div className="app-header-inner">
           <NavLink to="/" className="app-logo">도매 통합검색</NavLink>
           <nav className="app-nav">
             <NavLink to="/" end>통합검색</NavLink>
+            <NavLink to="/favorites">상비약</NavLink>
             <NavLink to="/cart" className={({ isActive }) => isActive ? 'active' : ''}>
               장바구니{cartCount > 0 && <span className="cart-badge">{cartCount}</span>}
             </NavLink>
@@ -73,6 +88,7 @@ export default function App() {
         <Routes>
           <Route path="/setup" element={<SetupPage />} />
           <Route path="/" element={<SearchPage />} />
+          <Route path="/favorites" element={<FavoritesPage />} />
           <Route path="/cart" element={<CartPage />} />
           <Route path="/urgent" element={<UrgentPage />} />
           <Route path="/history" element={<HistoryPage />} />
