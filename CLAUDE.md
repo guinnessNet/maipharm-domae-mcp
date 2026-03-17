@@ -134,7 +134,7 @@ API 키 없으면 크롤러 0개 → 검색/주문 불가.
 - requirements.txt에 포함된 패키지만 사용 가능 (새 의존성 추가 시 requirements.txt 먼저 업데이트)
 
 ### 도매상별 주의사항
-- 티제이팜: login_p=2, referer 필수, X-Requested-With: XMLHttpRequest 필수 (없으면 9999 에러), ItemToken 캐싱
+- 티제이팜: login_p=2, referer 필수, X-Requested-With: XMLHttpRequest 필수 (없으면 9999 에러), ItemToken 캐싱, **NCloud IP 차단됨 → 시놀로지 프록시 경유 필수** (DOMAE_PROXY_URL 환경변수)
 - 인천/복산 (NicePharm): 장바구니 읽기는 Bag.asp
 - 백제: JWT Bearer, product_id는 ITEM_CD|ITEM_GB_CD
 - HMP: DWR 프로토콜, 주문 미구현
@@ -142,6 +142,47 @@ API 키 없으면 크롤러 0개 → 검색/주문 불가.
 - 도현팜 (NicePharm): 인천/복산과 동일 패턴, vendor_code 로그인 시 자동 추출
 - 삼성팜: PHP 기반, 검색은 iframe(sc_item_list_iframe.php), 주문은 order_temp 방식(주문대기→주문하기), product_id는 "item_code|supplier_code" 형태, 로그인 시 order.php 방문 필요
 - 경동사(ndrug): 별도 패턴
+
+## 시놀로지 프록시 (클라우드 워커용)
+
+일부 도매 사이트(티제이팜 등)가 NCloud 데이터센터 IP(49.50.135.x)를 차단함.
+시놀로지 NAS에 tinyproxy Docker 컨테이너를 띄워 가정용 IP로 우회.
+
+### 구성
+- **시놀로지**: 192.168.0.4 (내부) / 121.168.79.102 (외부), SSH 포트 24
+- **프록시**: tinyproxy Docker, `--network host`, 포트 8888
+- **IP 화이트리스트**: 서버1(49.50.135.173), 서버2(49.50.135.178)만 허용
+- **공유기 포트포워딩**: 외부 8888 → 192.168.0.4:8888
+
+### 프록시 컨테이너 관리
+```bash
+# SSH 접속
+sshpass -p 'R4wBNJGSJAwthnL' ssh -p 24 guinness90@192.168.0.4
+
+# 재생성 (IP 화이트리스트 적용)
+sudo docker rm -f domae-proxy
+sudo docker run -d --name domae-proxy --restart unless-stopped \
+  --network host monokal/tinyproxy 49.50.135.178 49.50.135.173
+
+# 로그 확인
+sudo docker logs domae-proxy --tail 20
+
+# 상태 확인
+sudo docker ps | grep proxy
+```
+
+### 크롤러 적용
+티제이팜 크롤러는 환경변수 `DOMAE_PROXY_URL`이 설정되면 자동으로 프록시 경유:
+```
+DOMAE_PROXY_URL=http://121.168.79.102:8888
+```
+서버2 워커의 PM2 환경변수에 추가 필요.
+
+### 새 도매상 차단 시
+1. NCloud 서버에서 직접 접속 테스트 → 차단 확인
+2. 해당 크롤러 `__init__`에 `DOMAE_PROXY_URL` 프록시 설정 추가
+3. seed-crawlers.ts 재실행
+4. 워커 재시작
 
 ## Git Commit
 - 커밋 메시지는 항상 한글로 간략하게 작성한다 (1줄, 50자 이내 권장)
