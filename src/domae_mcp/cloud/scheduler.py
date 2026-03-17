@@ -34,6 +34,31 @@ class CloudScheduler:
         self._crawlers = {}  # 캐시: {module_name: crawler_class}
         self._crawlers_loaded = False
 
+    def _drain_urgent_queue(self):
+        """우선 큐(domae:jobs:urgent)에 쌓인 잡을 모두 처리."""
+        while True:
+            raw = self._redis.lpop("domae:jobs:urgent")
+            if not raw:
+                break
+            try:
+                job = json.loads(raw)
+                action = job.get("action")
+                logger.info("인터럽트 우선 잡: monitor=%s action=%s", job.get("monitor_id"), action)
+                if action == "search_on_demand":
+                    self.search_on_demand(job)
+                elif action == "order":
+                    self.order(job)
+                elif action == "batch_order":
+                    self.batch_order(job)
+                elif action == "urgent_order_immediate":
+                    self.urgent_order_immediate(job)
+                elif action == "verify_credentials":
+                    self.verify_credentials(job)
+                else:
+                    logger.warning("알 수 없는 urgent action: %s", action)
+            except Exception as e:
+                logger.error("urgent 잡 처리 실패: %s", e)
+
     @staticmethod
     def _decrypt_creds(raw_creds):
         """암호화된 credentials 복호화 (평문 폴백 제거)"""
@@ -73,9 +98,11 @@ class CloudScheduler:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
 
-            # 3. 각 제품 검색
+            # 3. 각 제품 검색 (키워드 사이에 urgent 큐 체크)
             all_results = []
             for keyword in products:
+                # urgent 잡 인터럽트: 키워드 처리 전 우선 큐 확인
+                self._drain_urgent_queue()
                 results = self._search_all(keyword, credentials)
                 all_results.extend(results)
                 time.sleep(0.5)  # 제품 간 딜레이
