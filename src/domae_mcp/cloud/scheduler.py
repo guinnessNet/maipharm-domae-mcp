@@ -8,7 +8,7 @@ import string
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def _generate_cuid() -> str:
@@ -80,9 +80,10 @@ class CloudScheduler:
                 self._save_results(conn, monitor_id, all_results)
 
             # 5. lastRunAt 업데이트
+            utc_now = datetime.now(timezone.utc)
             cur.execute(
-                'UPDATE domae_cloud_monitors SET "lastRunAt" = NOW(), "updatedAt" = NOW() WHERE id = %s',
-                (monitor_id,)
+                'UPDATE domae_cloud_monitors SET "lastRunAt" = %s, "updatedAt" = %s WHERE id = %s',
+                (utc_now, utc_now, monitor_id)
             )
             conn.commit()
 
@@ -177,14 +178,15 @@ class CloudScheduler:
     def _save_results(self, conn, monitor_id: str, results: list):
         """검색 결과 DB 저장"""
         cur = conn.cursor()
+        utc_now = datetime.now(timezone.utc)
         for r in results:
             cur.execute("""
                 INSERT INTO domae_cloud_results
                 (id, "monitorId", keyword, supplier, "productName", unit, price, quantity, "productId", "searchedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
-                r.get("unit"), r.get("price"), r.get("quantity"), r.get("product_id"),
+                r.get("unit"), r.get("price"), r.get("quantity"), r.get("product_id"), utc_now,
             ))
 
     def _detect_changes(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
