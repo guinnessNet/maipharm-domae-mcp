@@ -102,6 +102,9 @@ class CloudScheduler:
 
             logger.info("모니터 %s 완료: %d건 검색, %d건 변동", monitor_id, len(all_results), len(all_changes))
 
+            # 7. 활성 긴급주문 처리
+            self._process_urgent_orders(conn, monitor_id, credentials)
+
         except Exception as e:
             conn.rollback()
             logger.error("모니터 실행 실패 [%s]: %s", monitor_id, e, exc_info=True)
@@ -566,5 +569,256 @@ class CloudScheduler:
             self._db_pool.putconn(conn)
 
     def urgent_order_immediate(self, job: dict):
-        """긴급주문 즉시 실행 (F-4에서 구현)"""
-        logger.info("urgent_order_immediate: %s (미구현)", job.get("monitor_id"))
+        """긴급주문 즉시 1회 실행 — response_key로 결과 반환"""
+        monitor_id = job["monitor_id"]
+        response_key = job["response_key"]
+        urgent_order_id = job["urgent_order_id"]
+        suppliers_info = job.get("suppliers", [])
+        remaining_qty = job.get("remaining_quantity", 0)
+
+        conn = self._db_pool.getconn()
+        try:
+            cur = conn.cursor()
+
+            # credentials 조회
+            cur.execute("""
+                SELECT m.credentials
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s AND m."isActive" = true
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                self._redis.lpush(response_key, json.dumps({"success": False, "message": "모니터 없음"}))
+                return
+
+            raw_creds = row[0]
+            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
+                from domae_mcp.cloud.crypto import decrypt_credentials
+                credentials = decrypt_credentials(raw_creds)
+            else:
+                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            filled = 0
+            details = []
+
+            for sup_info in suppliers_info:
+                if filled >= remaining_qty:
+                    break
+
+                supplier_name = sup_info["supplier"]
+                product_id_val = sup_info["product_id"]
+                need = remaining_qty - filled
+
+                cred = credentials.get(supplier_name)
+                if not cred:
+                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "계정 미등록"})
+                    continue
+
+                crawler_cls = self._crawlers.get(supplier_name)
+                if not crawler_cls:
+                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "크롤러 없음"})
+                    continue
+
+                try:
+                    crawler = crawler_cls()
+                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+                    # 재고 확인
+                    search_results = crawler.search(product_id_val)
+                    available = 0
+                    for sr in search_results:
+                        if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
+                            available = sr.quantity
+                            break
+
+                    if available == 0:
+                        details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "재고 없음"})
+                        # 로그 기록
+                        utc_now = datetime.now(timezone.utc)
+                        cur.execute("""
+                            INSERT INTO domae_urgent_logs
+                            (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """, (_generate_cuid(), urgent_order_id, supplier_name, 0, False, "재고 없음", utc_now))
+                        conn.commit()
+                        continue
+
+                    # 주문 실행
+                    order_qty = min(need, available)
+                    result = crawler.order(product_id_val, order_qty)
+
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute("""
+                        INSERT INTO domae_urgent_logs
+                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (_generate_cuid(), urgent_order_id, supplier_name, order_qty, result.success,
+                          getattr(result, "message", ""), utc_now))
+
+                    if result.success:
+                        filled += order_qty
+                        details.append({"supplier": supplier_name, "quantity": order_qty, "success": True,
+                                        "message": getattr(result, "message", "주문 완료")})
+                    else:
+                        details.append({"supplier": supplier_name, "quantity": 0, "success": False,
+                                        "message": getattr(result, "message", "주문 실패")})
+                    conn.commit()
+
+                except Exception as e:
+                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": str(e)})
+                    logger.warning("urgent immediate [%s/%s]: %s", supplier_name, urgent_order_id, e)
+
+                time.sleep(2)
+
+            # filledQuantity 업데이트
+            if filled > 0:
+                cur.execute("""
+                    UPDATE domae_urgent_orders
+                    SET "filledQuantity" = "filledQuantity" + %s
+                    WHERE id = %s
+                """, (filled, urgent_order_id))
+
+                # 목표 달성 체크
+                cur.execute(
+                    'SELECT "filledQuantity", "totalQuantity" FROM domae_urgent_orders WHERE id = %s',
+                    (urgent_order_id,)
+                )
+                uo_row = cur.fetchone()
+                total_filled = uo_row[0] if uo_row else filled
+                total_qty = uo_row[1] if uo_row else remaining_qty
+                completed = total_filled >= total_qty
+
+                if completed:
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute(
+                        'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
+                        (utc_now, urgent_order_id)
+                    )
+                conn.commit()
+            else:
+                total_filled = 0
+                total_qty = remaining_qty
+                completed = False
+
+            self._redis.lpush(response_key, json.dumps({
+                "success": filled > 0,
+                "filled_quantity": filled,
+                "total_filled": total_filled,
+                "total_quantity": total_qty,
+                "completed": completed,
+                "details": details,
+            }))
+
+            logger.info("urgent_order_immediate 완료: urgent=%s filled=%d", urgent_order_id, filled)
+
+        except Exception as e:
+            logger.error("urgent_order_immediate 실패: %s", e, exc_info=True)
+            self._redis.lpush(response_key, json.dumps({"success": False, "message": str(e)}))
+        finally:
+            self._db_pool.putconn(conn)
+
+    def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
+        """모니터링 주기 내 활성 긴급주문 처리"""
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT uo.id, uo."productName", uo."totalQuantity", uo."filledQuantity"
+            FROM domae_urgent_orders uo
+            WHERE uo."monitorId" = %s AND uo.active = true AND uo."filledQuantity" < uo."totalQuantity"
+        """, (monitor_id,))
+        urgent_orders = cur.fetchall()
+
+        if not urgent_orders:
+            return
+
+        for uo_id, product_name, total_qty, filled_qty in urgent_orders:
+            remaining = total_qty - filled_qty
+
+            # 이 긴급주문에 등록된 도매상 조회
+            cur.execute(
+                'SELECT supplier, "productId" FROM domae_urgent_suppliers WHERE "urgentOrderId" = %s',
+                (uo_id,)
+            )
+            suppliers = cur.fetchall()
+            filled_this_round = 0
+
+            for supplier_name, product_id_val in suppliers:
+                if filled_this_round >= remaining:
+                    break
+
+                cred = credentials.get(supplier_name)
+                if not cred:
+                    continue
+
+                crawler_cls = self._crawlers.get(supplier_name)
+                if not crawler_cls:
+                    continue
+
+                try:
+                    crawler = crawler_cls()
+                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+                    search_results = crawler.search(product_id_val)
+                    available = 0
+                    for sr in search_results:
+                        if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
+                            available = sr.quantity
+                            break
+
+                    if available == 0:
+                        continue
+
+                    order_qty = min(remaining - filled_this_round, available)
+                    result = crawler.order(product_id_val, order_qty)
+
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute("""
+                        INSERT INTO domae_urgent_logs
+                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (_generate_cuid(), uo_id, supplier_name, order_qty, result.success,
+                          getattr(result, "message", ""), utc_now))
+
+                    if result.success:
+                        filled_this_round += order_qty
+
+                    conn.commit()
+                    time.sleep(2)
+
+                except Exception as e:
+                    logger.warning("urgent process [%s/%s]: %s", uo_id, supplier_name, e)
+
+            if filled_this_round > 0:
+                cur.execute("""
+                    UPDATE domae_urgent_orders
+                    SET "filledQuantity" = "filledQuantity" + %s
+                    WHERE id = %s
+                """, (filled_this_round, uo_id))
+
+                cur.execute(
+                    'SELECT "filledQuantity", "totalQuantity" FROM domae_urgent_orders WHERE id = %s',
+                    (uo_id,)
+                )
+                row = cur.fetchone()
+                if row and row[0] >= row[1]:
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute(
+                        'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
+                        (utc_now, uo_id)
+                    )
+                    # 텔레그램 알림
+                    try:
+                        cur.execute('SELECT "telegramToken", "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
+                        tg_row = cur.fetchone()
+                        if tg_row and (tg_row[0] or tg_row[1]):
+                            from domae_mcp.cloud.notifier import Notifier
+                            Notifier.send_telegram(tg_row[0], tg_row[1],
+                                f"✅ 긴급주문 완료: {product_name} {total_qty}통 확보")
+                    except Exception as e:
+                        logger.warning("긴급주문 알림 실패: %s", e)
+
+                conn.commit()
+
+        logger.info("긴급주문 처리 완료: monitor=%s, %d건", monitor_id, len(urgent_orders))
