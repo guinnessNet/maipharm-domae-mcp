@@ -1,9 +1,14 @@
 """설정 관리: ~/.maipharm-domae-mcp/ 기반 config.json + Fernet 암호화"""
 
 import json
+import logging
+import os
+import platform
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+
+logger = logging.getLogger(__name__)
 
 
 # 지원 도매상 목록
@@ -61,6 +66,17 @@ class ConfigManager:
             self._key_path.chmod(0o600)
         except OSError:
             pass  # Windows에서는 chmod 동작이 다를 수 있음
+        if platform.system() == "Windows":
+            import subprocess
+            try:
+                username = os.getenv("USERNAME", "")
+                if username:
+                    subprocess.run(
+                        ["icacls", str(self._key_path), "/grant:r", f"{username}:F", "/inheritance:r"],
+                        capture_output=True, check=True
+                    )
+            except Exception as e:
+                logger.warning("Windows 키 파일 권한 설정 실패: %s", e)
         return key
 
     def _encrypt(self, text: str) -> str:
@@ -160,15 +176,22 @@ class ConfigManager:
             {"token": "...", "chat_id": "..."}
         """
         tg = self._config.get("telegram", {})
+        raw_token = tg.get("token", "")
+        # 복호화 시도; 기존 평문 토큰(Fernet 형식이 아닌 경우)은 그대로 반환
+        if raw_token:
+            try:
+                raw_token = self._decrypt(raw_token)
+            except (InvalidToken, Exception):
+                pass  # 암호화되지 않은 기존 토큰 — 그대로 사용
         return {
-            "token": tg.get("token", ""),
+            "token": raw_token,
             "chat_id": tg.get("chat_id", ""),
         }
 
     def set_telegram(self, token: str, chat_id: str) -> None:
-        """텔레그램 설정 저장"""
+        """텔레그램 설정 저장 (토큰은 암호화)"""
         self._config["telegram"] = {
-            "token": token,
+            "token": self._encrypt(token),
             "chat_id": chat_id,
         }
         self._save()

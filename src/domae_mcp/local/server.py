@@ -7,6 +7,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from domae_mcp.local.config import ConfigManager
@@ -49,6 +50,13 @@ app = FastAPI(
     description="의약품 도매 통합 검색/주문 로컬 서버",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5900", "http://127.0.0.1:5900"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 라우터 마운트

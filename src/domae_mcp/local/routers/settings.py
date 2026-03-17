@@ -152,9 +152,10 @@ async def verify_api_key(req: ApiKeySaveRequest, request: Request):
     try:
         result = await manager.verify(api_key)
     except ValueError as e:
+        logger.error("API 키 검증 실패: %s", e, exc_info=True)
         return ApiKeyVerifyResponse(
             valid=False, tier="", pharmacy_name="",
-            message=str(e), crawler_count=0,
+            message="검증 중 오류가 발생했습니다", crawler_count=0,
         )
 
     # 2. API 키 저장
@@ -217,7 +218,8 @@ def test_credentials(req: TestCredentialRequest):
         crawler.ensure_login(cred["login_id"], cred["login_pw"])
         return MessageResponse(success=True, message="로그인 성공")
     except Exception as e:
-        return MessageResponse(success=False, message=f"로그인 실패: {str(e)}")
+        logger.error("로그인 실패 (%s): %s", req.supplier, e, exc_info=True)
+        return MessageResponse(success=False, message="로그인 실패: 잠시 후 다시 시도해주세요")
 
 
 # ── 텔레그램 엔드포인트 ──

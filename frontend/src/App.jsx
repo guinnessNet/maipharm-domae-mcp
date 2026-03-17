@@ -1,16 +1,30 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
 import client from './api/client';
 import SearchPage from './pages/SearchPage';
+import CartPage from './pages/CartPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupPage from './pages/SetupPage';
 import UrgentPage from './pages/UrgentPage';
 import HistoryPage from './pages/HistoryPage';
 import ProductsPage from './pages/ProductsPage';
+import MonitorAlertsPage from './pages/MonitorAlertsPage';
+import { getCartCount } from './utils/cart';
 
 export default function App() {
   const [setupDone, setSetupDone] = useState(null); // null=로딩, true/false
+  const [cartCount, setCartCount] = useState(0);
   const location = useLocation();
+
+  const refreshCartCount = useCallback(() => {
+    setCartCount(getCartCount());
+  }, []);
+
+  useEffect(() => {
+    refreshCartCount();
+    window.addEventListener('cart-updated', refreshCartCount);
+    return () => window.removeEventListener('cart-updated', refreshCartCount);
+  }, [refreshCartCount]);
 
   useEffect(() => {
     (async () => {
@@ -44,9 +58,13 @@ export default function App() {
           <NavLink to="/" className="app-logo">도매 통합검색</NavLink>
           <nav className="app-nav">
             <NavLink to="/" end>통합검색</NavLink>
+            <NavLink to="/cart" className={({ isActive }) => isActive ? 'active' : ''}>
+              장바구니{cartCount > 0 && <span className="cart-badge">{cartCount}</span>}
+            </NavLink>
             <NavLink to="/urgent">긴급주문</NavLink>
             <NavLink to="/history">주문이력</NavLink>
             <NavLink to="/products">모니터링</NavLink>
+            <NavLink to="/alerts">변동내역</NavLink>
             <NavLink to="/settings">설정</NavLink>
           </nav>
         </div>
@@ -55,9 +73,11 @@ export default function App() {
         <Routes>
           <Route path="/setup" element={<SetupPage />} />
           <Route path="/" element={<SearchPage />} />
+          <Route path="/cart" element={<CartPage />} />
           <Route path="/urgent" element={<UrgentPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/products" element={<ProductsPage />} />
+          <Route path="/alerts" element={<MonitorAlertsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

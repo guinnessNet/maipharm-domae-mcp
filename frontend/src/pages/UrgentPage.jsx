@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
 import client from '../api/client';
 
 const styles = {
@@ -90,6 +91,7 @@ const statusBadgeClass = (order) => {
 };
 
 export default function UrgentPage() {
+  const location = useLocation();
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -124,6 +126,30 @@ export default function UrgentPage() {
   useEffect(() => {
     fetchOrders();
   }, [fetchOrders]);
+
+  // Prefill from SearchPage navigation
+  useEffect(() => {
+    const prefill = location.state?.prefill;
+    if (prefill) {
+      setForm((prev) => ({
+        ...prev,
+        product_name: prefill.product_name || '',
+        unit: prefill.unit || '',
+        insurance_code: prefill.insurance_code || '',
+      }));
+      if (prefill.suppliers && prefill.suppliers.length > 0) {
+        const s = prefill.suppliers[0];
+        setSuppliers([{
+          supplier: s.supplier || '',
+          product_id: s.product_id || '',
+          price: s.price != null ? String(s.price) : '',
+        }]);
+      }
+      setActiveTab('register');
+      // Clear the navigation state so refreshing doesn't re-prefill
+      window.history.replaceState({}, '');
+    }
+  }, [location.state]);
 
   // Categorize orders
   const activeOrders = useMemo(() => orders.filter((o) => o.active), [orders]);

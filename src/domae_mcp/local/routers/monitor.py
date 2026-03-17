@@ -1,14 +1,17 @@
-"""모니터링 제어 라우터: 시작/중지/상태"""
+"""모니터링 제어 라우터: 시작/중지/상태/변동이력"""
 
+from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from domae_mcp.core.models import MonitorAlert
 from domae_mcp.core.services.monitor_service import MonitorService
 from domae_mcp.core.services.telegram_service import TelegramService
 from domae_mcp.local.config import ConfigManager, SUPPLIERS
-from domae_mcp.local.database import _get_session_factory
+from domae_mcp.local.database import _get_session_factory, get_db
 
 router = APIRouter(tags=["모니터링"])
 
@@ -92,3 +95,43 @@ def get_monitor_status():
         running=service.is_running,
         last_run=service.last_run.isoformat() if service.last_run else None,
     )
+
+
+class MonitorAlertResponse(BaseModel):
+    id: int
+    product_name: str
+    supplier: str
+    alert_type: str
+    old_value: Optional[float] = None
+    new_value: Optional[float] = None
+    created_at: str
+
+
+@router.get("/monitor/alerts", response_model=list[MonitorAlertResponse])
+def get_monitor_alerts(
+    alert_type: Optional[str] = Query(None, description="price 또는 stock"),
+    days: int = Query(30, ge=1, le=365, description="조회 기간 (일)"),
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    """모니터링 변동 이력 조회."""
+    cutoff = datetime.now() - timedelta(days=days)
+    query = db.query(MonitorAlert).filter(MonitorAlert.created_at >= cutoff)
+
+    if alert_type and alert_type in ("price", "stock"):
+        query = query.filter(MonitorAlert.alert_type == alert_type)
+
+    alerts = query.order_by(MonitorAlert.created_at.desc()).limit(limit).all()
+
+    return [
+        MonitorAlertResponse(
+            id=a.id,
+            product_name=a.product_name,
+            supplier=a.supplier,
+            alert_type=a.alert_type,
+            old_value=a.old_value,
+            new_value=a.new_value,
+            created_at=a.created_at.isoformat() if a.created_at else "",
+        )
+        for a in alerts
+    ]

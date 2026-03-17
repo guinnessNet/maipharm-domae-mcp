@@ -12,6 +12,7 @@ from domae_mcp.core.models import (
     Product,
     InventorySnapshot,
     MonitorSchedule,
+    MonitorAlert,
     UrgentOrder,
     UrgentOrderLog,
 )
@@ -177,6 +178,13 @@ class MonitorService:
                         quantity=item["quantity"],
                         price=item["price"],
                     )
+                    db.add(MonitorAlert(
+                        product_name=item["product_name"],
+                        supplier=item["supplier"],
+                        alert_type="stock",
+                        old_value=0,
+                        new_value=float(item["quantity"]),
+                    ))
             else:
                 # 가격 변동
                 if prev.price and item["price"] and prev.price != item["price"]:
@@ -186,6 +194,13 @@ class MonitorService:
                         old_price=prev.price,
                         new_price=item["price"],
                     )
+                    db.add(MonitorAlert(
+                        product_name=item["product_name"],
+                        supplier=item["supplier"],
+                        alert_type="price",
+                        old_value=float(prev.price),
+                        new_value=float(item["price"]),
+                    ))
                 # 재고 없음 → 있음
                 if (prev.quantity or 0) == 0 and item["quantity"] > 0:
                     self._telegram.send_stock_alert(
@@ -194,6 +209,13 @@ class MonitorService:
                         quantity=item["quantity"],
                         price=item["price"],
                     )
+                    db.add(MonitorAlert(
+                        product_name=item["product_name"],
+                        supplier=item["supplier"],
+                        alert_type="stock",
+                        old_value=0,
+                        new_value=float(item["quantity"]),
+                    ))
 
         # 5. 긴급주문 체크
         self._check_urgent_orders(db, current_items)

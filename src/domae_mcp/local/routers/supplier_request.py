@@ -52,7 +52,7 @@ def submit_supplier_request(req: SupplierRequestBody):
             f"도매상명: {req.supplier_name}\n"
             f"로그인 URL: {req.login_url}\n"
             f"아이디: {req.login_id}\n"
-            f"비밀번호: {req.login_pw}\n"
+            f"비밀번호: (보안을 위해 별도 전달)\n"
             f"개인정보 동의: {'동의' if req.agreed else '미동의'}\n"
         )
 
@@ -83,8 +83,8 @@ def submit_supplier_request(req: SupplierRequestBody):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("메일 전송 실패", exc_info=True)
+        logger.error("메일 전송 실패: %s", e, exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"메일 전송 중 오류가 발생했습니다: {str(e)}",
+            detail="메일 전송 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
         )

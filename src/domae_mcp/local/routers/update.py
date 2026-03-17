@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 _config = ConfigManager()
 
-GITHUB_REPO = "maipharm/maipharm-domae-mcp"
+GITHUB_REPO = "guinnessNet/maipharm-domae-mcp"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 

@@ -1,9 +1,10 @@
 """클라우드 모니터링 스케줄러"""
+import hashlib
 import importlib.util
 import json
 import logging
 import os
-import random
+import secrets
 import string
 import sys
 import tempfile
@@ -17,9 +18,10 @@ def _generate_cuid() -> str:
     ts_part = ""
     base = 36
     while ts > 0:
-        ts_part = string.digits[ts % base] if ts % base < 10 else chr(ord('a') + ts % base - 10) + ts_part
+        char = string.digits[ts % base] if ts % base < 10 else chr(ord('a') + ts % base - 10)
+        ts_part = char + ts_part
         ts //= base
-    rand_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+    rand_part = secrets.token_hex(12)[:16]  # 16자 cryptographically secure random
     return f"c{ts_part}{rand_part}"[:25]
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,14 @@ class CloudScheduler:
         self._redis = redis_client
         self._crawlers = {}  # 캐시: {module_name: crawler_class}
         self._crawlers_loaded = False
+
+    @staticmethod
+    def _decrypt_creds(raw_creds):
+        """암호화된 credentials 복호화 (평문 폴백 제거)"""
+        if isinstance(raw_creds, str):
+            from domae_mcp.cloud.crypto import decrypt_credentials
+            return decrypt_credentials(raw_creds)
+        return raw_creds
 
     def execute(self, job: dict):
         """잡 1개 실행"""
@@ -54,12 +64,7 @@ class CloudScheduler:
 
             products = json.loads(row[1]) if isinstance(row[1], str) else row[1]
             raw_creds = row[2]
-            # 암호화된 문자열이면 복호화, 아니면 평문 JSON 호환
-            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
-                from domae_mcp.cloud.crypto import decrypt_credentials
-                credentials = decrypt_credentials(raw_creds)
-            else:
-                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+            credentials = self._decrypt_creds(raw_creds)
             telegram_token = row[3]
             telegram_chat_id = row[4]
             tier = row[6]
@@ -112,9 +117,9 @@ class CloudScheduler:
             self._db_pool.putconn(conn)
 
     def _load_crawlers(self, conn):
-        """DB에서 크롤러 코드 로드 (동적 import)"""
+        """DB에서 크롤러 코드 로드 (동적 import, SHA-256 해시 검증)"""
         cur = conn.cursor()
-        cur.execute('SELECT name, code FROM domae_crawlers WHERE "isActive" = true')
+        cur.execute('SELECT name, code, "codeHash" FROM domae_crawlers WHERE "isActive" = true')
         rows = cur.fetchall()
 
         cache_dir = tempfile.mkdtemp(prefix="domae_cloud_")
@@ -123,7 +128,16 @@ class CloudScheduler:
         # domae_mcp 패키지가 설치되어 있어야 함
         from domae_mcp.core.crawlers.base import BaseCrawler
 
-        for name, code in rows:
+        for name, code, code_hash in rows:
+            # SHA-256 해시 검증
+            if code_hash is not None:
+                computed = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                if computed != code_hash:
+                    logger.warning("크롤러 코드 해시 불일치 [%s]: expected=%s actual=%s — 스킵", name, code_hash, computed)
+                    continue
+            else:
+                logger.warning("크롤러 코드 해시 없음 [%s]: codeHash=NULL — 해시 검증 없이 로드", name)
+
             try:
                 file_path = os.path.join(cache_dir, f"{name}.py")
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -246,6 +260,8 @@ class CloudScheduler:
             if (not prev["quantity"] or prev["quantity"] == 0) and r.get("quantity") and r["quantity"] > 0:
                 changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {r['quantity']}개")
 
+        return changes
+
     def search_on_demand(self, job: dict):
         """온디맨드 검색 — 도매상별로 stream_key에 결과를 실시간 전송"""
         monitor_id = job["monitor_id"]
@@ -269,11 +285,7 @@ class CloudScheduler:
                 return
 
             raw_creds = row[0]
-            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
-                from domae_mcp.cloud.crypto import decrypt_credentials
-                credentials = decrypt_credentials(raw_creds)
-            else:
-                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+            credentials = self._decrypt_creds(raw_creds)
 
             # 2. 크롤러 로드
             if not self._crawlers_loaded:
@@ -369,11 +381,7 @@ class CloudScheduler:
                 return
 
             raw_creds = row[0]
-            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
-                from domae_mcp.cloud.crypto import decrypt_credentials
-                credentials = decrypt_credentials(raw_creds)
-            else:
-                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+            credentials = self._decrypt_creds(raw_creds)
 
             # 2. 크롤러 로드
             if not self._crawlers_loaded:
@@ -446,11 +454,7 @@ class CloudScheduler:
                 return
 
             raw_creds = row[0]
-            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
-                from domae_mcp.cloud.crypto import decrypt_credentials
-                credentials = decrypt_credentials(raw_creds)
-            else:
-                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+            credentials = self._decrypt_creds(raw_creds)
 
             telegram_token = row[1]
             telegram_chat_id = row[2]
@@ -602,11 +606,7 @@ class CloudScheduler:
                 return
 
             raw_creds = row[0]
-            if isinstance(raw_creds, str) and not raw_creds.startswith("{"):
-                from domae_mcp.cloud.crypto import decrypt_credentials
-                credentials = decrypt_credentials(raw_creds)
-            else:
-                credentials = json.loads(raw_creds) if isinstance(raw_creds, str) else raw_creds
+            credentials = self._decrypt_creds(raw_creds)
 
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
@@ -761,6 +761,7 @@ class CloudScheduler:
                         "verified": False, "message": "아이디 또는 비밀번호가 올바르지 않습니다."
                     }))
             except Exception as e:
+                result = None
                 self._redis.lpush(response_key, json.dumps({
                     "verified": False, "message": str(e)
                 }))

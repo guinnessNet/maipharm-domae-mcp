@@ -1,13 +1,18 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import client from '../api/client';
+import { addToCart } from '../utils/cart';
 
 export default function SearchPage() {
+  const navigate = useNavigate();
   const [keyword, setKeyword] = useState('');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [orderStatus, setOrderStatus] = useState({});
   const [quantities, setQuantities] = useState({});
+  const [orderConfirm, setOrderConfirm] = useState(null);
+  const [cartToast, setCartToast] = useState(null);
 
   const handleSearch = async (e) => {
     e.preventDefault();
@@ -50,17 +55,24 @@ export default function SearchPage() {
     setQuantities((prev) => ({ ...prev, [key]: value }));
   };
 
-  const handleOrder = async (row) => {
+  const handleOrderClick = (row) => {
     const key = `${row.supplier}-${row.productId}`;
     const qty = parseInt(quantities[key], 10) || 1;
+    setOrderConfirm({ ...row, qty, key });
+  };
 
+  const handleOrderConfirm = async () => {
+    if (!orderConfirm) return;
+    const { key, qty } = orderConfirm;
+
+    setOrderConfirm(null);
     setOrderStatus((prev) => ({ ...prev, [key]: { loading: true } }));
 
     try {
       const { data } = await client.post('/orders', {
-        supplier: row.supplier,
-        product_id: row.productId,
-        product_name: row.productName,
+        supplier: orderConfirm.supplier,
+        product_id: orderConfirm.productId,
+        product_name: orderConfirm.productName,
         quantity: qty,
       });
 
@@ -78,6 +90,24 @@ export default function SearchPage() {
         },
       }));
     }
+  };
+
+  const handleAddToCart = (row) => {
+    const key = `${row.supplier}-${row.productId}`;
+    const qty = parseInt(quantities[key], 10) || 1;
+    addToCart({
+      supplier: row.supplier,
+      productName: row.productName,
+      maker: row.maker,
+      unit: row.unit,
+      insuranceCode: row.insuranceCode,
+      productId: row.productId,
+      price: row.price,
+      quantity: qty,
+    });
+    window.dispatchEvent(new Event('cart-updated'));
+    setCartToast(row.productName);
+    setTimeout(() => setCartToast(null), 2000);
   };
 
   return (
@@ -147,7 +177,7 @@ export default function SearchPage() {
                       style={{ width: '4rem' }}
                     />
                   </td>
-                  <td>
+                  <td style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
                     {status?.loading ? (
                       <span className="loading-spinner" />
                     ) : status?.success === true ? (
@@ -155,9 +185,34 @@ export default function SearchPage() {
                     ) : status?.success === false ? (
                       <span className="text-error">{status.message}</span>
                     ) : (
-                      <button className="btn-primary btn-sm" onClick={() => handleOrder(row)}>
-                        주문
-                      </button>
+                      <>
+                        <button className="btn-primary btn-sm" onClick={() => handleOrderClick(row)}>
+                          주문
+                        </button>
+                        <button className="btn-sm btn-cart" onClick={() => handleAddToCart(row)}>
+                          담기
+                        </button>
+                        <button
+                          className="btn-sm"
+                          style={{ background: '#dc2626', color: '#fff', border: 'none' }}
+                          onClick={() => navigate('/urgent', {
+                            state: {
+                              prefill: {
+                                product_name: row.productName,
+                                unit: row.unit,
+                                insurance_code: row.insuranceCode,
+                                suppliers: [{
+                                  supplier: row.supplier,
+                                  product_id: row.productId,
+                                  price: row.price,
+                                }],
+                              },
+                            },
+                          })}
+                        >
+                          긴급
+                        </button>
+                      </>
                     )}
                   </td>
                 </tr>
@@ -175,6 +230,54 @@ export default function SearchPage() {
         <div className="empty-state">
           <p>제품명 또는 보험코드로 도매상 재고를 검색하세요.</p>
         </div>
+      )}
+
+      {orderConfirm && (
+        <div className="modal-overlay" onClick={() => setOrderConfirm(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">주문 확인</h3>
+            <p className="text-secondary" style={{ marginBottom: '1rem' }}>
+              아래 내용으로 주문하시겠습니까?
+            </p>
+            <table className="modal-table">
+              <tbody>
+                <tr>
+                  <th>도매상</th>
+                  <td>{orderConfirm.supplier}</td>
+                </tr>
+                <tr>
+                  <th>제품명</th>
+                  <td>
+                    {orderConfirm.productName}
+                    {orderConfirm.maker && (
+                      <span className="text-secondary" style={{ fontSize: '0.78rem', marginLeft: '0.4rem' }}>
+                        ({orderConfirm.maker})
+                      </span>
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <th>수량</th>
+                  <td>{orderConfirm.qty}</td>
+                </tr>
+                {orderConfirm.price != null && (
+                  <tr>
+                    <th>단가</th>
+                    <td>{orderConfirm.price.toLocaleString()}원</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            <div className="modal-actions">
+              <button onClick={() => setOrderConfirm(null)}>취소</button>
+              <button className="btn-primary" onClick={handleOrderConfirm}>주문하기</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cartToast && (
+        <div className="cart-toast">장바구니에 추가됨</div>
       )}
     </div>
   );
