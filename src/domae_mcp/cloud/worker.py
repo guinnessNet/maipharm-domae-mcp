@@ -64,6 +64,8 @@ class CloudWorker:
                         self._scheduler.batch_order(job)
                     elif action == "urgent_order_immediate":
                         self._scheduler.urgent_order_immediate(job)
+                    elif action == "verify_credentials":
+                        self._scheduler.verify_credentials(job)
                     else:
                         logger.warning("알 수 없는 action: %s", action)
                 except Exception as e:

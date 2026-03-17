@@ -730,6 +730,51 @@ class CloudScheduler:
         finally:
             self._db_pool.putconn(conn)
 
+    def verify_credentials(self, job: dict):
+        """도매 계정 로그인 검증"""
+        response_key = job["response_key"]
+        supplier_name = job["supplier"]
+        login_id = job["login_id"]
+        login_pw = job["login_pw"]
+
+        conn = self._db_pool.getconn()
+        try:
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                self._redis.lpush(response_key, json.dumps({
+                    "verified": False, "message": f"{supplier_name} 크롤러를 찾을 수 없습니다."
+                }))
+                return
+
+            try:
+                crawler = crawler_cls()
+                result = crawler.login(login_id, login_pw)
+                if result:
+                    self._redis.lpush(response_key, json.dumps({
+                        "verified": True, "message": "로그인 성공"
+                    }))
+                else:
+                    self._redis.lpush(response_key, json.dumps({
+                        "verified": False, "message": "아이디 또는 비밀번호가 올바르지 않습니다."
+                    }))
+            except Exception as e:
+                self._redis.lpush(response_key, json.dumps({
+                    "verified": False, "message": str(e)
+                }))
+
+            logger.info("verify_credentials: %s → %s", supplier_name, "성공" if result else "실패")
+
+        except Exception as e:
+            logger.error("verify_credentials 실패: %s", e)
+            self._redis.lpush(response_key, json.dumps({
+                "verified": False, "message": str(e)
+            }))
+        finally:
+            self._db_pool.putconn(conn)
+
     def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
         """모니터링 주기 내 활성 긴급주문 처리"""
         cur = conn.cursor()
