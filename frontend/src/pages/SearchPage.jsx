@@ -152,7 +152,7 @@ export default function SearchPage() {
       )}
 
       {!loading && rows.length > 0 && (
-        <table>
+        <div className="table-wrapper"><table>
           <thead>
             <tr>
               <th>제품명</th>
@@ -239,7 +239,7 @@ export default function SearchPage() {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       {!loading && !error && results.length === 0 && keyword && (

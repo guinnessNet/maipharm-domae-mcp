@@ -116,7 +116,7 @@ export default function CartPage() {
             실패한 {failCount}건은 장바구니에 남아있습니다.
           </div>
         )}
-        <table>
+        <div className="table-wrapper"><table>
           <thead>
             <tr>
               <th>도매상</th>
@@ -141,7 +141,7 @@ export default function CartPage() {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
         <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>
           {failCount > 0 && (
             <button className="btn-primary" onClick={() => {
@@ -211,7 +211,7 @@ export default function CartPage() {
           }}>
             {supplier}
           </div>
-          <table style={{ borderRadius: '0 0 var(--radius) var(--radius)' }}>
+          <div className="table-wrapper"><table style={{ borderRadius: '0 0 var(--radius) var(--radius)' }}>
             <thead>
               <tr>
                 <th>제품명</th>
@@ -278,7 +278,7 @@ export default function CartPage() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         </div>
       ))}
 

@@ -32,6 +32,16 @@ export default function FontSizeModal({ onClose }) {
               의약품 통합검색 도매 주문
             </span>
           </button>
+
+          <button
+            className="font-option"
+            onClick={() => handleSelect('xlarge')}
+          >
+            <span className="font-option-label">매우 큰 글씨</span>
+            <span className="font-preview" style={{ fontSize: '24px' }}>
+              의약품 통합검색 도매 주문
+            </span>
+          </button>
         </div>
       </div>
     </div>

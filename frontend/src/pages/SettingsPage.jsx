@@ -36,6 +36,12 @@ export default function SettingsPage() {
           >
             큰 글씨
           </button>
+          <button
+            className={currentFontSize === 'xlarge' ? 'btn-primary' : ''}
+            onClick={() => handleFontChange('xlarge')}
+          >
+            매우 큰 글씨
+          </button>
         </div>
       </div>
 

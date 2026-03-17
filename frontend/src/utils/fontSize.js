@@ -10,7 +10,9 @@ export const setFontSize = (size) => {
 
 export const applyFontSize = (size) => {
   const root = document.documentElement;
-  if (size === 'large') {
+  if (size === 'xlarge') {
+    root.style.fontSize = '24px';
+  } else if (size === 'large') {
     root.style.fontSize = '20px';
   } else {
     root.style.fontSize = '16px'; // normal

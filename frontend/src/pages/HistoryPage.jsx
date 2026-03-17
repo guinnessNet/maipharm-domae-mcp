@@ -165,7 +165,7 @@ export default function HistoryPage() {
             </span>
           </div>
 
-          <table>
+          <div className="table-wrapper"><table>
             <thead>
               <tr>
                 <th>날짜</th>
@@ -219,7 +219,7 @@ export default function HistoryPage() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
 
           <div style={styles.pagination}>
             <button
