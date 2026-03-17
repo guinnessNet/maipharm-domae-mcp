@@ -197,7 +197,7 @@ class CloudScheduler:
     def _save_results(self, conn, monitor_id: str, results: list):
         """검색 결과 DB 저장"""
         cur = conn.cursor()
-        utc_now = datetime.now()
+        utc_now = datetime.now(timezone.utc)
         for r in results:
             cur.execute("""
                 INSERT INTO domae_cloud_results
@@ -432,7 +432,7 @@ class CloudScheduler:
             cur = conn.cursor()
 
             # 1. batch status → processing
-            utc_now = datetime.now()
+            utc_now = datetime.now(timezone.utc)
             cur.execute(
                 'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
                 ("processing", batch_id, monitor_id)
@@ -514,7 +514,7 @@ class CloudScheduler:
                     order_message = order_message or str(e)
 
                 # DomaeCloudOrder INSERT
-                utc_now = datetime.now()
+                utc_now = datetime.now(timezone.utc)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
@@ -552,7 +552,7 @@ class CloudScheduler:
                 time.sleep(1)  # 주문 간 딜레이 (같은 서버 연속 주문)
 
             # 5. batch 완료
-            utc_now = datetime.now()
+            utc_now = datetime.now(timezone.utc)
             cur.execute("""
                 UPDATE domae_order_batches
                 SET status = %s, "completedAt" = %s
@@ -648,7 +648,7 @@ class CloudScheduler:
                     if available == 0:
                         details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "재고 없음"})
                         # 로그 기록
-                        utc_now = datetime.now()
+                        utc_now = datetime.now(timezone.utc)
                         cur.execute("""
                             INSERT INTO domae_urgent_logs
                             (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
@@ -661,7 +661,7 @@ class CloudScheduler:
                     order_qty = min(need, available)
                     result = crawler.order(product_id_val, order_qty)
 
-                    utc_now = datetime.now()
+                    utc_now = datetime.now(timezone.utc)
                     cur.execute("""
                         INSERT INTO domae_urgent_logs
                         (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
@@ -703,7 +703,7 @@ class CloudScheduler:
                 completed = total_filled >= total_qty
 
                 if completed:
-                    utc_now = datetime.now()
+                    utc_now = datetime.now(timezone.utc)
                     cur.execute(
                         'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
                         (utc_now, urgent_order_id)
@@ -830,7 +830,7 @@ class CloudScheduler:
                     order_qty = min(remaining - filled_this_round, available)
                     result = crawler.order(product_id_val, order_qty)
 
-                    utc_now = datetime.now()
+                    utc_now = datetime.now(timezone.utc)
                     cur.execute("""
                         INSERT INTO domae_urgent_logs
                         (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "orderedAt")
@@ -860,7 +860,7 @@ class CloudScheduler:
                 )
                 row = cur.fetchone()
                 if row and row[0] >= row[1]:
-                    utc_now = datetime.now()
+                    utc_now = datetime.now(timezone.utc)
                     cur.execute(
                         'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
                         (utc_now, uo_id)
