@@ -252,13 +252,25 @@ class CloudScheduler:
                 changes.append(f"🆕 [{r['supplier']}] {r['product_name']} 신규 등장 (가격: {r.get('price', '?')}원)")
                 continue
 
-            # 가격 하락
-            if prev["price"] and r.get("price") and r["price"] < prev["price"]:
-                changes.append(f"📉 [{r['supplier']}] {r['product_name']} 가격 하락: {prev['price']:,} → {r['price']:,}원")
+            # 가격 변동
+            if prev["price"] and r.get("price") and r["price"] != prev["price"]:
+                if r["price"] < prev["price"]:
+                    changes.append(f"📉 [{r['supplier']}] {r['product_name']} 가격 하락: {prev['price']:,} → {r['price']:,}원")
+                else:
+                    changes.append(f"📈 [{r['supplier']}] {r['product_name']} 가격 상승: {prev['price']:,} → {r['price']:,}원")
 
-            # 재고 증가 (0 → N)
-            if (not prev["quantity"] or prev["quantity"] == 0) and r.get("quantity") and r["quantity"] > 0:
-                changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {r['quantity']}개")
+            # 재고 변동
+            prev_qty = prev["quantity"] or 0
+            new_qty = r.get("quantity") or 0
+            if prev_qty != new_qty:
+                if prev_qty == 0 and new_qty > 0:
+                    changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {new_qty}개")
+                elif prev_qty > 0 and new_qty == 0:
+                    changes.append(f"🚫 [{r['supplier']}] {r['product_name']} 품절 (이전: {prev_qty}개)")
+                else:
+                    diff = new_qty - prev_qty
+                    arrow = "↑" if diff > 0 else "↓"
+                    changes.append(f"📊 [{r['supplier']}] {r['product_name']} 재고 변동: {prev_qty} → {new_qty}개 ({arrow}{abs(diff)})")
 
         return changes
 
@@ -368,10 +380,10 @@ class CloudScheduler:
 
         conn = self._db_pool.getconn()
         try:
-            # 1. credentials 조회
+            # 1. credentials + telegramChatId 조회
             cur = conn.cursor()
             cur.execute("""
-                SELECT m.credentials
+                SELECT m.credentials, m."telegramChatId"
                 FROM domae_cloud_monitors m
                 WHERE m.id = %s AND m."isActive" = true
             """, (monitor_id,))
@@ -382,6 +394,7 @@ class CloudScheduler:
 
             raw_creds = row[0]
             credentials = self._decrypt_creds(raw_creds)
+            telegram_chat_id = row[1]
 
             # 2. 크롤러 로드
             if not self._crawlers_loaded:
@@ -411,6 +424,19 @@ class CloudScheduler:
                 "order_id": getattr(result, "order_id", None),
                 "message": getattr(result, "message", ""),
             }))
+
+            # 텔레그램 알림
+            if telegram_chat_id:
+                try:
+                    from domae_mcp.cloud.notifier import Notifier
+                    product_name = job.get("product_name", product_id)
+                    if result.success:
+                        msg = f"✅ [{supplier_name}] {product_name} {quantity}개 주문 완료"
+                    else:
+                        msg = f"❌ [{supplier_name}] {product_name} 주문 실패: {getattr(result, 'message', '')}"
+                    Notifier.send_telegram(telegram_chat_id, msg)
+                except Exception as e:
+                    logger.warning("주문 텔레그램 알림 실패: %s", e)
 
             logger.info("order 완료: monitor=%s supplier=%s success=%s", monitor_id, supplier_name, result.success)
 
