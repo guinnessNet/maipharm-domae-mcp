@@ -11,6 +11,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+import psycopg2
+
 
 def _generate_cuid() -> str:
     """Prisma cuid() 호환 ID 생성 (25자, 'c'로 시작)."""
@@ -34,6 +36,20 @@ class CloudScheduler:
         self._crawlers = {}  # 캐시: {module_name: crawler_class}
         self._crawlers_loaded = False
 
+    def _get_conn(self):
+        """커넥션 풀에서 연결을 가져오고 SELECT 1로 유효성 검증.
+        stale 커넥션이면 닫고 새로 가져온다."""
+        conn = self._db_pool.getconn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            logger.warning("stale DB 커넥션 감지, 새 커넥션 획득")
+            self._db_pool.putconn(conn, close=True)
+            conn = self._db_pool.getconn()
+        return conn
+
     @staticmethod
     def _decrypt_creds(raw_creds):
         """암호화된 credentials 복호화 (평문 폴백 제거)"""
@@ -45,7 +61,7 @@ class CloudScheduler:
     def execute(self, job: dict):
         """잡 1개 실행"""
         monitor_id = job["monitor_id"]
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             # 1. 모니터 정보 조회
             cur = conn.cursor()
@@ -281,7 +297,7 @@ class CloudScheduler:
         keywords = job.get("keywords", [])
         requested_suppliers = job.get("suppliers", [])
 
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             # 1. 모니터 정보 조회 (credentials 가져오기)
             cur = conn.cursor()
@@ -378,7 +394,7 @@ class CloudScheduler:
         product_id = job["product_id"]
         quantity = job["quantity"]
 
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             # 1. credentials + telegramChatId 조회
             cur = conn.cursor()
@@ -452,7 +468,7 @@ class CloudScheduler:
         batch_id = job["batch_id"]
         items = job.get("items", [])
 
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             cur = conn.cursor()
 
@@ -615,7 +631,7 @@ class CloudScheduler:
         suppliers_info = job.get("suppliers", [])
         remaining_qty = job.get("remaining_quantity", 0)
 
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             cur = conn.cursor()
 
@@ -763,7 +779,7 @@ class CloudScheduler:
         login_id = job["login_id"]
         login_pw = job["login_pw"]
 
-        conn = self._db_pool.getconn()
+        conn = self._get_conn()
         try:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)

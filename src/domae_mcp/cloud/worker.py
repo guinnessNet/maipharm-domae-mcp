@@ -23,9 +23,13 @@ class CloudWorker:
             os.environ.get("REDIS_URL", "redis://localhost:6379"),
             decode_responses=True,
         )
-        self._db_pool = pool.SimpleConnectionPool(
+        self._db_pool = pool.ThreadedConnectionPool(
             1, 3,  # min 1, max 3 connections
             dsn=os.environ["DATABASE_URL"],
+            keepalives=1,
+            keepalives_idle=300,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
         self._executor = ThreadPoolExecutor(max_workers=3)
         self._scheduler = CloudScheduler(self._db_pool, self._redis)
@@ -38,15 +42,17 @@ class CloudWorker:
         self._running = False
 
     def run(self):
-        logger.info("도매 클라우드 워커 시작 (BRPOP 대기)")
+        logger.info("도매 클라우드 워커 시작 (우선순위 큐 지원)")
 
         while self._running:
             try:
-                result = self._redis.brpop("domae:jobs", timeout=5)
+                result = self._redis.brpop(["domae:jobs:urgent", "domae:jobs"], timeout=5)
                 if result is None:
                     continue
 
-                _, job_data = result
+                queue_name, job_data = result
+                if queue_name == "domae:jobs:urgent":
+                    logger.info("우선 잡 수신")
                 job = json.loads(job_data)
                 monitor_id = job.get("monitor_id")
                 action = job.get("action", "monitor")
