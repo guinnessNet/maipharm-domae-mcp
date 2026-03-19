@@ -319,15 +319,19 @@ class CloudScheduler:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
 
-            # 3. 대상 도매상 결정
+            # 3. 대상 도매상 결정 (requested_suppliers 순서 보장)
             target_suppliers = {}
-            for supplier_name, crawler_cls in self._crawlers.items():
-                if requested_suppliers and supplier_name not in requested_suppliers:
-                    continue
-                cred = credentials.get(supplier_name)
-                if not cred:
-                    continue
-                target_suppliers[supplier_name] = (crawler_cls, cred)
+            if requested_suppliers:
+                for supplier_name in requested_suppliers:
+                    crawler_cls = self._crawlers.get(supplier_name)
+                    cred = credentials.get(supplier_name)
+                    if crawler_cls and cred:
+                        target_suppliers[supplier_name] = (crawler_cls, cred)
+            else:
+                for supplier_name, crawler_cls in self._crawlers.items():
+                    cred = credentials.get(supplier_name)
+                    if cred:
+                        target_suppliers[supplier_name] = (crawler_cls, cred)
 
             # 4. 도매상별 검색 + 즉시 stream 전송
             for supplier_name, (crawler_cls, cred) in target_suppliers.items():
