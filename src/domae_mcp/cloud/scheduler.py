@@ -490,38 +490,15 @@ class CloudScheduler:
                     if cred:
                         target_suppliers[supplier_name] = (crawler_cls, cred)
 
-            # 4. 도매상별 검색 + 즉시 stream 전송
-            for supplier_name, (crawler_cls, cred) in target_suppliers.items():
+            # 4. 도매상별 병렬 검색 + 완료 시 즉시 stream 전송
+            def _search_and_stream(supplier_name, crawler_cls, cred):
                 try:
-                    crawler = crawler_cls()
-                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
-
-                    supplier_results = []
-                    for keyword in keywords:
-                        try:
-                            search_results = crawler.search(keyword)
-                            for r in search_results:
-                                supplier_results.append({
-                                    "keyword": keyword,
-                                    "supplier": supplier_name,
-                                    "product_name": r.product_name,
-                                    "unit": r.unit,
-                                    "insurance_code": getattr(r, "insurance_code", None),
-                                    "quantity": r.quantity,
-                                    "price": r.price,
-                                    "product_id": r.product_id,
-                                })
-                        except Exception as e:
-                            logger.warning("검색 실패 [%s/%s]: %s", supplier_name, keyword, e)
-                        time.sleep(1)
-
-                    # 도매상 1곳 완료 → stream 전송
+                    supplier_results = self._search_supplier(supplier_name, crawler_cls, cred, keywords)
                     self._redis.lpush(stream_key, json.dumps({
                         "type": "partial",
                         "supplier": supplier_name,
                         "results": supplier_results,
                     }))
-
                 except Exception as e:
                     logger.warning("도매상 검색 실패 [%s]: %s", supplier_name, e)
                     self._redis.lpush(stream_key, json.dumps({
@@ -531,7 +508,16 @@ class CloudScheduler:
                         "error": str(e),
                     }))
 
-                time.sleep(0.3)  # 도매상 간 딜레이 (서로 다른 서버)
+            with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
+                futures = [
+                    executor.submit(_search_and_stream, name, cls, cred)
+                    for name, (cls, cred) in target_suppliers.items()
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result(timeout=120)
+                    except Exception as e:
+                        logger.error("search_on_demand 스레드 에러: %s", e)
 
             # 5. 전체 완료
             self._redis.lpush(stream_key, json.dumps({"type": "done"}))
