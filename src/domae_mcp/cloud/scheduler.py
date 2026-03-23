@@ -9,6 +9,7 @@ import string
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import psycopg2
@@ -88,12 +89,28 @@ class CloudScheduler:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
 
-            # 3. 각 제품 검색
+            # 3. 도매별 병렬 검색 (도매당 1회 로그인 후 전 품목 순차 검색)
+            target_suppliers = {
+                name: (cls, credentials.get(name))
+                for name, cls in self._crawlers.items()
+                if credentials.get(name)
+            }
+
             all_results = []
-            for keyword in products:
-                results = self._search_all(keyword, credentials)
-                all_results.extend(results)
-                time.sleep(0.5)  # 제품 간 딜레이
+            with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
+                futures = {
+                    executor.submit(
+                        self._search_supplier, name, cls, cred, products
+                    ): name
+                    for name, (cls, cred) in target_suppliers.items()
+                }
+                for future in as_completed(futures):
+                    supplier = futures[future]
+                    try:
+                        results = future.result(timeout=120)
+                        all_results.extend(results)
+                    except Exception as e:
+                        logger.error("도매 검색 실패 [%s]: %s", supplier, e)
 
             # 4. 결과 저장
             if all_results:
@@ -231,16 +248,43 @@ class CloudScheduler:
 
         return results
 
+    def _search_supplier(self, supplier_name: str, crawler_cls, cred: dict, keywords: list) -> list:
+        """도매 1개에 대해 1회 로그인 후 전 품목 순차 검색."""
+        results = []
+        try:
+            crawler = crawler_cls()
+            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+            for keyword in keywords:
+                try:
+                    search_results = crawler.search(keyword)
+                    for r in search_results:
+                        results.append({
+                            "keyword": keyword,
+                            "supplier": supplier_name,
+                            "product_name": r.product_name,
+                            "unit": r.unit,
+                            "insurance_code": getattr(r, "insurance_code", None),
+                            "price": r.price,
+                            "quantity": r.quantity,
+                            "product_id": r.product_id,
+                        })
+                except Exception as e:
+                    logger.warning("검색 실패 [%s/%s]: %s", supplier_name, keyword, e)
+                time.sleep(0.5)  # 같은 사이트 내 품목 간 딜레이
+
+        except Exception as e:
+            logger.error("도매 로그인 실패 [%s]: %s", supplier_name, e)
+
+        return results
+
     def _save_results(self, conn, monitor_id: str, results: list):
         """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리)"""
         cur = conn.cursor()
         utc_now = datetime.now(timezone.utc)
 
-        # 24시간 초과 스냅샷 정리
-        cur.execute("""
-            DELETE FROM domae_inventory_snapshots
-            WHERE "monitorId" = %s AND "scannedAt" < NOW() - INTERVAL '24 hours'
-        """, (monitor_id,))
+        # 24시간 초과 스냅샷을 일별 평균으로 압축 보존
+        self._compact_old_snapshots(cur, monitor_id)
 
         for r in results:
             cur.execute("""
@@ -261,6 +305,60 @@ class CloudScheduler:
                 r.get("unit"), r.get("insurance_code"), r.get("quantity"), r.get("price"),
                 r.get("product_id"), utc_now,
             ))
+
+    def _compact_old_snapshots(self, cur, monitor_id: str):
+        """24시간 초과 스냅샷을 일별 평균으로 압축 보존."""
+        try:
+            # 1. 압축 대상 집계 (24h~90일, 같은 날짜에 2건 이상인 그룹)
+            cur.execute("""
+                SELECT "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
+                       DATE("scannedAt") as snap_date,
+                       AVG(COALESCE(quantity, 0))::int as avg_qty,
+                       AVG(COALESCE(price, 0))::int as avg_price
+                FROM domae_inventory_snapshots
+                WHERE "monitorId" = %s
+                  AND "scannedAt" < NOW() - INTERVAL '24 hours'
+                  AND "scannedAt" >= NOW() - INTERVAL '90 days'
+                GROUP BY "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
+                         DATE("scannedAt")
+                HAVING COUNT(*) > 1
+            """, (monitor_id,))
+
+            groups = cur.fetchall()
+
+            if groups:
+                # 2. 원본 삭제 (24h~90일)
+                cur.execute("""
+                    DELETE FROM domae_inventory_snapshots
+                    WHERE "monitorId" = %s
+                      AND "scannedAt" < NOW() - INTERVAL '24 hours'
+                      AND "scannedAt" >= NOW() - INTERVAL '90 days'
+                """, (monitor_id,))
+
+                # 3. 압축된 일별 대표 레코드 INSERT (scannedAt = 해당 날짜 12:00 UTC)
+                for row in groups:
+                    mid, supplier, product_name, unit, ins_code, product_id, snap_date, avg_qty, avg_price = row
+                    compacted_time = datetime.combine(snap_date, datetime.min.time().replace(hour=12))
+                    cur.execute("""
+                        INSERT INTO domae_inventory_snapshots
+                        (id, "monitorId", supplier, "productName", unit, "insuranceCode",
+                         quantity, price, "productId", "scannedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        _generate_cuid(), mid, supplier, product_name, unit, ins_code,
+                        avg_qty, avg_price, product_id, compacted_time,
+                    ))
+
+                logger.info("스냅샷 압축 완료 [%s]: %d개 그룹 → 일별 평균", monitor_id, len(groups))
+
+            # 4. 90일 초과 데이터 완전 삭제
+            cur.execute("""
+                DELETE FROM domae_inventory_snapshots
+                WHERE "monitorId" = %s AND "scannedAt" < NOW() - INTERVAL '90 days'
+            """, (monitor_id,))
+
+        except Exception as e:
+            logger.warning("스냅샷 압축 실패 [%s]: %s", monitor_id, e)
 
     def _detect_alerts(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
         """이전 스냅샷과 비교하여 핵심 이벤트만 감지.
