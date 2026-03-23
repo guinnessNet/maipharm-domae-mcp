@@ -70,6 +70,8 @@ class CloudWorker:
                         self._scheduler.batch_order(job)
                     elif action == "urgent_order_immediate":
                         self._scheduler.urgent_order_immediate(job)
+                    elif action == "telegram_order":
+                        self._scheduler.telegram_order(job)
                     elif action == "verify_credentials":
                         self._scheduler.verify_credentials(job)
                     else:

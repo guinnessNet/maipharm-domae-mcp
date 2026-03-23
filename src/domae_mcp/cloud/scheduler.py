@@ -107,20 +107,42 @@ class CloudScheduler:
             )
             conn.commit()
 
-            # 6. 변동 감지 + 알림
-            all_changes = []
+            # 6. 변동 감지 + 이벤트별 개별 알림
+            all_alerts = []
             for keyword in products:
                 keyword_results = [r for r in all_results if r["keyword"] == keyword]
                 if keyword_results:
-                    changes = self._detect_changes(conn, monitor_id, keyword, keyword_results)
-                    all_changes.extend(changes)
+                    alerts = self._detect_alerts(conn, monitor_id, keyword, keyword_results)
+                    all_alerts.extend(alerts)
 
-            if all_changes and telegram_chat_id:
+            if all_alerts and telegram_chat_id:
                 from domae_mcp.cloud.notifier import Notifier
-                message = f"🔔 도매 모니터링 알림\n\n" + "\n".join(all_changes)
-                Notifier.send_telegram(telegram_chat_id, message)
+                for alert in all_alerts:
+                    try:
+                        if alert["type"] == "restock":
+                            Notifier.send_restock_alert(
+                                chat_id=telegram_chat_id,
+                                monitor_id=monitor_id,
+                                supplier=alert["supplier"],
+                                product_name=alert["product_name"],
+                                product_id=alert.get("product_id", ""),
+                                quantity=alert["quantity"],
+                                price=alert.get("price", 0),
+                            )
+                        elif alert["type"] == "drop":
+                            Notifier.send_stock_drop_alert(
+                                chat_id=telegram_chat_id,
+                                supplier=alert["supplier"],
+                                product_name=alert["product_name"],
+                                old_qty=alert["old_qty"],
+                                new_qty=alert["new_qty"],
+                                price=alert.get("price", 0),
+                            )
+                        time.sleep(0.3)  # 텔레그램 rate limit 방지
+                    except Exception as e:
+                        logger.warning("알림 전송 실패: %s", e)
 
-            logger.info("모니터 %s 완료: %d건 검색, %d건 변동", monitor_id, len(all_results), len(all_changes))
+            logger.info("모니터 %s 완료: %d건 검색, %d건 알림", monitor_id, len(all_results), len(all_alerts))
 
             # 7. 활성 긴급주문 처리
             self._process_urgent_orders(conn, monitor_id, credentials)
@@ -210,9 +232,16 @@ class CloudScheduler:
         return results
 
     def _save_results(self, conn, monitor_id: str, results: list):
-        """검색 결과 DB 저장"""
+        """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리)"""
         cur = conn.cursor()
         utc_now = datetime.now(timezone.utc)
+
+        # 24시간 초과 스냅샷 정리
+        cur.execute("""
+            DELETE FROM domae_inventory_snapshots
+            WHERE "monitorId" = %s AND "scannedAt" < NOW() - INTERVAL '24 hours'
+        """, (monitor_id,))
+
         for r in results:
             cur.execute("""
                 INSERT INTO domae_cloud_results
@@ -222,7 +251,7 @@ class CloudScheduler:
                 _generate_cuid(), monitor_id, r["keyword"], r["supplier"], r["product_name"],
                 r.get("unit"), r.get("insurance_code"), r.get("price"), r.get("quantity"), r.get("product_id"), utc_now,
             ))
-            # 스냅샷 저장
+            # 스냅샷 누적 저장 (교체 아닌 INSERT)
             cur.execute("""
                 INSERT INTO domae_inventory_snapshots
                 (id, "monitorId", supplier, "productName", unit, "insuranceCode", quantity, price, "productId", "scannedAt")
@@ -233,62 +262,92 @@ class CloudScheduler:
                 r.get("product_id"), utc_now,
             ))
 
-    def _detect_changes(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
-        """이전 검색 결과와 비교하여 변동 사항 감지.
+    def _detect_alerts(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
+        """이전 스냅샷과 비교하여 핵심 이벤트만 감지.
+
+        감지 이벤트:
+        1. 재입고: 직전 스냅샷 재고 0 → 현재 > 0
+        2. 급격한 재고 감소: 직전 스냅샷 대비 30% 이상 감소
 
         Returns:
-            변동 메시지 리스트. 예: ["[지오영] 아모잘탄정 가격 하락: 12,500 → 11,800"]
+            이벤트 dict 리스트:
+            [{"type": "restock"|"drop", "supplier": ..., "product_name": ..., ...}]
         """
         cur = conn.cursor()
-        # 직전 검색 결과 (현재 검색 직전의 searchedAt 기준)
+
+        # 직전 스냅샷 (현재 저장 직전의 최신 스냅샷)
         cur.execute("""
             SELECT DISTINCT ON (supplier, "productName")
-                   supplier, "productName", price, quantity
-            FROM domae_cloud_results
-            WHERE "monitorId" = %s AND keyword = %s
-            AND "searchedAt" < (SELECT MAX("searchedAt") FROM domae_cloud_results WHERE "monitorId" = %s AND keyword = %s)
-            ORDER BY supplier, "productName", "searchedAt" DESC
-        """, (monitor_id, keyword, monitor_id, keyword))
+                   supplier, "productName", quantity, price, "productId"
+            FROM domae_inventory_snapshots
+            WHERE "monitorId" = %s
+              AND "scannedAt" < (
+                  SELECT MAX("scannedAt") FROM domae_inventory_snapshots
+                  WHERE "monitorId" = %s
+              )
+            ORDER BY supplier, "productName", "scannedAt" DESC
+        """, (monitor_id, monitor_id))
 
         prev_map = {}
         for row in cur.fetchall():
-            key = f"{row[0]}|{row[1]}"  # supplier|productName
-            prev_map[key] = {"price": row[2], "quantity": row[3]}
+            key = f"{row[0]}|{row[1]}"
+            prev_map[key] = {
+                "quantity": row[2] or 0,
+                "price": row[3] or 0,
+                "product_id": row[4] or "",
+            }
 
         if not prev_map:
             return []  # 첫 검색이면 비교 불가
 
-        changes = []
+        alerts = []
         for r in new_results:
             key = f"{r['supplier']}|{r['product_name']}"
             prev = prev_map.get(key)
+            new_qty = r.get("quantity") or 0
+            new_price = r.get("price") or 0
 
             if prev is None:
-                # 새로 등장한 제품
-                changes.append(f"🆕 [{r['supplier']}] {r['product_name']} 신규 등장 (가격: {r.get('price', '?')}원)")
+                # 신규 제품 — 재입고와 동일 취급 (재고 있을 때만)
+                if new_qty > 0:
+                    alerts.append({
+                        "type": "restock",
+                        "supplier": r["supplier"],
+                        "product_name": r["product_name"],
+                        "product_id": r.get("product_id", ""),
+                        "quantity": new_qty,
+                        "price": new_price,
+                    })
                 continue
 
-            # 가격 변동
-            if prev["price"] and r.get("price") and r["price"] != prev["price"]:
-                if r["price"] < prev["price"]:
-                    changes.append(f"📉 [{r['supplier']}] {r['product_name']} 가격 하락: {prev['price']:,} → {r['price']:,}원")
-                else:
-                    changes.append(f"📈 [{r['supplier']}] {r['product_name']} 가격 상승: {prev['price']:,} → {r['price']:,}원")
+            prev_qty = prev["quantity"]
 
-            # 재고 변동
-            prev_qty = prev["quantity"] or 0
-            new_qty = r.get("quantity") or 0
-            if prev_qty != new_qty:
-                if prev_qty == 0 and new_qty > 0:
-                    changes.append(f"📦 [{r['supplier']}] {r['product_name']} 재고 입고: {new_qty}개")
-                elif prev_qty > 0 and new_qty == 0:
-                    changes.append(f"🚫 [{r['supplier']}] {r['product_name']} 품절 (이전: {prev_qty}개)")
-                else:
-                    diff = new_qty - prev_qty
-                    arrow = "↑" if diff > 0 else "↓"
-                    changes.append(f"📊 [{r['supplier']}] {r['product_name']} 재고 변동: {prev_qty} → {new_qty}개 ({arrow}{abs(diff)})")
+            # 1. 재입고: 0 → N
+            if prev_qty == 0 and new_qty > 0:
+                alerts.append({
+                    "type": "restock",
+                    "supplier": r["supplier"],
+                    "product_name": r["product_name"],
+                    "product_id": r.get("product_id", ""),
+                    "quantity": new_qty,
+                    "price": new_price,
+                })
 
-        return changes
+            # 2. 급격한 재고 감소: 30% 이상 감소 (이전 재고 10개 이상일 때만)
+            elif prev_qty >= 10 and new_qty < prev_qty:
+                drop_pct = (prev_qty - new_qty) / prev_qty
+                if drop_pct >= 0.3:
+                    alerts.append({
+                        "type": "drop",
+                        "supplier": r["supplier"],
+                        "product_name": r["product_name"],
+                        "product_id": r.get("product_id", ""),
+                        "old_qty": prev_qty,
+                        "new_qty": new_qty,
+                        "price": new_price,
+                    })
+
+        return alerts
 
     def search_on_demand(self, job: dict):
         """온디맨드 검색 — 도매상별로 stream_key에 결과를 실시간 전송"""
@@ -822,6 +881,122 @@ class CloudScheduler:
         finally:
             self._db_pool.putconn(conn)
 
+    def telegram_order(self, job: dict):
+        """텔레그램 인라인 버튼으로 접수된 주문 처리.
+
+        monitor_prefix로 모니터를 찾고, supplier/product_id로 주문 실행.
+        결과를 원본 텔레그램 메시지에 편집으로 반영.
+        """
+        monitor_prefix = job["monitor_prefix"]
+        supplier_name = job["supplier"]
+        product_id = job["product_id"]
+        quantity = job["quantity"]
+        chat_id = job["chat_id"]
+        message_id = job.get("message_id")
+        original_text = job.get("original_text", "")
+
+        conn = self._get_conn()
+        try:
+            from domae_mcp.cloud.notifier import Notifier
+
+            # 입력 검증: monitor_prefix는 정확히 8자 영숫자
+            if not monitor_prefix or len(monitor_prefix) != 8:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="잘못된 요청",
+                )
+                return
+
+            # 1. monitor_prefix로 모니터 조회 (LEFT 정확 매칭 + chat_id 소유권 검증)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT m.id, m.credentials
+                FROM domae_cloud_monitors m
+                WHERE LEFT(m.id, 8) = %s
+                  AND m."isActive" = true
+                  AND m."telegramChatId" = %s
+                LIMIT 1
+            """, (monitor_prefix, chat_id))
+            row = cur.fetchone()
+            if not row:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="권한 없음",
+                )
+                return
+
+            monitor_id = row[0]
+            credentials = self._decrypt_creds(row[1])
+
+            # 2. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            cred = credentials.get(supplier_name)
+            if not cred:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg=f"{supplier_name} 계정 미등록",
+                )
+                return
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg=f"{supplier_name} 크롤러 없음",
+                )
+                return
+
+            # 3. 주문 실행
+            crawler = crawler_cls()
+            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+            # 제품명/가격 조회
+            product_name = product_id
+            price = 0
+            try:
+                search_results = crawler.search(product_id)
+                for sr in search_results:
+                    if sr.product_id == product_id:
+                        product_name = sr.product_name
+                        price = sr.price or 0
+                        break
+            except Exception:
+                pass
+
+            result = crawler.order(product_id, quantity)
+
+            Notifier.send_order_result(
+                chat_id, message_id, original_text,
+                product_name, supplier_name, quantity, price,
+                success=result.success,
+                error_msg=getattr(result, "message", ""),
+            )
+
+            logger.info(
+                "telegram_order 완료: supplier=%s product=%s qty=%d success=%s",
+                supplier_name, product_id, quantity, result.success,
+            )
+
+        except Exception as e:
+            logger.error("telegram_order 실패: %s", e, exc_info=True)
+            try:
+                from domae_mcp.cloud.notifier import Notifier
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="서버 오류",
+                )
+            except Exception:
+                pass
+        finally:
+            self._db_pool.putconn(conn)
+
     def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
         """모니터링 주기 내 활성 긴급주문 처리"""
         cur = conn.cursor()
@@ -887,6 +1062,34 @@ class CloudScheduler:
                     if result.success:
                         filled_this_round += order_qty
 
+                        # 긴급주문 체결 알림 (건별)
+                        try:
+                            cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
+                            tg_row = cur.fetchone()
+                            if tg_row and tg_row[0]:
+                                from domae_mcp.cloud.notifier import Notifier
+                                current_filled = (filled_qty or 0) + filled_this_round
+                                # 가격 조회
+                                price = 0
+                                try:
+                                    for sr in search_results:
+                                        if sr.product_id == product_id_val:
+                                            price = sr.price or 0
+                                            break
+                                except Exception:
+                                    pass
+                                Notifier.send_urgent_order_result(
+                                    chat_id=tg_row[0],
+                                    product_name=product_name,
+                                    supplier=supplier_name,
+                                    quantity=order_qty,
+                                    price=price,
+                                    filled=current_filled,
+                                    total=total_qty,
+                                )
+                        except Exception as e:
+                            logger.warning("긴급주문 알림 실패: %s", e)
+
                     conn.commit()
                     time.sleep(0.5)
 
@@ -911,16 +1114,6 @@ class CloudScheduler:
                         'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
                         (utc_now, uo_id)
                     )
-                    # 텔레그램 알림
-                    try:
-                        cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
-                        tg_row = cur.fetchone()
-                        if tg_row and tg_row[0]:
-                            from domae_mcp.cloud.notifier import Notifier
-                            Notifier.send_telegram(tg_row[0],
-                                f"✅ 긴급주문 완료: {product_name} {total_qty}통 확보")
-                    except Exception as e:
-                        logger.warning("긴급주문 알림 실패: %s", e)
 
                 conn.commit()
 

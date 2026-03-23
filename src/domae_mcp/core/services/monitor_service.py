@@ -154,75 +154,91 @@ class MonitorService:
                     "product_id": sup["product_id"],
                 })
 
-        # 3. 이전 스냅샷 조회 (해당 제품 키워드 기반)
+        # 3. 이전 스냅샷 조회 (최신 스냅샷만)
         prev_snapshots = (
             db.query(InventorySnapshot)
             .filter(InventorySnapshot.product_name.isnot(None))
+            .order_by(InventorySnapshot.scanned_at.desc())
             .all()
         )
-        prev_map = {
-            (s.product_name, s.supplier): s for s in prev_snapshots
-        }
+        # (product_name, supplier) 기준 최신 1개만
+        prev_map: dict[tuple, InventorySnapshot] = {}
+        for s in prev_snapshots:
+            key = (s.product_name, s.supplier)
+            if key not in prev_map:
+                prev_map[key] = s
 
-        # 4. 변동 감지 및 알림
+        # 4. 핵심 이벤트 감지 (재입고 + 급격한 재고 감소)
         for item in current_items:
             key = (item["product_name"], item["supplier"])
             prev = prev_map.get(key)
+            new_qty = item["quantity"] or 0
+            new_price = item["price"] or 0
 
             if prev is None:
-                # 신규 재고 감지
-                if item["quantity"] > 0:
-                    self._telegram.send_stock_alert(
-                        product_name=item["product_name"],
+                # 신규 제품 — 재고 있으면 재입고 취급
+                if new_qty > 0:
+                    self._telegram.send_restock_alert(
                         supplier=item["supplier"],
-                        quantity=item["quantity"],
-                        price=item["price"],
+                        product_name=item["product_name"],
+                        product_id=item.get("product_id", ""),
+                        quantity=new_qty,
+                        price=new_price,
                     )
                     db.add(MonitorAlert(
                         product_name=item["product_name"],
                         supplier=item["supplier"],
                         alert_type="stock",
                         old_value=0,
-                        new_value=float(item["quantity"]),
+                        new_value=float(new_qty),
                     ))
             else:
-                # 가격 변동
-                if prev.price and item["price"] and prev.price != item["price"]:
-                    self._telegram.send_price_alert(
-                        product_name=item["product_name"],
+                prev_qty = prev.quantity or 0
+
+                # 재입고: 0 → N
+                if prev_qty == 0 and new_qty > 0:
+                    self._telegram.send_restock_alert(
                         supplier=item["supplier"],
-                        old_price=prev.price,
-                        new_price=item["price"],
-                    )
-                    db.add(MonitorAlert(
                         product_name=item["product_name"],
-                        supplier=item["supplier"],
-                        alert_type="price",
-                        old_value=float(prev.price),
-                        new_value=float(item["price"]),
-                    ))
-                # 재고 없음 → 있음
-                if (prev.quantity or 0) == 0 and item["quantity"] > 0:
-                    self._telegram.send_stock_alert(
-                        product_name=item["product_name"],
-                        supplier=item["supplier"],
-                        quantity=item["quantity"],
-                        price=item["price"],
+                        product_id=item.get("product_id", ""),
+                        quantity=new_qty,
+                        price=new_price,
                     )
                     db.add(MonitorAlert(
                         product_name=item["product_name"],
                         supplier=item["supplier"],
                         alert_type="stock",
                         old_value=0,
-                        new_value=float(item["quantity"]),
+                        new_value=float(new_qty),
                     ))
+
+                # 급격한 재고 감소: 30% 이상 (이전 재고 10개 이상)
+                elif prev_qty >= 10 and new_qty < prev_qty:
+                    drop_pct = (prev_qty - new_qty) / prev_qty
+                    if drop_pct >= 0.3:
+                        self._telegram.send_stock_drop_alert(
+                            supplier=item["supplier"],
+                            product_name=item["product_name"],
+                            old_qty=prev_qty,
+                            new_qty=new_qty,
+                            price=new_price,
+                        )
+                        db.add(MonitorAlert(
+                            product_name=item["product_name"],
+                            supplier=item["supplier"],
+                            alert_type="stock_drop",
+                            old_value=float(prev_qty),
+                            new_value=float(new_qty),
+                        ))
 
         # 5. 긴급주문 체크
         self._check_urgent_orders(db, current_items)
 
-        # 6. 새 스냅샷 저장 (기존 스냅샷 삭제 후 교체)
-        for s in prev_snapshots:
-            db.delete(s)
+        # 6. 스냅샷 누적 저장 + 24시간 초과 정리
+        from sqlalchemy import text as sa_text
+        db.execute(
+            sa_text("DELETE FROM inventory_snapshots WHERE scanned_at < datetime('now', '-24 hours')")
+        )
 
         for item in current_items:
             snapshot = InventorySnapshot(
@@ -299,18 +315,19 @@ class MonitorService:
                 )
                 db.add(log)
 
-                # 텔레그램 알림
-                self._telegram.send_order_alert(
-                    product_name=uo.product_name,
-                    supplier=uo_sup.supplier,
-                    quantity=order_qty,
-                    success=result.success,
-                    message=result.message,
-                )
-
                 if result.success:
                     uo.filled_quantity = (uo.filled_quantity or 0) + order_qty
                     remaining -= order_qty
+
+                    # 긴급주문 체결 알림
+                    self._telegram.send_urgent_order_result(
+                        product_name=uo.product_name,
+                        supplier=uo_sup.supplier,
+                        quantity=order_qty,
+                        price=match.get("price", 0),
+                        filled=uo.filled_quantity,
+                        total=uo.total_quantity or 0,
+                    )
 
             # 수량 충족 시 비활성화
             if uo.filled_quantity >= (uo.total_quantity or 0):
