@@ -651,56 +651,35 @@ class CloudScheduler:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
 
-            # 4. 순차 주문 처리
+            # 4. 도매상별 그룹핑 → 일괄 주문
             success_count = 0
             fail_count = 0
             logged_in_crawlers = {}  # 도매상별 로그인 캐시
 
-            for item in items:
+            # 4-1. 사전 검증 + 도매상별 그룹핑
+            from collections import OrderedDict
+            supplier_groups = OrderedDict()  # {supplier: [(idx, item), ...]}
+            pre_fail = {}  # {idx: error_message}
+
+            for idx, item in enumerate(items):
                 supplier_name = item.get("supplier")
-                product_id_val = item.get("product_id")
-                product_name = item.get("product_name", "")
-                insurance_code = item.get("insurance_code")
-                unit = item.get("unit")
-                qty = item.get("quantity", 1)
-                cart_item_id = item.get("cart_item_id")
+                if not supplier_name:
+                    pre_fail[idx] = "도매상 미지정"
+                    continue
+                cred = credentials.get(supplier_name)
+                if not cred:
+                    pre_fail[idx] = f"{supplier_name} 계정 미등록"
+                    continue
+                crawler_cls = self._crawlers.get(supplier_name)
+                if not crawler_cls:
+                    pre_fail[idx] = f"{supplier_name} 크롤러 없음"
+                    continue
+                supplier_groups.setdefault(supplier_name, []).append((idx, item))
 
-                order_success = False
-                order_id_val = None
-                order_message = ""
-                order_price = item.get("price")
-
-                try:
-                    if not supplier_name:
-                        order_message = "도매상 미지정"
-                        raise ValueError(order_message)
-
-                    cred = credentials.get(supplier_name)
-                    if not cred:
-                        order_message = f"{supplier_name} 계정 미등록"
-                        raise ValueError(order_message)
-
-                    crawler_cls = self._crawlers.get(supplier_name)
-                    if not crawler_cls:
-                        order_message = f"{supplier_name} 크롤러 없음"
-                        raise ValueError(order_message)
-
-                    # 도매상별 로그인 캐시
-                    if supplier_name not in logged_in_crawlers:
-                        crawler = crawler_cls()
-                        crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
-                        logged_in_crawlers[supplier_name] = crawler
-
-                    crawler = logged_in_crawlers[supplier_name]
-                    result = crawler.order(product_id_val, qty)
-                    order_success = result.success
-                    order_id_val = getattr(result, "order_id", None)
-                    order_message = getattr(result, "message", "")
-
-                except Exception as e:
-                    order_message = order_message or str(e)
-
-                # DomaeCloudOrder INSERT
+            # 4-2. 사전 실패 항목 기록
+            for idx, msg in pre_fail.items():
+                item = items[idx]
+                fail_count += 1
                 utc_now = datetime.now(timezone.utc)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
@@ -708,25 +687,81 @@ class CloudScheduler:
                      quantity, price, success, "productId", "orderId", message, "orderedAt")
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
-                    _generate_cuid(), monitor_id, batch_id, supplier_name or "",
-                    product_name, unit, insurance_code,
-                    qty, order_price, order_success,
-                    product_id_val, order_id_val, order_message, utc_now,
+                    _generate_cuid(), monitor_id, batch_id, item.get("supplier") or "",
+                    item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
+                    item.get("quantity", 1), item.get("price"), False,
+                    item.get("product_id"), None, msg, utc_now,
                 ))
+                cart_item_id = item.get("cart_item_id")
+                if cart_item_id:
+                    cur.execute(
+                        'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                        (utc_now, msg, cart_item_id)
+                    )
+            conn.commit()
 
-                if order_success:
-                    success_count += 1
-                    # 장바구니에서 제거
-                    if cart_item_id:
-                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
-                else:
-                    fail_count += 1
-                    # 장바구니에 실패 사유 기록
-                    if cart_item_id:
-                        cur.execute(
-                            'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
-                            (utc_now, order_message, cart_item_id)
-                        )
+            # 4-3. 도매상별 일괄 주문
+            for supplier_name, group_items in supplier_groups.items():
+                cred = credentials[supplier_name]
+                crawler_cls = self._crawlers[supplier_name]
+
+                if supplier_name not in logged_in_crawlers:
+                    crawler = crawler_cls()
+                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+                    logged_in_crawlers[supplier_name] = crawler
+                crawler = logged_in_crawlers[supplier_name]
+
+                batch_items = [
+                    {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1)}
+                    for _, item in group_items
+                ]
+
+                try:
+                    results = crawler.order_batch(batch_items)
+                except Exception as e:
+                    results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
+                               for _ in group_items]
+
+                # 길이 불일치 방어
+                if len(results) != len(group_items):
+                    logger.warning("order_batch 반환 길이 불일치: %s expected=%d got=%d",
+                                   supplier_name, len(group_items), len(results))
+                    from domae_mcp.core.crawlers.base import OrderResult as _OR
+                    while len(results) < len(group_items):
+                        results.append(_OR(success=False, message="결과 누락"))
+
+                for (idx, item), result in zip(group_items, results):
+                    order_success = result.success
+                    order_id_val = getattr(result, "order_id", None)
+                    order_message = getattr(result, "message", "")
+                    order_price = item.get("price")
+
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute("""
+                        INSERT INTO domae_cloud_orders
+                        (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
+                         quantity, price, success, "productId", "orderId", message, "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        _generate_cuid(), monitor_id, batch_id, supplier_name,
+                        item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
+                        item.get("quantity", 1), order_price, order_success,
+                        item.get("product_id"), order_id_val, order_message, utc_now,
+                    ))
+
+                    if order_success:
+                        success_count += 1
+                        cart_item_id = item.get("cart_item_id")
+                        if cart_item_id:
+                            cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                    else:
+                        fail_count += 1
+                        cart_item_id = item.get("cart_item_id")
+                        if cart_item_id:
+                            cur.execute(
+                                'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                                (utc_now, order_message, cart_item_id)
+                            )
 
                 # batch 카운트 업데이트
                 cur.execute("""
@@ -736,7 +771,7 @@ class CloudScheduler:
                 """, (success_count, fail_count, batch_id))
                 conn.commit()
 
-                time.sleep(1)  # 주문 간 딜레이 (같은 서버 연속 주문)
+                time.sleep(1)  # 도매상 간 딜레이
 
             # 5. batch 완료
             utc_now = datetime.now(timezone.utc)
