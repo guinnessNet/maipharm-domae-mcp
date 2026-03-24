@@ -654,6 +654,8 @@ class CloudScheduler:
             # 4. 도매상별 그룹핑 → 일괄 주문
             success_count = 0
             fail_count = 0
+            success_lines = []  # 텔레그램 알림용
+            fail_lines = []
             logged_in_crawlers = {}  # 도매상별 로그인 캐시
 
             # 4-1. 사전 검증 + 도매상별 그룹핑
@@ -680,6 +682,9 @@ class CloudScheduler:
             for idx, msg in pre_fail.items():
                 item = items[idx]
                 fail_count += 1
+                fail_lines.append(
+                    f" · [{item.get('supplier', '?')}] {item.get('product_name', '')} ×{item.get('quantity', 1)} — {msg}"
+                )
                 utc_now = datetime.now(timezone.utc)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
@@ -749,13 +754,16 @@ class CloudScheduler:
                         item.get("product_id"), order_id_val, order_message, utc_now,
                     ))
 
+                    _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{item.get('quantity', 1)}"
                     if order_success:
                         success_count += 1
+                        success_lines.append(_tg_line)
                         cart_item_id = item.get("cart_item_id")
                         if cart_item_id:
                             cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
                     else:
                         fail_count += 1
+                        fail_lines.append(_tg_line + (f" — {order_message}" if order_message else ""))
                         cart_item_id = item.get("cart_item_id")
                         if cart_item_id:
                             cur.execute(
@@ -786,7 +794,20 @@ class CloudScheduler:
             if telegram_chat_id:
                 try:
                     from domae_mcp.cloud.notifier import Notifier
-                    msg = f"📦 도매 일괄주문 완료\n\n성공: {success_count}건\n실패: {fail_count}건"
+                    parts = ["📦 도매 일괄주문 완료\n"]
+                    if success_lines:
+                        parts.append(f"✅ 성공 {success_count}건")
+                        parts.extend(success_lines[:10])
+                        if len(success_lines) > 10:
+                            parts.append(f" ... 외 {len(success_lines) - 10}건")
+                    if fail_lines:
+                        if success_lines:
+                            parts.append("")
+                        parts.append(f"❌ 실패 {fail_count}건")
+                        parts.extend(fail_lines[:10])
+                        if len(fail_lines) > 10:
+                            parts.append(f" ... 외 {len(fail_lines) - 10}건")
+                    msg = "\n".join(parts)
                     Notifier.send_telegram(telegram_chat_id, msg)
                 except Exception as e:
                     logger.warning("텔레그램 알림 실패: %s", e)
@@ -802,6 +823,23 @@ class CloudScheduler:
                 conn.commit()
             except Exception:
                 pass
+            # 부분 성공이라도 텔레그램 알림 발송
+            if telegram_chat_id and (success_lines or fail_lines):
+                try:
+                    from domae_mcp.cloud.notifier import Notifier
+                    parts = [f"📦 도매 일괄주문 오류 (일부 처리됨)\n"]
+                    if success_lines:
+                        parts.append(f"✅ 성공 {success_count}건")
+                        parts.extend(success_lines[:10])
+                    if fail_lines:
+                        if success_lines:
+                            parts.append("")
+                        parts.append(f"❌ 실패 {fail_count}건")
+                        parts.extend(fail_lines[:10])
+                    parts.append(f"\n⚠️ 오류: {str(e)[:100]}")
+                    Notifier.send_telegram(telegram_chat_id, "\n".join(parts))
+                except Exception:
+                    pass
         finally:
             self._db_pool.putconn(conn)
 
