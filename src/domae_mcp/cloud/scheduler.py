@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 
@@ -899,7 +899,8 @@ class CloudScheduler:
                 conn.commit()
                 if telegram_chat_id:
                     self._send_auto_order_telegram(telegram_chat_id, supplier_name, [], items,
-                                                   global_error=f"{supplier_name} 계정 미등록")
+                                                   global_error=f"{supplier_name} 계정 미등록",
+                                                   scheduled_at=scheduled_at)
                 return
 
             crawler_cls = self._crawlers.get(supplier_name)
@@ -909,7 +910,8 @@ class CloudScheduler:
                 conn.commit()
                 if telegram_chat_id:
                     self._send_auto_order_telegram(telegram_chat_id, supplier_name, [], items,
-                                                   global_error=f"{supplier_name} 크롤러 없음")
+                                                   global_error=f"{supplier_name} 크롤러 없음",
+                                                   scheduled_at=scheduled_at)
                 return
 
             # 5. 로그인 + 주문 실행
@@ -996,6 +998,7 @@ class CloudScheduler:
                 self._send_auto_order_telegram(
                     telegram_chat_id, supplier_name, success_items, failed_items,
                     conn=conn, monitor_id=monitor_id, credentials=credentials,
+                    scheduled_at=scheduled_at,
                 )
 
             # 9. SSE 결과 알림 (Redis publish)
@@ -1028,6 +1031,7 @@ class CloudScheduler:
                 self._send_auto_order_telegram(
                     telegram_chat_id, supplier_name, success_items, failed_items,
                     conn=conn, monitor_id=monitor_id, credentials=credentials,
+                    scheduled_at=scheduled_at,
                 )
         finally:
             self._db_pool.putconn(conn)
@@ -1052,14 +1056,20 @@ class CloudScheduler:
 
     def _send_auto_order_telegram(self, chat_id: str, supplier: str, success_items: list,
                                   failed_items: list, global_error: str = None,
-                                  conn=None, monitor_id: str = None, credentials: dict = None):
+                                  conn=None, monitor_id: str = None, credentials: dict = None,
+                                  scheduled_at: str = ""):
         """자동주문 결과 텔레그램 알림 전송.
 
         실패 품목이 있으면 다른 도매에서 대체 검색 후 인라인 버튼으로 표시.
         """
         try:
             from domae_mcp.cloud.notifier import Notifier
-            now_str = datetime.now(timezone.utc).strftime("%H:%M")
+            # scheduled_at은 이미 KST 기준 마감시간 (예: "14:00")
+            if scheduled_at:
+                now_str = scheduled_at
+            else:
+                KST = timezone(timedelta(hours=9))
+                now_str = datetime.now(KST).strftime("%H:%M")
 
             if global_error:
                 # 전체 실패 (계정 미등록, 크롤러 없음 등)
@@ -1191,7 +1201,8 @@ class CloudScheduler:
 
         성공 시 메시지 편집, 실패 시 남은 도매로 인라인 버튼 재표시.
         """
-        monitor_prefix = job["monitor_prefix"]
+        monitor_id = job.get("monitor_id")
+        monitor_prefix = job.get("monitor_prefix", "")
         supplier_name = job["supplier"]
         product_id = job["product_id"]
         quantity = job["quantity"]
@@ -1204,8 +1215,8 @@ class CloudScheduler:
         try:
             from domae_mcp.cloud.notifier import Notifier
 
-            # 입력 검증
-            if not monitor_prefix or len(monitor_prefix) != 8:
+            # 입력 검증: monitor_id가 있으면 직접 사용, 없으면 prefix 필요
+            if not monitor_id and (not monitor_prefix or len(monitor_prefix) != 8):
                 Notifier.send_order_result(
                     chat_id, message_id, original_text,
                     product_id, supplier_name, quantity, 0,
@@ -1213,16 +1224,28 @@ class CloudScheduler:
                 )
                 return
 
-            # 1. monitor_prefix로 모니터 조회 + chat_id 소유권 검증
+            # 1. 모니터 조회 + chat_id 소유권 검증
             cur = conn.cursor()
-            cur.execute("""
-                SELECT m.id, m.credentials
-                FROM domae_cloud_monitors m
-                WHERE LEFT(m.id, 8) = %s
-                  AND m."isActive" = true
-                  AND m."telegramChatId" = %s
-                LIMIT 1
-            """, (monitor_prefix, chat_id))
+            if monitor_id:
+                # monitor_id가 있으면 직접 조회
+                cur.execute("""
+                    SELECT m.id, m.credentials
+                    FROM domae_cloud_monitors m
+                    WHERE m.id = %s
+                      AND m."isActive" = true
+                      AND m."telegramChatId" = %s
+                    LIMIT 1
+                """, (monitor_id, chat_id))
+            else:
+                # monitor_prefix로 LIKE 검색
+                cur.execute("""
+                    SELECT m.id, m.credentials
+                    FROM domae_cloud_monitors m
+                    WHERE LEFT(m.id, 8) = %s
+                      AND m."isActive" = true
+                      AND m."telegramChatId" = %s
+                    LIMIT 1
+                """, (monitor_prefix, chat_id))
             row = cur.fetchone()
             if not row:
                 Notifier.send_order_result(
