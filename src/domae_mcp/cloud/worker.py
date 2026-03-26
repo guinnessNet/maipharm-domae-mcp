@@ -72,6 +72,8 @@ class CloudWorker:
                         self._scheduler.auto_order(job)
                     elif action == "urgent_order_immediate":
                         self._scheduler.urgent_order_immediate(job)
+                    elif action == "auto_order_retry":
+                        self._scheduler.auto_order_retry(job)
                     elif action == "telegram_order":
                         self._scheduler.telegram_order(job)
                     elif action == "verify_credentials":

@@ -991,9 +991,12 @@ class CloudScheduler:
                 log_status = "failed"
             self._update_auto_order_log(conn, monitor_id, batch_id, log_status)
 
-            # 8. 텔레그램 알림
+            # 8. 텔레그램 알림 (실패 품목은 대체 도매 검색 + 인라인 버튼)
             if telegram_chat_id:
-                self._send_auto_order_telegram(telegram_chat_id, supplier_name, success_items, failed_items)
+                self._send_auto_order_telegram(
+                    telegram_chat_id, supplier_name, success_items, failed_items,
+                    conn=conn, monitor_id=monitor_id, credentials=credentials,
+                )
 
             # 9. SSE 결과 알림 (Redis publish)
             try:
@@ -1022,7 +1025,10 @@ class CloudScheduler:
             self._update_auto_order_log(conn, monitor_id, batch_id, "failed", str(e)[:200])
             # 부분 성공이라도 텔레그램 알림
             if telegram_chat_id and (success_items or failed_items):
-                self._send_auto_order_telegram(telegram_chat_id, supplier_name, success_items, failed_items)
+                self._send_auto_order_telegram(
+                    telegram_chat_id, supplier_name, success_items, failed_items,
+                    conn=conn, monitor_id=monitor_id, credentials=credentials,
+                )
         finally:
             self._db_pool.putconn(conn)
 
@@ -1045,8 +1051,12 @@ class CloudScheduler:
             logger.warning("auto_order_log 상태 업데이트 실패: %s", e)
 
     def _send_auto_order_telegram(self, chat_id: str, supplier: str, success_items: list,
-                                  failed_items: list, global_error: str = None):
-        """자동주문 결과 텔레그램 알림 전송"""
+                                  failed_items: list, global_error: str = None,
+                                  conn=None, monitor_id: str = None, credentials: dict = None):
+        """자동주문 결과 텔레그램 알림 전송.
+
+        실패 품목이 있으면 다른 도매에서 대체 검색 후 인라인 버튼으로 표시.
+        """
         try:
             from domae_mcp.cloud.notifier import Notifier
             now_str = datetime.now(timezone.utc).strftime("%H:%M")
@@ -1069,8 +1079,39 @@ class CloudScheduler:
                     lines.append(f"• {item.get('product_name', '')} — {qty}개 — {line_total:,}원")
                 lines.append(f"\n총 {len(success_items)}건, {total_price:,}원 주문 완료")
                 Notifier.send_telegram(chat_id, "\n".join(lines))
+                return
 
-            elif not success_items and failed_items:
+            # 실패 품목 있음 → 대체 도매 검색
+            inline_keyboard = []
+            if failed_items and credentials and monitor_id:
+                available_suppliers = [
+                    s for s in credentials.keys()
+                    if s != supplier and self._crawlers.get(s)
+                ]
+                for item in failed_items[:5]:  # 최대 5개 품목만 대체 검색
+                    alt_results = self._search_alternatives(
+                        item.get("product_name", ""), available_suppliers, credentials
+                    )
+                    if alt_results:
+                        row = []
+                        for alt in alt_results[:3]:  # 도매당 최대 3개
+                            price_str = f" {alt['price']:,}원" if alt.get("price") else ""
+                            mid = Notifier._sanitize_cb_field(monitor_id, 8)
+                            sup = Notifier._sanitize_cb_field(alt["supplier"], 10)
+                            pid = Notifier._sanitize_cb_field(alt["product_id"], 16)
+                            qty = item.get("quantity", 1)
+                            cb_data = f"AO:{mid}:{sup}:{pid}:{qty}"
+                            if len(cb_data.encode("utf-8")) <= 64:
+                                row.append({
+                                    "text": f"{alt['supplier']}{price_str}",
+                                    "callback_data": cb_data,
+                                })
+                        if row:
+                            inline_keyboard.append(row)
+
+            reply_markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
+
+            if not success_items and failed_items:
                 # 전체 실패
                 lines = [f"❌ 자동주문 실패 ({supplier}, {now_str})\n"]
                 for item in failed_items[:10]:
@@ -1079,8 +1120,11 @@ class CloudScheduler:
                     lines.append(f"• {item.get('product_name', '')} {qty}개 — {reason}")
                 if len(failed_items) > 10:
                     lines.append(f" ... 외 {len(failed_items) - 10}건")
-                lines.append("\n수동으로 확인해주세요.")
-                Notifier.send_telegram(chat_id, "\n".join(lines))
+                if inline_keyboard:
+                    lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
+                else:
+                    lines.append("\n수동으로 확인해주세요.")
+                Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
             else:
                 # 부분 실패
@@ -1104,11 +1148,233 @@ class CloudScheduler:
                 if len(failed_items) > 10:
                     lines.append(f" ... 외 {len(failed_items) - 10}건")
 
-                lines.append("\n수동으로 확인해주세요.")
-                Notifier.send_telegram(chat_id, "\n".join(lines))
+                if inline_keyboard:
+                    lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
+                else:
+                    lines.append("\n수동으로 확인해주세요.")
+                Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
         except Exception as e:
             logger.warning("자동주문 텔레그램 알림 실패: %s", e)
+
+    def _search_alternatives(self, product_name: str, available_suppliers: list, credentials: dict) -> list:
+        """다른 도매에서 해당 품목 검색 — 재고 있는 결과만 반환."""
+        results = []
+        for sup in available_suppliers:
+            try:
+                cred = credentials.get(sup)
+                if not cred:
+                    continue
+                crawler_cls = self._crawlers.get(sup)
+                if not crawler_cls:
+                    continue
+                crawler = crawler_cls()
+                crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+                search_results = crawler.search(product_name)
+                for r in search_results:
+                    if r.quantity and r.quantity > 0:
+                        results.append({
+                            "supplier": sup,
+                            "product_id": r.product_id,
+                            "product_name": r.product_name,
+                            "price": r.price,
+                            "quantity": r.quantity,
+                        })
+                        break  # 도매당 1개만
+            except Exception as e:
+                logger.debug("대체 검색 실패 [%s/%s]: %s", sup, product_name, e)
+                continue
+        return results
+
+    def auto_order_retry(self, job: dict):
+        """텔레그램 대체 도매 주문 (단일 품목) — AO 콜백 버튼 핸들러.
+
+        성공 시 메시지 편집, 실패 시 남은 도매로 인라인 버튼 재표시.
+        """
+        monitor_prefix = job["monitor_prefix"]
+        supplier_name = job["supplier"]
+        product_id = job["product_id"]
+        quantity = job["quantity"]
+        chat_id = job["chat_id"]
+        message_id = job.get("message_id")
+        original_text = job.get("original_text", "")
+        tried_suppliers = job.get("tried_suppliers", [])
+
+        conn = self._get_conn()
+        try:
+            from domae_mcp.cloud.notifier import Notifier
+
+            # 입력 검증
+            if not monitor_prefix or len(monitor_prefix) != 8:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="잘못된 요청",
+                )
+                return
+
+            # 1. monitor_prefix로 모니터 조회 + chat_id 소유권 검증
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT m.id, m.credentials
+                FROM domae_cloud_monitors m
+                WHERE LEFT(m.id, 8) = %s
+                  AND m."isActive" = true
+                  AND m."telegramChatId" = %s
+                LIMIT 1
+            """, (monitor_prefix, chat_id))
+            row = cur.fetchone()
+            if not row:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="권한 없음",
+                )
+                return
+
+            monitor_id = row[0]
+            credentials = self._decrypt_creds(row[1])
+
+            # 2. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            cred = credentials.get(supplier_name)
+            if not cred:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg=f"{supplier_name} 계정 미등록",
+                )
+                return
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg=f"{supplier_name} 크롤러 없음",
+                )
+                return
+
+            # 3. 주문 실행
+            crawler = crawler_cls()
+            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+            # 제품명/가격 조회
+            product_name = product_id
+            price = 0
+            try:
+                search_results = crawler.search(product_id)
+                for sr in search_results:
+                    if sr.product_id == product_id:
+                        product_name = sr.product_name
+                        price = sr.price or 0
+                        break
+            except Exception:
+                pass
+
+            result = crawler.order(product_id, quantity)
+
+            if result.success:
+                # 성공 → 메시지 편집: 버튼 제거 + 완료 표시
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_name, supplier_name, quantity, price,
+                    success=True,
+                )
+                # DB 기록
+                utc_now = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO domae_cloud_orders
+                    (id, "monitorId", supplier, "productName",
+                     quantity, price, success, "productId", "orderId", message, "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), monitor_id, supplier_name,
+                    product_name, quantity, price, True,
+                    product_id, getattr(result, "order_id", None),
+                    getattr(result, "message", ""), utc_now,
+                ))
+                conn.commit()
+            else:
+                # 실패 → 남은 도매에서 검색 → 인라인 버튼 재표시
+                all_tried = list(set(tried_suppliers + [supplier_name]))
+                remaining_suppliers = [
+                    s for s in credentials.keys()
+                    if s not in all_tried and self._crawlers.get(s)
+                ]
+
+                inline_keyboard = []
+                if remaining_suppliers:
+                    alt_results = self._search_alternatives(
+                        product_name if product_name != product_id else product_id,
+                        remaining_suppliers, credentials,
+                    )
+                    if alt_results:
+                        row_btns = []
+                        for alt in alt_results[:3]:
+                            price_str = f" {alt['price']:,}원" if alt.get("price") else ""
+                            mid = Notifier._sanitize_cb_field(monitor_id, 8)
+                            sup = Notifier._sanitize_cb_field(alt["supplier"], 10)
+                            pid = Notifier._sanitize_cb_field(alt["product_id"], 16)
+                            cb_data = f"AO:{mid}:{sup}:{pid}:{quantity}"
+                            if len(cb_data.encode("utf-8")) <= 64:
+                                row_btns.append({
+                                    "text": f"{alt['supplier']}{price_str}",
+                                    "callback_data": cb_data,
+                                })
+                        if row_btns:
+                            inline_keyboard.append(row_btns)
+
+                error_msg = getattr(result, "message", "주문 실패")
+                fail_text = f"\n\n❌ {supplier_name} 주문 실패: {error_msg}"
+
+                if inline_keyboard:
+                    fail_text += "\n\n다른 도매에서 주문하려면 아래 버튼을 누르세요:"
+                    reply_markup = {"inline_keyboard": inline_keyboard}
+                else:
+                    fail_text += "\n\n모든 도매 주문 실패 — 수동으로 확인해주세요."
+                    reply_markup = None
+
+                if message_id:
+                    updated_text = original_text + fail_text
+                    Notifier.edit_message(chat_id, message_id, updated_text, reply_markup=reply_markup)
+                else:
+                    Notifier.send_telegram(chat_id, fail_text.strip(), reply_markup=reply_markup)
+
+                # DB 기록 (실패)
+                utc_now = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO domae_cloud_orders
+                    (id, "monitorId", supplier, "productName",
+                     quantity, price, success, "productId", message, "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), monitor_id, supplier_name,
+                    product_name, quantity, price, False,
+                    product_id, error_msg, utc_now,
+                ))
+                conn.commit()
+
+            logger.info(
+                "auto_order_retry 완료: supplier=%s product=%s qty=%d success=%s",
+                supplier_name, product_id, quantity, result.success,
+            )
+
+        except Exception as e:
+            logger.error("auto_order_retry 실패: %s", e, exc_info=True)
+            try:
+                from domae_mcp.cloud.notifier import Notifier
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg="서버 오류",
+                )
+            except Exception:
+                pass
+        finally:
+            self._db_pool.putconn(conn)
 
     def urgent_order_immediate(self, job: dict):
         """긴급주문 즉시 1회 실행 — response_key로 결과 반환"""
