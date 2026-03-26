@@ -843,6 +843,273 @@ class CloudScheduler:
         finally:
             self._db_pool.putconn(conn)
 
+    def auto_order(self, job: dict):
+        """자동주문 — 단일 도매상 장바구니 주문 실행 + 텔레그램 알림 + SSE 알림"""
+        monitor_id = job["monitor_id"]
+        batch_id = job["batch_id"]
+        supplier_name = job["supplier"]
+        scheduled_at = job.get("scheduled_at", "")
+        items = job.get("items", [])
+
+        conn = self._get_conn()
+        telegram_chat_id = None
+        success_items = []
+        failed_items = []
+
+        try:
+            cur = conn.cursor()
+
+            # 1. batch status → processing
+            utc_now = datetime.now(timezone.utc)
+            cur.execute(
+                'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
+                ("processing", batch_id, monitor_id)
+            )
+            conn.commit()
+
+            # 2. credentials + telegramChatId 조회
+            cur.execute("""
+                SELECT m.credentials, m."telegramChatId"
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                self._update_auto_order_log(conn, monitor_id, batch_id, "failed", "모니터 없음")
+                cur.execute(
+                    'UPDATE domae_order_batches SET status = %s WHERE id = %s',
+                    ("failed", batch_id)
+                )
+                conn.commit()
+                return
+
+            raw_creds = row[0]
+            credentials = self._decrypt_creds(raw_creds)
+            telegram_chat_id = row[1]
+
+            # 3. 크롤러 로드
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            # 4. 사전 검증
+            cred = credentials.get(supplier_name)
+            if not cred:
+                self._update_auto_order_log(conn, monitor_id, batch_id, "failed", f"{supplier_name} 계정 미등록")
+                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                conn.commit()
+                if telegram_chat_id:
+                    self._send_auto_order_telegram(telegram_chat_id, supplier_name, [], items,
+                                                   global_error=f"{supplier_name} 계정 미등록")
+                return
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                self._update_auto_order_log(conn, monitor_id, batch_id, "failed", f"{supplier_name} 크롤러 없음")
+                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                conn.commit()
+                if telegram_chat_id:
+                    self._send_auto_order_telegram(telegram_chat_id, supplier_name, [], items,
+                                                   global_error=f"{supplier_name} 크롤러 없음")
+                return
+
+            # 5. 로그인 + 주문 실행
+            crawler = crawler_cls()
+            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+
+            batch_items = [
+                {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1)}
+                for item in items
+            ]
+
+            try:
+                results = crawler.order_batch(batch_items)
+            except Exception as e:
+                results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
+                           for _ in items]
+
+            # 길이 불일치 방어
+            if len(results) != len(items):
+                logger.warning("auto_order order_batch 반환 길이 불일치: %s expected=%d got=%d",
+                               supplier_name, len(items), len(results))
+                from domae_mcp.core.crawlers.base import OrderResult as _OR
+                while len(results) < len(items):
+                    results.append(_OR(success=False, message="결과 누락"))
+
+            success_count = 0
+            fail_count = 0
+
+            for item, result in zip(items, results):
+                order_success = result.success
+                order_id_val = getattr(result, "order_id", None)
+                order_message = getattr(result, "message", "")
+                order_price = item.get("price")
+
+                utc_now = datetime.now(timezone.utc)
+                cur.execute("""
+                    INSERT INTO domae_cloud_orders
+                    (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
+                     quantity, price, success, "productId", "orderId", message, "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), monitor_id, batch_id, supplier_name,
+                    item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
+                    item.get("quantity", 1), order_price, order_success,
+                    item.get("product_id"), order_id_val, order_message, utc_now,
+                ))
+
+                if order_success:
+                    success_count += 1
+                    success_items.append(item)
+                    cart_item_id = item.get("cart_item_id")
+                    if cart_item_id:
+                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                else:
+                    fail_count += 1
+                    failed_items.append({**item, "message": order_message})
+                    cart_item_id = item.get("cart_item_id")
+                    if cart_item_id:
+                        cur.execute(
+                            'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                            (utc_now, order_message, cart_item_id)
+                        )
+
+            # 6. batch 완료
+            utc_now = datetime.now(timezone.utc)
+            cur.execute("""
+                UPDATE domae_order_batches
+                SET status = %s, "successCount" = %s, "failCount" = %s, "completedAt" = %s
+                WHERE id = %s
+            """, ("completed", success_count, fail_count, utc_now, batch_id))
+            conn.commit()
+
+            # 7. DomaeAutoOrderLog 상태 업데이트
+            if fail_count == 0:
+                log_status = "success"
+            elif success_count > 0:
+                log_status = "partial_fail"
+            else:
+                log_status = "failed"
+            self._update_auto_order_log(conn, monitor_id, batch_id, log_status)
+
+            # 8. 텔레그램 알림
+            if telegram_chat_id:
+                self._send_auto_order_telegram(telegram_chat_id, supplier_name, success_items, failed_items)
+
+            # 9. SSE 결과 알림 (Redis publish)
+            try:
+                self._redis.publish(f"domae:notifications:{monitor_id}", json.dumps({
+                    "type": "auto_order_result",
+                    "supplier": supplier_name,
+                    "status": "success" if not failed_items else "partial_fail",
+                    "count": len(success_items),
+                    "totalPrice": sum(i.get("price", 0) * i.get("quantity", 0) for i in success_items if i.get("price")),
+                }))
+            except Exception as e:
+                logger.warning("auto_order SSE publish 실패: %s", e)
+
+            logger.info("auto_order 완료: batch=%s supplier=%s success=%d fail=%d",
+                        batch_id, supplier_name, success_count, fail_count)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("auto_order 실패 [%s/%s]: %s", batch_id, supplier_name, e, exc_info=True)
+            try:
+                cur = conn.cursor()
+                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                conn.commit()
+            except Exception:
+                pass
+            self._update_auto_order_log(conn, monitor_id, batch_id, "failed", str(e)[:200])
+            # 부분 성공이라도 텔레그램 알림
+            if telegram_chat_id and (success_items or failed_items):
+                self._send_auto_order_telegram(telegram_chat_id, supplier_name, success_items, failed_items)
+        finally:
+            self._db_pool.putconn(conn)
+
+    def _update_auto_order_log(self, conn, monitor_id: str, batch_id: str, status: str, message: str = None):
+        """DomaeAutoOrderLog 상태 업데이트 (batchId 기준)"""
+        try:
+            cur = conn.cursor()
+            if message:
+                cur.execute("""
+                    UPDATE domae_auto_order_logs SET status = %s, message = %s
+                    WHERE "monitorId" = %s AND "batchId" = %s
+                """, (status, message, monitor_id, batch_id))
+            else:
+                cur.execute("""
+                    UPDATE domae_auto_order_logs SET status = %s
+                    WHERE "monitorId" = %s AND "batchId" = %s
+                """, (status, monitor_id, batch_id))
+            conn.commit()
+        except Exception as e:
+            logger.warning("auto_order_log 상태 업데이트 실패: %s", e)
+
+    def _send_auto_order_telegram(self, chat_id: str, supplier: str, success_items: list,
+                                  failed_items: list, global_error: str = None):
+        """자동주문 결과 텔레그램 알림 전송"""
+        try:
+            from domae_mcp.cloud.notifier import Notifier
+            now_str = datetime.now(timezone.utc).strftime("%H:%M")
+
+            if global_error:
+                # 전체 실패 (계정 미등록, 크롤러 없음 등)
+                msg = f"❌ 자동주문 실패 ({supplier}, {now_str})\n\n{global_error}\n\n수동으로 확인해주세요."
+                Notifier.send_telegram(chat_id, msg)
+                return
+
+            if success_items and not failed_items:
+                # 전체 성공
+                lines = [f"✅ 자동주문 완료 ({supplier}, {now_str})\n", "주문 내역:"]
+                total_price = 0
+                for item in success_items:
+                    qty = item.get("quantity", 1)
+                    price = item.get("price", 0) or 0
+                    line_total = price * qty
+                    total_price += line_total
+                    lines.append(f"• {item.get('product_name', '')} — {qty}개 — {line_total:,}원")
+                lines.append(f"\n총 {len(success_items)}건, {total_price:,}원 주문 완료")
+                Notifier.send_telegram(chat_id, "\n".join(lines))
+
+            elif not success_items and failed_items:
+                # 전체 실패
+                lines = [f"❌ 자동주문 실패 ({supplier}, {now_str})\n"]
+                for item in failed_items[:10]:
+                    qty = item.get("quantity", 1)
+                    reason = item.get("message", "주문 실패")
+                    lines.append(f"• {item.get('product_name', '')} {qty}개 — {reason}")
+                if len(failed_items) > 10:
+                    lines.append(f" ... 외 {len(failed_items) - 10}건")
+                lines.append("\n수동으로 확인해주세요.")
+                Notifier.send_telegram(chat_id, "\n".join(lines))
+
+            else:
+                # 부분 실패
+                lines = [f"⚠️ 자동주문 부분 완료 ({supplier}, {now_str})\n"]
+                lines.append("✅ 성공:")
+                total_price = 0
+                for item in success_items[:10]:
+                    qty = item.get("quantity", 1)
+                    price = item.get("price", 0) or 0
+                    line_total = price * qty
+                    total_price += line_total
+                    lines.append(f"• {item.get('product_name', '')} — {qty}개 — {line_total:,}원")
+                if len(success_items) > 10:
+                    lines.append(f" ... 외 {len(success_items) - 10}건")
+
+                lines.append("\n❌ 실패:")
+                for item in failed_items[:10]:
+                    qty = item.get("quantity", 1)
+                    reason = item.get("message", "주문 실패")
+                    lines.append(f"• {item.get('product_name', '')} — {reason}")
+                if len(failed_items) > 10:
+                    lines.append(f" ... 외 {len(failed_items) - 10}건")
+
+                lines.append("\n수동으로 확인해주세요.")
+                Notifier.send_telegram(chat_id, "\n".join(lines))
+
+        except Exception as e:
+            logger.warning("자동주문 텔레그램 알림 실패: %s", e)
+
     def urgent_order_immediate(self, job: dict):
         """긴급주문 즉시 1회 실행 — response_key로 결과 반환"""
         monitor_id = job["monitor_id"]

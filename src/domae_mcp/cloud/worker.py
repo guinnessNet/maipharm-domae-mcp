@@ -68,6 +68,8 @@ class CloudWorker:
                         self._scheduler.order(job)
                     elif action == "batch_order":
                         self._scheduler.batch_order(job)
+                    elif action == "auto_order":
+                        self._scheduler.auto_order(job)
                     elif action == "urgent_order_immediate":
                         self._scheduler.urgent_order_immediate(job)
                     elif action == "telegram_order":
