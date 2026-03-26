@@ -1168,32 +1168,44 @@ class CloudScheduler:
             logger.warning("자동주문 텔레그램 알림 실패: %s", e)
 
     def _search_alternatives(self, product_name: str, available_suppliers: list, credentials: dict) -> list:
-        """다른 도매에서 해당 품목 검색 — 재고 있는 결과만 반환."""
+        """다른 도매에서 해당 품목 검색 — 재고 있는 결과만 반환 (병렬)."""
         results = []
-        for sup in available_suppliers:
+
+        def _search_one(sup: str):
             try:
                 cred = credentials.get(sup)
                 if not cred:
-                    continue
+                    return None
                 crawler_cls = self._crawlers.get(sup)
                 if not crawler_cls:
-                    continue
+                    return None
                 crawler = crawler_cls()
                 crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
                 search_results = crawler.search(product_name)
                 for r in search_results:
                     if r.quantity and r.quantity > 0:
-                        results.append({
+                        return {
                             "supplier": sup,
                             "product_id": r.product_id,
                             "product_name": r.product_name,
                             "price": r.price,
                             "quantity": r.quantity,
-                        })
-                        break  # 도매당 1개만
+                        }
+                return None
             except Exception as e:
                 logger.debug("대체 검색 실패 [%s/%s]: %s", sup, product_name, e)
-                continue
+                return None
+
+        with ThreadPoolExecutor(max_workers=min(len(available_suppliers), 5)) as executor:
+            futures = {executor.submit(_search_one, sup): sup for sup in available_suppliers}
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=60)
+                    if result:
+                        results.append(result)
+                except Exception:
+                    pass
+
         return results
 
     def auto_order_retry(self, job: dict):
