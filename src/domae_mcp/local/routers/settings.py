@@ -235,8 +235,16 @@ def get_telegram():
 
 @router.put("/settings/telegram", response_model=MessageResponse)
 def save_telegram(req: TelegramSettings):
-    """텔레그램 설정 저장."""
+    """텔레그램 설정 저장. 실행 중인 모니터링에 즉시 반영."""
     _config.set_telegram(req.token, req.chat_id)
+
+    # 실행 중인 모니터링 서비스에 즉시 반영
+    from domae_mcp.local.routers.monitor import _monitor_service
+    if _monitor_service and _monitor_service.is_running:
+        from domae_mcp.core.services.telegram_service import TelegramService
+        _monitor_service.update_telegram(TelegramService(token=req.token, chat_id=req.chat_id))
+        logger.info("실행 중인 모니터링에 텔레그램 설정 반영됨")
+
     return MessageResponse(success=True, message="텔레그램 설정이 저장되었습니다.")
 
 
