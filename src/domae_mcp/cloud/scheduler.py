@@ -1723,16 +1723,28 @@ class CloudScheduler:
                 error_msg=getattr(result, "message", ""),
             )
 
-            # DB 주문 기록 저장
+            # DB 주문 기록 저장 (배치 생성 → 주문 연결)
             utc_now = datetime.now(timezone.utc)
             cur = conn.cursor()
+            batch_id = _generate_cuid()
+            cur.execute("""
+                INSERT INTO domae_order_batches
+                (id, "monitorId", status, "totalItems", "successCount", "failCount",
+                 "createdAt", "completedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                batch_id, monitor_id, "completed", 1,
+                1 if result.success else 0,
+                0 if result.success else 1,
+                utc_now, utc_now,
+            ))
             cur.execute("""
                 INSERT INTO domae_cloud_orders
-                (id, "monitorId", supplier, "productName",
+                (id, "monitorId", "batchId", supplier, "productName",
                  quantity, price, success, "productId", "orderId", message, "orderedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                _generate_cuid(), monitor_id, supplier_name,
+                _generate_cuid(), monitor_id, batch_id, supplier_name,
                 product_name, quantity, price, result.success,
                 product_id, getattr(result, "order_id", None),
                 getattr(result, "message", ""), utc_now,
