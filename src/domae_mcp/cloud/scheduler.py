@@ -1679,33 +1679,48 @@ class CloudScheduler:
 
             # 3. 주문 실행
             crawler = crawler_cls()
-            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            login_ok = crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            logger.info(
+                "telegram_order 로그인: supplier=%s login_ok=%s",
+                supplier_name, login_ok,
+            )
+            if not login_ok:
+                Notifier.send_order_result(
+                    chat_id, message_id, original_text,
+                    product_id, supplier_name, quantity, 0,
+                    success=False, error_msg=f"{supplier_name} 로그인 실패",
+                )
+                return
 
             # 제품명/가격 조회
             product_name = product_id
             price = 0
             try:
                 search_results = crawler.search(product_id)
+                logger.info(
+                    "telegram_order 검색: product_id=%s results=%d",
+                    product_id, len(search_results),
+                )
                 for sr in search_results:
                     if sr.product_id == product_id:
                         product_name = sr.product_name
                         price = sr.price or 0
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("telegram_order 검색 실패: %s", e)
 
             result = crawler.order(product_id, quantity)
+            logger.info(
+                "telegram_order 완료: supplier=%s product=%s(%s) qty=%d success=%s msg=%s",
+                supplier_name, product_id, product_name, quantity,
+                result.success, getattr(result, "message", ""),
+            )
 
             Notifier.send_order_result(
                 chat_id, message_id, original_text,
                 product_name, supplier_name, quantity, price,
                 success=result.success,
                 error_msg=getattr(result, "message", ""),
-            )
-
-            logger.info(
-                "telegram_order 완료: supplier=%s product=%s qty=%d success=%s",
-                supplier_name, product_id, quantity, result.success,
             )
 
         except Exception as e:
