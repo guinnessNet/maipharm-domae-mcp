@@ -867,15 +867,15 @@ class CloudScheduler:
             )
             conn.commit()
 
-            # 2. credentials + telegramChatId 조회
+            # 2. credentials + telegramChatId 조회 (isActive 체크 포함)
             cur.execute("""
                 SELECT m.credentials, m."telegramChatId"
                 FROM domae_cloud_monitors m
-                WHERE m.id = %s
+                WHERE m.id = %s AND m."isActive" = true
             """, (monitor_id,))
             row = cur.fetchone()
             if not row:
-                self._update_auto_order_log(conn, monitor_id, batch_id, "failed", "모니터 없음")
+                self._update_auto_order_log(conn, monitor_id, batch_id, "failed", "모니터 없음 또는 비활성")
                 cur.execute(
                     'UPDATE domae_order_batches SET status = %s WHERE id = %s',
                     ("failed", batch_id)
