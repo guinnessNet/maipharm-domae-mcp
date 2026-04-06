@@ -1692,22 +1692,38 @@ class CloudScheduler:
                 )
                 return
 
-            # 제품명/가격 조회
+            # 제품명/가격 조회 — DB 스냅샷에서 우선 조회, 없으면 크롤러 검색
             product_name = product_id
             price = 0
+            unit = None
+            insurance_code = None
             try:
-                search_results = crawler.search(product_id)
-                logger.info(
-                    "telegram_order 검색: product_id=%s results=%d",
-                    product_id, len(search_results),
-                )
-                for sr in search_results:
-                    if sr.product_id == product_id:
-                        product_name = sr.product_name
-                        price = sr.price or 0
-                        break
+                cur.execute("""
+                    SELECT "productName", price, unit, "insuranceCode"
+                    FROM domae_inventory_snapshots
+                    WHERE "monitorId" = %s AND "productId" = %s AND supplier = %s
+                    ORDER BY "scannedAt" DESC LIMIT 1
+                """, (monitor_id, product_id, supplier_name))
+                snap = cur.fetchone()
+                if snap:
+                    product_name = snap[0] or product_id
+                    price = snap[1] or 0
+                    unit = snap[2]
+                    insurance_code = snap[3]
+                    logger.info("telegram_order DB 조회: product=%s name=%s", product_id, product_name)
+                else:
+                    # DB에 없으면 크롤러 검색 fallback
+                    search_results = crawler.search(product_id)
+                    for sr in search_results:
+                        if sr.product_id == product_id:
+                            product_name = sr.product_name
+                            price = sr.price or 0
+                            unit = sr.unit
+                            insurance_code = sr.insurance_code
+                            break
+                    logger.info("telegram_order 크롤러 검색: product_id=%s results=%d", product_id, len(search_results))
             except Exception as e:
-                logger.warning("telegram_order 검색 실패: %s", e)
+                logger.warning("telegram_order 제품 조회 실패: %s", e)
 
             result = crawler.order(product_id, quantity)
             logger.info(
@@ -1740,12 +1756,13 @@ class CloudScheduler:
             ))
             cur.execute("""
                 INSERT INTO domae_cloud_orders
-                (id, "monitorId", "batchId", supplier, "productName",
+                (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
                  quantity, price, success, "productId", "orderId", message, "orderedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 _generate_cuid(), monitor_id, batch_id, supplier_name,
-                product_name, quantity, price, result.success,
+                product_name, unit, insurance_code,
+                quantity, price, result.success,
                 product_id, getattr(result, "order_id", None),
                 getattr(result, "message", ""), utc_now,
             ))
