@@ -213,10 +213,19 @@ class Notifier:
         else:
             result_text = f"\n\n❌ <b>주문 실패</b>\n{safe_sup} {safe_name} × {quantity}개\n사유: {safe_err}"
 
+        # 버튼 제거용 빈 reply_markup
+        no_buttons = {"inline_keyboard": []}
+
         if message_id:
-            # 원본 메시지에 결과 추가 + 버튼 제거
-            updated = original_text + result_text
-            return Notifier.edit_message(chat_id, message_id, updated)
+            # original_text는 콜백 메시지의 plain text → HTML 이스케이프 필수
+            safe_original = html.escape(original_text)
+            updated = safe_original + result_text
+            ok = Notifier.edit_message(chat_id, message_id, updated, reply_markup=no_buttons)
+            if not ok:
+                # 편집 실패 시 새 메시지로 fallback
+                logger.warning("메시지 편집 실패, 새 메시지로 발송 (chat=%s, msg=%s)", chat_id, message_id)
+                Notifier.send_telegram(chat_id, result_text.strip())
+            return True
         else:
             Notifier.send_telegram(chat_id, result_text.strip())
             return True
