@@ -1723,6 +1723,22 @@ class CloudScheduler:
                 error_msg=getattr(result, "message", ""),
             )
 
+            # DB 주문 기록 저장
+            utc_now = datetime.now(timezone.utc)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO domae_cloud_orders
+                (id, "monitorId", supplier, "productName",
+                 quantity, price, success, "productId", "orderId", message, "orderedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                _generate_cuid(), monitor_id, supplier_name,
+                product_name, quantity, price, result.success,
+                product_id, getattr(result, "order_id", None),
+                getattr(result, "message", ""), utc_now,
+            ))
+            conn.commit()
+
         except Exception as e:
             logger.error("telegram_order 실패: %s", e, exc_info=True)
             try:
