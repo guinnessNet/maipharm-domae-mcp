@@ -758,12 +758,40 @@ class CloudScheduler:
                     while len(results) < len(group_items):
                         results.append(_OR(success=False, message="결과 누락"))
 
+                # ── 1차 결과 분류 (성공/실패 분리) ──
+                succeeded = []  # [(idx, item, result)]
+                failed = []     # [(idx, item, result)]
                 for (idx, item), result in zip(group_items, results):
-                    order_success = result.success
+                    if result.success:
+                        succeeded.append((idx, item, result))
+                    else:
+                        failed.append((idx, item, result))
+
+                # ── 실패 항목 1회 재시도 (안전 검증은 각 크롤러 내장) ──
+                if failed:
+                    logger.info("batch_order 재시도: %s 실패 %d건, 개별 재시도 시작",
+                                supplier_name, len(failed))
+                    time.sleep(2)
+                    for idx, item, orig_result in list(failed):
+                        pid = item.get("product_id")
+                        qty = item.get("quantity", 1)
+                        if not pid:
+                            continue
+                        try:
+                            # 단건 order()로 재시도 — 크롤러 내부에서 이중 주문 검증
+                            retry_result = crawler.order(pid, qty)
+                            if retry_result.success:
+                                logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
+                                failed.remove((idx, item, orig_result))
+                                succeeded.append((idx, item, retry_result))
+                        except Exception as e:
+                            logger.warning("batch_order 재시도 실패: %s pid=%s err=%s", supplier_name, pid, e)
+
+                # ── 결과 DB 기록 ──
+                for idx, item, result in succeeded:
                     order_id_val = getattr(result, "order_id", None)
                     order_message = getattr(result, "message", "")
                     order_price = item.get("price")
-
                     utc_now = datetime.now(timezone.utc)
                     cur.execute("""
                         INSERT INTO domae_cloud_orders
@@ -773,26 +801,40 @@ class CloudScheduler:
                     """, (
                         _generate_cuid(), monitor_id, batch_id, supplier_name,
                         item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                        item.get("quantity", 1), order_price, order_success,
+                        item.get("quantity", 1), order_price, True,
                         item.get("product_id"), order_id_val, order_message, utc_now,
                     ))
-
+                    success_count += 1
                     _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{item.get('quantity', 1)}"
-                    if order_success:
-                        success_count += 1
-                        success_lines.append(_tg_line)
-                        cart_item_id = item.get("cart_item_id")
-                        if cart_item_id:
-                            cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
-                    else:
-                        fail_count += 1
-                        fail_lines.append(_tg_line + (f" — {order_message}" if order_message else ""))
-                        cart_item_id = item.get("cart_item_id")
-                        if cart_item_id:
-                            cur.execute(
-                                'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
-                                (utc_now, order_message, cart_item_id)
-                            )
+                    success_lines.append(_tg_line)
+                    cart_item_id = item.get("cart_item_id")
+                    if cart_item_id:
+                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+
+                for idx, item, result in failed:
+                    order_message = getattr(result, "message", "")
+                    order_price = item.get("price")
+                    utc_now = datetime.now(timezone.utc)
+                    cur.execute("""
+                        INSERT INTO domae_cloud_orders
+                        (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
+                         quantity, price, success, "productId", "orderId", message, "orderedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        _generate_cuid(), monitor_id, batch_id, supplier_name,
+                        item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
+                        item.get("quantity", 1), order_price, False,
+                        item.get("product_id"), None, order_message, utc_now,
+                    ))
+                    fail_count += 1
+                    _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{item.get('quantity', 1)}"
+                    fail_lines.append(_tg_line + (f" — {order_message}" if order_message else ""))
+                    cart_item_id = item.get("cart_item_id")
+                    if cart_item_id:
+                        cur.execute(
+                            'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                            (utc_now, order_message, cart_item_id)
+                        )
 
                 # batch 카운트 업데이트
                 cur.execute("""
