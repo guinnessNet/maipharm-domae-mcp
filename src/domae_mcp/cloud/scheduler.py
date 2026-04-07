@@ -399,6 +399,29 @@ class CloudScheduler:
             return []  # 첫 검색이면 비교 불가
 
         alerts = []
+
+        # 제품별 도매 합산 재고 계산 (drop 알림 합산용)
+        # prev 합산: product_name → total prev qty
+        prev_product_totals = {}
+        for key, val in prev_map.items():
+            product_name = key.split("|", 1)[1]
+            prev_product_totals[product_name] = prev_product_totals.get(product_name, 0) + val["quantity"]
+
+        # new 합산: product_name → {total_qty, max_price}
+        new_product_totals = {}
+        for r in new_results:
+            pname = r["product_name"]
+            qty = r.get("quantity") or 0
+            price = r.get("price") or 0
+            if pname not in new_product_totals:
+                new_product_totals[pname] = {"qty": 0, "price": 0, "product_id": r.get("product_id", "")}
+            new_product_totals[pname]["qty"] += qty
+            if price > new_product_totals[pname]["price"]:
+                new_product_totals[pname]["price"] = price
+
+        # 이미 합산 drop 알림을 생성한 제품 추적
+        drop_alerted_products = set()
+
         for r in new_results:
             key = f"{r['supplier']}|{r['product_name']}"
             prev = prev_map.get(key)
@@ -420,7 +443,7 @@ class CloudScheduler:
 
             prev_qty = prev["quantity"]
 
-            # 1. 재입고: 0 → N
+            # 1. 재입고: 0 → N (도매별 개별 유지)
             if prev_qty == 0 and new_qty > 0:
                 alerts.append({
                     "type": "restock",
@@ -431,19 +454,25 @@ class CloudScheduler:
                     "price": new_price,
                 })
 
-            # 2. 급격한 재고 감소: 30% 이상 감소 (이전 재고 10개 이상일 때만)
-            elif prev_qty >= 10 and new_qty < prev_qty:
-                drop_pct = (prev_qty - new_qty) / prev_qty
-                if drop_pct >= 0.3:
-                    alerts.append({
-                        "type": "drop",
-                        "supplier": r["supplier"],
-                        "product_name": r["product_name"],
-                        "product_id": r.get("product_id", ""),
-                        "old_qty": prev_qty,
-                        "new_qty": new_qty,
-                        "price": new_price,
-                    })
+            # 2. 재고 감소: 전체 도매 합산 비교 → 1건만 알림
+            pname = r["product_name"]
+            if pname not in drop_alerted_products:
+                total_prev = prev_product_totals.get(pname, 0)
+                total_new = new_product_totals.get(pname, {}).get("qty", 0)
+                if total_prev >= 10 and total_new < total_prev:
+                    drop_pct = (total_prev - total_new) / total_prev
+                    if drop_pct >= 0.3:
+                        drop_alerted_products.add(pname)
+                        agg = new_product_totals[pname]
+                        alerts.append({
+                            "type": "drop",
+                            "supplier": "전체",
+                            "product_name": pname,
+                            "product_id": agg.get("product_id", ""),
+                            "old_qty": total_prev,
+                            "new_qty": total_new,
+                            "price": agg["price"],
+                        })
 
         return alerts
 
@@ -1522,6 +1551,11 @@ class CloudScheduler:
             filled = 0
             details = []
 
+            # 도매별 결과 수집 (합산 로그용)
+            supplier_results = {}  # {supplier_name: {"qty": int}}
+            any_success = False
+            first_scanned_at = None
+
             for sup_info in suppliers_info:
                 if filled >= remaining_qty:
                     break
@@ -1533,11 +1567,13 @@ class CloudScheduler:
                 cred = credentials.get(supplier_name)
                 if not cred:
                     details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "계정 미등록"})
+                    supplier_results[supplier_name] = {"qty": 0}
                     continue
 
                 crawler_cls = self._crawlers.get(supplier_name)
                 if not crawler_cls:
                     details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "크롤러 없음"})
+                    supplier_results[supplier_name] = {"qty": 0}
                     continue
 
                 try:
@@ -1546,6 +1582,8 @@ class CloudScheduler:
 
                     # 재고 확인
                     scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if first_scanned_at is None:
+                        first_scanned_at = scanned_at
                     search_results = crawler.search(product_id_val)
                     available = 0
                     for sr in search_results:
@@ -1555,42 +1593,59 @@ class CloudScheduler:
 
                     if available == 0:
                         details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "재고 없음"})
-                        # 로그 기록
-                        utc_now = datetime.now(timezone.utc)
-                        cur.execute("""
-                            INSERT INTO domae_urgent_logs
-                            (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (_generate_cuid(), urgent_order_id, supplier_name, 0, False, "재고 없음", scanned_at, utc_now))
-                        conn.commit()
+                        supplier_results[supplier_name] = {"qty": 0}
                         continue
 
                     # 주문 실행
                     order_qty = min(need, available)
                     result = crawler.order(product_id_val, order_qty)
 
-                    utc_now = datetime.now(timezone.utc)
-                    cur.execute("""
-                        INSERT INTO domae_urgent_logs
-                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (_generate_cuid(), urgent_order_id, supplier_name, order_qty, result.success,
-                          getattr(result, "message", ""), scanned_at, utc_now))
-
                     if result.success:
                         filled += order_qty
                         details.append({"supplier": supplier_name, "quantity": order_qty, "success": True,
                                         "message": getattr(result, "message", "주문 완료")})
+                        supplier_results[supplier_name] = {"qty": order_qty}
+                        any_success = True
                     else:
                         details.append({"supplier": supplier_name, "quantity": 0, "success": False,
                                         "message": getattr(result, "message", "주문 실패")})
-                    conn.commit()
+                        supplier_results[supplier_name] = {"qty": 0}
 
                 except Exception as e:
                     details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": str(e)})
+                    supplier_results.setdefault(supplier_name, {"qty": 0})
                     logger.warning("urgent immediate [%s/%s]: %s", supplier_name, urgent_order_id, e)
 
                 time.sleep(0.5)
+
+            # 합산 로그 1건 INSERT
+            if supplier_results:
+                utc_now = datetime.now(timezone.utc)
+                message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
+                total_ordered = sum(r["qty"] for r in supplier_results.values())
+                cur.execute("""
+                    INSERT INTO domae_urgent_logs
+                    (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), urgent_order_id, "",
+                    total_ordered, any_success,
+                    ", ".join(message_parts),
+                    first_scanned_at or utc_now, utc_now,
+                ))
+
+                # 오래된 로그 자동 삭제 (20건 초과 시)
+                cur.execute("""
+                    DELETE FROM domae_urgent_logs
+                    WHERE "urgentOrderId" = %s
+                    AND id NOT IN (
+                        SELECT id FROM domae_urgent_logs
+                        WHERE "urgentOrderId" = %s
+                        ORDER BY "orderedAt" DESC LIMIT 20
+                    )
+                """, (urgent_order_id, urgent_order_id))
+
+                conn.commit()
 
             # filledQuantity 업데이트
             if filled > 0:
@@ -2028,16 +2083,24 @@ class CloudScheduler:
             suppliers = cur.fetchall()
             filled_this_round = 0
 
+            # 도매별 결과 수집 (합산 로그용)
+            supplier_results = {}  # {supplier_name: {"qty": int}}
+            any_success = False
+            first_scanned_at = None
+
             for supplier_name, product_id_val in suppliers:
                 if filled_this_round >= remaining:
-                    break
+                    supplier_results.setdefault(supplier_name, {"qty": 0})
+                    continue
 
                 cred = credentials.get(supplier_name)
                 if not cred:
+                    supplier_results[supplier_name] = {"qty": 0}
                     continue
 
                 crawler_cls = self._crawlers.get(supplier_name)
                 if not crawler_cls:
+                    supplier_results[supplier_name] = {"qty": 0}
                     continue
 
                 try:
@@ -2045,6 +2108,8 @@ class CloudScheduler:
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
                     scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    if first_scanned_at is None:
+                        first_scanned_at = scanned_at
                     search_results = crawler.search(product_id_val)
                     available = 0
                     for sr in search_results:
@@ -2053,21 +2118,16 @@ class CloudScheduler:
                             break
 
                     if available == 0:
+                        supplier_results[supplier_name] = {"qty": 0}
                         continue
 
                     order_qty = min(remaining - filled_this_round, available)
                     result = crawler.order(product_id_val, order_qty)
 
-                    utc_now = datetime.now(timezone.utc)
-                    cur.execute("""
-                        INSERT INTO domae_urgent_logs
-                        (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (_generate_cuid(), uo_id, supplier_name, order_qty, result.success,
-                          getattr(result, "message", ""), scanned_at, utc_now))
-
                     if result.success:
                         filled_this_round += order_qty
+                        supplier_results[supplier_name] = {"qty": order_qty}
+                        any_success = True
 
                         # 긴급주문 체결 알림 (건별)
                         try:
@@ -2096,12 +2156,44 @@ class CloudScheduler:
                                 )
                         except Exception as e:
                             logger.warning("긴급주문 알림 실패: %s", e)
+                    else:
+                        supplier_results[supplier_name] = {"qty": 0}
 
                     conn.commit()
                     time.sleep(0.5)
 
                 except Exception as e:
+                    supplier_results.setdefault(supplier_name, {"qty": 0})
                     logger.warning("urgent process [%s/%s]: %s", uo_id, supplier_name, e)
+
+            # 합산 로그 1건 INSERT
+            if supplier_results:
+                utc_now = datetime.now(timezone.utc)
+                message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
+                total_ordered = sum(r["qty"] for r in supplier_results.values())
+                cur.execute("""
+                    INSERT INTO domae_urgent_logs
+                    (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    _generate_cuid(), uo_id, "",
+                    total_ordered, any_success,
+                    ", ".join(message_parts),
+                    first_scanned_at or utc_now, utc_now,
+                ))
+
+                # 오래된 로그 자동 삭제 (20건 초과 시)
+                cur.execute("""
+                    DELETE FROM domae_urgent_logs
+                    WHERE "urgentOrderId" = %s
+                    AND id NOT IN (
+                        SELECT id FROM domae_urgent_logs
+                        WHERE "urgentOrderId" = %s
+                        ORDER BY "orderedAt" DESC LIMIT 20
+                    )
+                """, (uo_id, uo_id))
+
+                conn.commit()
 
             if filled_this_round > 0:
                 cur.execute("""
