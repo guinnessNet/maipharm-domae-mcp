@@ -742,7 +742,8 @@ class CloudScheduler:
                                     crawler._add_to_cart(bi["product_id"], bi["quantity"])
                             results = crawler.order_batch(batch_items)
                         finally:
-                            self._redis.delete(lock_key)
+                            if lock_acquired:
+                                self._redis.delete(lock_key)
                     else:
                         results = crawler.order_batch(batch_items)
                 except Exception as e:
