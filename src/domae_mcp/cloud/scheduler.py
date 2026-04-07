@@ -768,24 +768,38 @@ class CloudScheduler:
                         failed.append((idx, item, result))
 
                 # ── 실패 항목 1회 재시도 (안전 검증은 각 크롤러 내장) ──
-                if failed:
-                    logger.info("batch_order 재시도: %s 실패 %d건, 개별 재시도 시작",
-                                supplier_name, len(failed))
+                # 재시도 불필요한 실패 사유 (재시도해도 결과 동일)
+                NO_RETRY_KEYWORDS = ["재고 부족", "로그인 실패", "계정 미등록", "크롤러 없음", "미지원"]
+                retryable = []
+                for entry in failed:
+                    msg = getattr(entry[2], "message", "")
+                    if any(kw in msg for kw in NO_RETRY_KEYWORDS):
+                        continue
+                    retryable.append(entry)
+
+                if retryable:
+                    logger.info("batch_order 재시도: %s 실패 %d건 중 %d건 재시도",
+                                supplier_name, len(failed), len(retryable))
                     time.sleep(2)
-                    for idx, item, orig_result in list(failed):
+                    still_failed = []
+                    for idx, item, orig_result in retryable:
                         pid = item.get("product_id")
                         qty = item.get("quantity", 1)
                         if not pid:
+                            still_failed.append((idx, item, orig_result))
                             continue
                         try:
-                            # 단건 order()로 재시도 — 크롤러 내부에서 이중 주문 검증
                             retry_result = crawler.order(pid, qty)
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
-                                failed.remove((idx, item, orig_result))
                                 succeeded.append((idx, item, retry_result))
+                            else:
+                                still_failed.append((idx, item, retry_result))
                         except Exception as e:
                             logger.warning("batch_order 재시도 실패: %s pid=%s err=%s", supplier_name, pid, e)
+                            still_failed.append((idx, item, orig_result))
+                    # failed를 재시도 불가 + 재시도 실패로 재구성
+                    failed = [e for e in failed if any(kw in getattr(e[2], "message", "") for kw in NO_RETRY_KEYWORDS)] + still_failed
 
                 # ── 결과 DB 기록 ──
                 for idx, item, result in succeeded:
