@@ -117,7 +117,7 @@ class CloudScheduler:
                 self._save_results(conn, monitor_id, all_results)
 
             # 5. lastRunAt 업데이트
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute(
                 'UPDATE domae_cloud_monitors SET "lastRunAt" = %s, "updatedAt" = %s WHERE id = %s',
                 (utc_now, utc_now, monitor_id)
@@ -281,7 +281,7 @@ class CloudScheduler:
     def _save_results(self, conn, monitor_id: str, results: list):
         """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리)"""
         cur = conn.cursor()
-        utc_now = datetime.now(timezone.utc)
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         # 24시간 초과 스냅샷을 일별 평균으로 압축 보존
         self._compact_old_snapshots(cur, monitor_id)
@@ -649,7 +649,7 @@ class CloudScheduler:
             cur = conn.cursor()
 
             # 1. batch status → processing
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute(
                 'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
                 ("processing", batch_id, monitor_id)
@@ -714,7 +714,7 @@ class CloudScheduler:
                 fail_lines.append(
                     f" · [{item.get('supplier', '?')}] {item.get('product_name', '')} ×{item.get('quantity', 1)} — {msg}"
                 )
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
@@ -835,7 +835,7 @@ class CloudScheduler:
                     order_id_val = getattr(result, "order_id", None)
                     order_message = getattr(result, "message", "")
                     order_price = item.get("price")
-                    utc_now = datetime.now(timezone.utc)
+                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute("""
                         INSERT INTO domae_cloud_orders
                         (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
@@ -857,7 +857,7 @@ class CloudScheduler:
                 for idx, item, result in failed:
                     order_message = getattr(result, "message", "")
                     order_price = item.get("price")
-                    utc_now = datetime.now(timezone.utc)
+                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute("""
                         INSERT INTO domae_cloud_orders
                         (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
@@ -890,7 +890,7 @@ class CloudScheduler:
                 time.sleep(1)  # 도매상 간 딜레이
 
             # 5. batch 완료
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute("""
                 UPDATE domae_order_batches
                 SET status = %s, "completedAt" = %s
@@ -968,7 +968,7 @@ class CloudScheduler:
             cur = conn.cursor()
 
             # 1. batch status → processing
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute(
                 'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
                 ("processing", batch_id, monitor_id)
@@ -1054,7 +1054,7 @@ class CloudScheduler:
                 order_message = getattr(result, "message", "")
                 order_price = item.get("price")
 
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
@@ -1084,7 +1084,7 @@ class CloudScheduler:
                         )
 
             # 6. batch 완료
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute("""
                 UPDATE domae_order_batches
                 SET status = %s, "successCount" = %s, "failCount" = %s, "completedAt" = %s
@@ -1427,7 +1427,7 @@ class CloudScheduler:
                     success=True,
                 )
                 # DB 기록
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", supplier, "productName",
@@ -1487,7 +1487,7 @@ class CloudScheduler:
                     Notifier.send_telegram(chat_id, fail_text.strip(), reply_markup=reply_markup)
 
                 # DB 기록 (실패)
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", supplier, "productName",
@@ -1620,7 +1620,7 @@ class CloudScheduler:
 
             # 합산 로그 1건 INSERT
             if supplier_results:
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
                 total_ordered = sum(r["qty"] for r in supplier_results.values())
                 cur.execute("""
@@ -1666,7 +1666,7 @@ class CloudScheduler:
                 completed = total_filled >= total_qty
 
                 if completed:
-                    utc_now = datetime.now(timezone.utc)
+                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute(
                         'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
                         (utc_now, urgent_order_id)
@@ -1868,7 +1868,7 @@ class CloudScheduler:
             return
         try:
             cur = conn.cursor()
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             if status == "synced":
                 cur.execute(
                     'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = NULL, "syncedAt" = %s WHERE id = %s',
@@ -2017,7 +2017,7 @@ class CloudScheduler:
             )
 
             # DB 주문 기록 저장 (배치 생성 → 주문 연결)
-            utc_now = datetime.now(timezone.utc)
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur = conn.cursor()
             batch_id = _generate_cuid()
             cur.execute("""
@@ -2168,7 +2168,7 @@ class CloudScheduler:
 
             # 합산 로그 1건 INSERT
             if supplier_results:
-                utc_now = datetime.now(timezone.utc)
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
                 total_ordered = sum(r["qty"] for r in supplier_results.values())
                 cur.execute("""
@@ -2208,7 +2208,7 @@ class CloudScheduler:
                 )
                 row = cur.fetchone()
                 if row and row[0] >= row[1]:
-                    utc_now = datetime.now(timezone.utc)
+                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute(
                         'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
                         (utc_now, uo_id)
