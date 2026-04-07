@@ -724,14 +724,25 @@ class CloudScheduler:
                 try:
                     # SUPPORTS_CART_SYNC 모드: 장바구니에 이미 담겨있으므로 바로 전송
                     if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
-                        # 장바구니 내용 검증 — 누락 항목 재담기
-                        cart = crawler._get_cart_items()
-                        cart_pids = {c["pc"] for c in cart}
-                        for bi in batch_items:
-                            if bi["product_id"] not in cart_pids:
-                                logger.info("batch_order cart_sync: %s 누락 — 재담기", bi["product_id"])
-                                crawler._add_to_cart(bi["product_id"], bi["quantity"])
-                        results = crawler.order_batch(batch_items)
+                        # 도매상별 락 획득 (동시 cart_sync 작업과 경합 방지)
+                        lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
+                        lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
+                        if not lock_acquired:
+                            logger.warning("batch_order: %s 장바구니 락 획득 실패, 대기 후 재시도", supplier_name)
+                            time.sleep(3)
+                            lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
+
+                        try:
+                            # 장바구니 내용 검증 — 누락 항목 재담기
+                            cart = crawler._get_cart_items()
+                            cart_pids = {c["pc"] for c in cart}
+                            for bi in batch_items:
+                                if bi["product_id"] not in cart_pids:
+                                    logger.info("batch_order cart_sync: %s 누락 — 재담기", bi["product_id"])
+                                    crawler._add_to_cart(bi["product_id"], bi["quantity"])
+                            results = crawler.order_batch(batch_items)
+                        finally:
+                            self._redis.delete(lock_key)
                     else:
                         results = crawler.order_batch(batch_items)
                 except Exception as e:
@@ -1661,6 +1672,15 @@ class CloudScheduler:
                 self._cart_sync_respond(response_key, False, f"{supplier_name} 장바구니 동기화 미지원")
                 return
 
+            # 필수 메서드 존재 확인 (다른 도매상 추가 시 AttributeError 방지)
+            required_methods = ["_add_to_cart", "_get_cart_items", "remove_from_cart", "update_cart_qty"]
+            missing = [m for m in required_methods if not hasattr(crawler_cls, m)]
+            if missing:
+                msg = f"{supplier_name} 크롤러에 필수 메서드 없음: {missing}"
+                self._cart_sync_respond(response_key, False, msg)
+                self._cart_sync_update_status(conn, cart_item_id, "failed", msg)
+                return
+
             crawler = crawler_cls()
             login_ok = crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
             if not login_ok:
@@ -1668,46 +1688,53 @@ class CloudScheduler:
                 self._cart_sync_update_status(conn, cart_item_id, "failed", f"{supplier_name} 로그인 실패")
                 return
 
-            success = False
-            message = ""
+            # 도매상별 락 (batch_order와 경합 방지)
+            lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
+            lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=30)
+            if not lock_acquired:
+                # 주문 진행 중이면 동기화 스킵 (주문이 우선)
+                self._cart_sync_respond(response_key, False, "주문 진행 중 — 동기화 대기")
+                self._cart_sync_update_status(conn, cart_item_id, "pending")
+                return
 
-            if action == "cart_sync_add":
-                crawler._add_to_cart(product_id, quantity, price=price)
-                # 장바구니에 실제로 담겼는지 확인
-                cart = crawler._get_cart_items()
-                found = any(c["pc"] == product_id for c in cart)
-                if found:
-                    success = True
-                    message = "장바구니 동기화 완료"
-                else:
-                    success = False
-                    message = "장바구니 담기 실패 (도매몰 거부)"
+            try:
+                success = False
+                message = ""
 
-            elif action == "cart_sync_update":
-                if hasattr(crawler, "update_cart_qty"):
+                if action == "cart_sync_add":
+                    crawler._add_to_cart(product_id, quantity, price=price)
+                    cart = crawler._get_cart_items()
+                    found = any(c["pc"] == product_id for c in cart)
+                    if found:
+                        success = True
+                        message = "장바구니 동기화 완료"
+                    else:
+                        success = False
+                        message = "장바구니 담기 실패 (도매몰 거부)"
+
+                elif action == "cart_sync_update":
                     crawler.update_cart_qty(product_id, quantity, price=price)
-                    success = True
-                    message = "수량 변경 동기화 완료"
-                else:
-                    success = False
-                    message = "수량 변경 미지원"
+                    cart = crawler._get_cart_items()
+                    found = any(c["pc"] == product_id for c in cart)
+                    success = found
+                    message = "수량 변경 동기화 완료" if found else "수량 변경 실패"
 
-            elif action == "cart_sync_remove":
-                if hasattr(crawler, "remove_from_cart"):
+                elif action == "cart_sync_remove":
                     crawler.remove_from_cart(product_id)
-                    success = True
-                    message = "삭제 동기화 완료"
-                else:
-                    success = False
-                    message = "삭제 미지원"
+                    cart = crawler._get_cart_items()
+                    still_exists = any(c["pc"] == product_id for c in cart)
+                    success = not still_exists
+                    message = "삭제 동기화 완료" if success else "삭제 실패 (항목 잔존)"
 
-            # DB 동기화 상태 업데이트
-            status = "synced" if success else "failed"
-            self._cart_sync_update_status(conn, cart_item_id, status, message if not success else None)
+                # DB 동기화 상태 업데이트
+                status = "synced" if success else "failed"
+                self._cart_sync_update_status(conn, cart_item_id, status, message if not success else None)
 
-            self._cart_sync_respond(response_key, success, message)
-            logger.info("cart_sync %s: monitor=%s supplier=%s pid=%s → %s",
-                        action, monitor_id, supplier_name, product_id, message)
+                self._cart_sync_respond(response_key, success, message)
+                logger.info("cart_sync %s: monitor=%s supplier=%s pid=%s → %s",
+                            action, monitor_id, supplier_name, product_id, message)
+            finally:
+                self._redis.delete(lock_key)
 
         except Exception as e:
             logger.error("cart_sync 실패 [%s]: %s", action, e, exc_info=True)
