@@ -42,6 +42,7 @@ class BaseCrawler(ABC):
     """
 
     SUPPLIER_NAME: str = ""
+    SUPPORTS_CART_SYNC: bool = False
 
     def __init__(self):
         self.session = requests.Session()

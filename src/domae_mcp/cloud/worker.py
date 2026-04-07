@@ -78,6 +78,8 @@ class CloudWorker:
                         self._scheduler.telegram_order(job)
                     elif action == "verify_credentials":
                         self._scheduler.verify_credentials(job)
+                    elif action in ("cart_sync_add", "cart_sync_update", "cart_sync_remove"):
+                        self._scheduler.cart_sync(job)
                     else:
                         logger.warning("알 수 없는 action: %s", action)
                 except Exception as e:

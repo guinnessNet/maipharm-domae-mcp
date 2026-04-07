@@ -1606,6 +1606,133 @@ class CloudScheduler:
         finally:
             self._db_pool.putconn(conn)
 
+    def cart_sync(self, job: dict):
+        """장바구니 동기화 — PharmSquare 장바구니 변경을 도매몰에 실시간 반영.
+        SUPPORTS_CART_SYNC=True인 도매상(복산 등)에서만 동작.
+        액션: cart_sync_add, cart_sync_update, cart_sync_remove"""
+        action = job["action"]
+        monitor_id = job["monitor_id"]
+        supplier_name = job["supplier"]
+        product_id = job["product_id"]
+        quantity = job.get("quantity", 0)
+        price = job.get("price", 0)
+        cart_item_id = job.get("cart_item_id")
+        response_key = job.get("response_key")
+
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT m.credentials
+                FROM domae_cloud_monitors m
+                WHERE m.id = %s AND m."isActive" = true
+            """, (monitor_id,))
+            row = cur.fetchone()
+            if not row:
+                self._cart_sync_respond(response_key, False, "모니터 없음")
+                return
+
+            credentials = self._decrypt_creds(row[0])
+            cred = credentials.get(supplier_name)
+            if not cred:
+                self._cart_sync_respond(response_key, False, f"{supplier_name} 계정 미등록")
+                return
+
+            if not self._crawlers_loaded:
+                self._load_crawlers(conn)
+
+            crawler_cls = self._crawlers.get(supplier_name)
+            if not crawler_cls:
+                self._cart_sync_respond(response_key, False, f"{supplier_name} 크롤러 없음")
+                return
+
+            if not getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
+                self._cart_sync_respond(response_key, False, f"{supplier_name} 장바구니 동기화 미지원")
+                return
+
+            crawler = crawler_cls()
+            login_ok = crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            if not login_ok:
+                self._cart_sync_respond(response_key, False, f"{supplier_name} 로그인 실패")
+                self._cart_sync_update_status(conn, cart_item_id, "failed", f"{supplier_name} 로그인 실패")
+                return
+
+            success = False
+            message = ""
+
+            if action == "cart_sync_add":
+                crawler._add_to_cart(product_id, quantity, price=price)
+                # 장바구니에 실제로 담겼는지 확인
+                cart = crawler._get_cart_items()
+                found = any(c["pc"] == product_id for c in cart)
+                if found:
+                    success = True
+                    message = "장바구니 동기화 완료"
+                else:
+                    success = False
+                    message = "장바구니 담기 실패 (도매몰 거부)"
+
+            elif action == "cart_sync_update":
+                if hasattr(crawler, "update_cart_qty"):
+                    crawler.update_cart_qty(product_id, quantity, price=price)
+                    success = True
+                    message = "수량 변경 동기화 완료"
+                else:
+                    success = False
+                    message = "수량 변경 미지원"
+
+            elif action == "cart_sync_remove":
+                if hasattr(crawler, "remove_from_cart"):
+                    crawler.remove_from_cart(product_id)
+                    success = True
+                    message = "삭제 동기화 완료"
+                else:
+                    success = False
+                    message = "삭제 미지원"
+
+            # DB 동기화 상태 업데이트
+            status = "synced" if success else "failed"
+            self._cart_sync_update_status(conn, cart_item_id, status, message if not success else None)
+
+            self._cart_sync_respond(response_key, success, message)
+            logger.info("cart_sync %s: monitor=%s supplier=%s pid=%s → %s",
+                        action, monitor_id, supplier_name, product_id, message)
+
+        except Exception as e:
+            logger.error("cart_sync 실패 [%s]: %s", action, e, exc_info=True)
+            self._cart_sync_respond(response_key, False, str(e))
+            self._cart_sync_update_status(conn, cart_item_id, "failed", str(e)[:200])
+        finally:
+            self._db_pool.putconn(conn)
+
+    def _cart_sync_respond(self, response_key: str | None, success: bool, message: str):
+        """cart_sync 결과를 Redis response 채널로 반환 (선택적)"""
+        if response_key:
+            self._redis.lpush(response_key, json.dumps({
+                "success": success, "message": message
+            }))
+
+    def _cart_sync_update_status(self, conn, cart_item_id: str | None, status: str, error: str | None = None):
+        """DomaeCartItem의 syncStatus 업데이트"""
+        if not cart_item_id:
+            return
+        try:
+            cur = conn.cursor()
+            utc_now = datetime.now(timezone.utc)
+            if status == "synced":
+                cur.execute(
+                    'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = NULL, "syncedAt" = %s WHERE id = %s',
+                    (status, utc_now, cart_item_id),
+                )
+            else:
+                cur.execute(
+                    'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = %s WHERE id = %s',
+                    (status, error, cart_item_id),
+                )
+            conn.commit()
+        except Exception as e:
+            logger.warning("_cart_sync_update_status 실패: %s", e)
+
     def telegram_order(self, job: dict):
         """텔레그램 인라인 버튼으로 접수된 주문 처리.
 
