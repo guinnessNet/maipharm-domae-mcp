@@ -307,9 +307,55 @@ class CloudScheduler:
             ))
 
     def _compact_old_snapshots(self, cur, monitor_id: str):
-        """24시간 초과 스냅샷을 일별 평균으로 압축 보존."""
+        """스냅샷 단계별 압축:
+        - 3일 이내: 원본 유지 (30분 간격)
+        - 3~7일: 12시간 평균 (1일 2건)
+        - 7~90일: 1일 평균 (1일 1건)
+        - 90일 초과: 삭제
+        """
         try:
-            # 1. 압축 대상 집계 (24h~90일, 같은 날짜에 2건 이상인 그룹)
+            # 1단계: 3~7일 데이터 → 12시간 평균으로 압축
+            cur.execute("""
+                SELECT "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
+                       DATE("scannedAt") as snap_date,
+                       CASE WHEN EXTRACT(HOUR FROM "scannedAt") < 12 THEN 0 ELSE 12 END as half,
+                       AVG(COALESCE(quantity, 0))::int as avg_qty,
+                       AVG(COALESCE(price, 0))::int as avg_price
+                FROM domae_inventory_snapshots
+                WHERE "monitorId" = %s
+                  AND "scannedAt" < NOW() - INTERVAL '3 days'
+                  AND "scannedAt" >= NOW() - INTERVAL '7 days'
+                GROUP BY "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
+                         DATE("scannedAt"),
+                         CASE WHEN EXTRACT(HOUR FROM "scannedAt") < 12 THEN 0 ELSE 12 END
+                HAVING COUNT(*) > 1
+            """, (monitor_id,))
+            half_groups = cur.fetchall()
+
+            if half_groups:
+                cur.execute("""
+                    DELETE FROM domae_inventory_snapshots
+                    WHERE "monitorId" = %s
+                      AND "scannedAt" < NOW() - INTERVAL '3 days'
+                      AND "scannedAt" >= NOW() - INTERVAL '7 days'
+                """, (monitor_id,))
+
+                for row in half_groups:
+                    mid, supplier, product_name, unit_val, ins_code, product_id, snap_date, half, avg_qty, avg_price = row
+                    compacted_time = datetime.combine(snap_date, datetime.min.time().replace(hour=int(half)))
+                    cur.execute("""
+                        INSERT INTO domae_inventory_snapshots
+                        (id, "monitorId", supplier, "productName", unit, "insuranceCode",
+                         quantity, price, "productId", "scannedAt")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        _generate_cuid(), mid, supplier, product_name, unit_val, ins_code,
+                        avg_qty, avg_price, product_id, compacted_time,
+                    ))
+
+                logger.info("스냅샷 12h 압축 [%s]: %d개 그룹", monitor_id, len(half_groups))
+
+            # 2단계: 7~90일 데이터 → 1일 평균으로 압축
             cur.execute("""
                 SELECT "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
                        DATE("scannedAt") as snap_date,
@@ -317,27 +363,24 @@ class CloudScheduler:
                        AVG(COALESCE(price, 0))::int as avg_price
                 FROM domae_inventory_snapshots
                 WHERE "monitorId" = %s
-                  AND "scannedAt" < NOW() - INTERVAL '24 hours'
+                  AND "scannedAt" < NOW() - INTERVAL '7 days'
                   AND "scannedAt" >= NOW() - INTERVAL '90 days'
                 GROUP BY "monitorId", supplier, "productName", unit, "insuranceCode", "productId",
                          DATE("scannedAt")
                 HAVING COUNT(*) > 1
             """, (monitor_id,))
+            day_groups = cur.fetchall()
 
-            groups = cur.fetchall()
-
-            if groups:
-                # 2. 원본 삭제 (24h~90일)
+            if day_groups:
                 cur.execute("""
                     DELETE FROM domae_inventory_snapshots
                     WHERE "monitorId" = %s
-                      AND "scannedAt" < NOW() - INTERVAL '24 hours'
+                      AND "scannedAt" < NOW() - INTERVAL '7 days'
                       AND "scannedAt" >= NOW() - INTERVAL '90 days'
                 """, (monitor_id,))
 
-                # 3. 압축된 일별 대표 레코드 INSERT (scannedAt = 해당 날짜 12:00 UTC)
-                for row in groups:
-                    mid, supplier, product_name, unit, ins_code, product_id, snap_date, avg_qty, avg_price = row
+                for row in day_groups:
+                    mid, supplier, product_name, unit_val, ins_code, product_id, snap_date, avg_qty, avg_price = row
                     compacted_time = datetime.combine(snap_date, datetime.min.time().replace(hour=12))
                     cur.execute("""
                         INSERT INTO domae_inventory_snapshots
@@ -345,13 +388,13 @@ class CloudScheduler:
                          quantity, price, "productId", "scannedAt")
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
-                        _generate_cuid(), mid, supplier, product_name, unit, ins_code,
+                        _generate_cuid(), mid, supplier, product_name, unit_val, ins_code,
                         avg_qty, avg_price, product_id, compacted_time,
                     ))
 
-                logger.info("스냅샷 압축 완료 [%s]: %d개 그룹 → 일별 평균", monitor_id, len(groups))
+                logger.info("스냅샷 일별 압축 [%s]: %d개 그룹", monitor_id, len(day_groups))
 
-            # 4. 90일 초과 데이터 완전 삭제
+            # 3단계: 90일 초과 삭제
             cur.execute("""
                 DELETE FROM domae_inventory_snapshots
                 WHERE "monitorId" = %s AND "scannedAt" < NOW() - INTERVAL '90 days'
