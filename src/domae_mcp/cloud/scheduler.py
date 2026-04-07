@@ -722,7 +722,18 @@ class CloudScheduler:
                 ]
 
                 try:
-                    results = crawler.order_batch(batch_items)
+                    # SUPPORTS_CART_SYNC 모드: 장바구니에 이미 담겨있으므로 바로 전송
+                    if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
+                        # 장바구니 내용 검증 — 누락 항목 재담기
+                        cart = crawler._get_cart_items()
+                        cart_pids = {c["pc"] for c in cart}
+                        for bi in batch_items:
+                            if bi["product_id"] not in cart_pids:
+                                logger.info("batch_order cart_sync: %s 누락 — 재담기", bi["product_id"])
+                                crawler._add_to_cart(bi["product_id"], bi["quantity"])
+                        results = crawler.order_batch(batch_items)
+                    else:
+                        results = crawler.order_batch(batch_items)
                 except Exception as e:
                     results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                                for _ in group_items]
