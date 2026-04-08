@@ -297,9 +297,15 @@ function CredentialsTab() {
 function TelegramTab() {
   const [token, setToken] = useState('');
   const [chatId, setChatId] = useState('');
+  const [showToken, setShowToken] = useState(false);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState(null);
   const [showGuide, setShowGuide] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [fetchingChatId, setFetchingChatId] = useState(false);
+  const [chatCandidates, setChatCandidates] = useState([]);
+
+  const isConnected = !!(token && chatId);
 
   useEffect(() => {
     (async () => {
@@ -325,61 +331,180 @@ function TelegramTab() {
     }
   };
 
+  const handleTest = async () => {
+    setTesting(true);
+    setStatus(null);
+    try {
+      const { data } = await client.post('/settings/telegram/test');
+      setStatus({ success: data.success, message: data.message });
+    } catch {
+      setStatus({ success: false, message: '테스트 발송 실패' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleFetchChatId = async () => {
+    if (!token) {
+      setStatus({ success: false, message: '봇 토큰을 먼저 입력해주세요.' });
+      return;
+    }
+    setFetchingChatId(true);
+    setChatCandidates([]);
+    setStatus(null);
+    try {
+      const { data } = await client.post('/settings/telegram/fetch-chat-id', { token, chat_id: '' });
+      if (data.success && data.candidates?.length > 0) {
+        if (data.candidates.length === 1) {
+          setChatId(data.candidates[0].chat_id);
+          setStatus({ success: true, message: `Chat ID를 자동으로 가져왔습니다: ${data.candidates[0].title}` });
+        } else {
+          setChatCandidates(data.candidates);
+        }
+      } else {
+        setStatus({ success: false, message: data.message });
+      }
+    } catch {
+      setStatus({ success: false, message: 'Chat ID 조회 실패' });
+    } finally {
+      setFetchingChatId(false);
+    }
+  };
+
+  const selectCandidate = (candidate) => {
+    setChatId(candidate.chat_id);
+    setChatCandidates([]);
+    setStatus({ success: true, message: `${candidate.title} 선택됨 (${candidate.chat_id})` });
+  };
+
   if (loading) return <div className="empty-state"><span className="loading-spinner" /></div>;
 
   return (
-    <div className="card" style={{ maxWidth: '550px' }}>
+    <div className="card" style={{ maxWidth: '580px' }}>
       <h3 style={{ marginBottom: '0.5rem' }}>텔레그램 알림 설정</h3>
       <p className="text-secondary" style={{ fontSize: '0.8rem', marginBottom: '1rem' }}>
-        가격 변동, 긴급주문 체결 등의 알림을 텔레그램으로 받을 수 있습니다.
+        재입고, 재고 급감, 긴급주문 체결 알림을 텔레그램으로 받을 수 있습니다.
       </p>
 
-      {/* 설정 가이드 토글 */}
-      <button
-        onClick={() => setShowGuide(!showGuide)}
-        style={{ fontSize: '0.8rem', color: 'var(--color-primary, #3b82f6)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: '0.75rem', padding: 0 }}
-      >
-        {showGuide ? '안내 닫기' : '처음이신가요? 설정 방법 보기'}
-      </button>
+      {/* 연결 상태 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem', padding: '0.5rem 0.75rem', background: 'var(--color-bg-secondary, #f8fafc)', borderRadius: '0.375rem' }}>
+        <span style={{ fontSize: '0.7rem' }}>{isConnected ? '🟢' : '⚪'}</span>
+        <span style={{ fontSize: '0.8rem', color: isConnected ? 'var(--color-success, #22c55e)' : 'var(--color-text-secondary, #94a3b8)' }}>
+          {isConnected ? '설정됨' : '미설정'}
+        </span>
+      </div>
 
-      {showGuide && (
-        <div style={{ background: 'var(--color-bg-secondary, #f8fafc)', padding: '1rem', borderRadius: '0.5rem', marginBottom: '1rem', fontSize: '0.8rem', lineHeight: 1.7 }}>
-          <strong>1단계: 텔레그램 봇 만들기</strong>
-          <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0.75rem' }}>
-            <li>텔레그램 앱에서 <strong>@BotFather</strong> 검색 → 대화 시작</li>
-            <li><code>/newbot</code> 입력 → 봇 이름, 사용자명 지정</li>
-            <li>발급된 <strong>봇 토큰</strong>을 아래에 입력</li>
-          </ol>
-          <strong>2단계: Chat ID 알아내기</strong>
-          <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0' }}>
-            <li>방금 만든 봇에게 아무 메시지 보내기 (예: "안녕")</li>
-            <li>브라우저에서 아래 주소 접속 (토큰 부분 교체):</li>
-            <li style={{ wordBreak: 'break-all' }}>
-              <code>https://api.telegram.org/bot[토큰]/getUpdates</code>
-            </li>
-            <li>응답에서 <code>"chat":{'"'}id":숫자{'}'}</code> 부분의 숫자가 Chat ID</li>
-          </ol>
-        </div>
-      )}
-
+      {/* 입력 필드 */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
         <div>
           <label style={{ display: 'block', marginBottom: '0.3rem', fontWeight: 500, fontSize: '0.85rem' }}>봇 토큰</label>
-          <input type="text" value={token} onChange={(e) => setToken(e.target.value)} style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.85rem' }} placeholder="7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxx" />
+          <div style={{ position: 'relative' }}>
+            <input
+              type={showToken ? 'text' : 'password'}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.85rem', paddingRight: '3rem' }}
+              placeholder="7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxx"
+            />
+            <button
+              onClick={() => setShowToken(!showToken)}
+              style={{ position: 'absolute', right: '0.5rem', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--color-text-secondary, #94a3b8)' }}
+            >
+              {showToken ? '숨기기' : '보기'}
+            </button>
+          </div>
         </div>
         <div>
           <label style={{ display: 'block', marginBottom: '0.3rem', fontWeight: 500, fontSize: '0.85rem' }}>Chat ID</label>
-          <input type="text" value={chatId} onChange={(e) => setChatId(e.target.value)} style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.85rem' }} placeholder="987654321" />
-        </div>
-        <div>
-          <button className="btn-primary" onClick={handleSave}>저장</button>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <input
+              type="text"
+              value={chatId}
+              onChange={(e) => setChatId(e.target.value)}
+              style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
+              placeholder="987654321"
+            />
+            <button
+              onClick={handleFetchChatId}
+              disabled={fetchingChatId || !token}
+              style={{ whiteSpace: 'nowrap', fontSize: '0.8rem' }}
+              title="봇에게 메시지를 보낸 후 클릭하면 Chat ID를 자동으로 가져옵니다"
+            >
+              {fetchingChatId ? '조회 중...' : '자동 조회'}
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Chat ID 후보 목록 */}
+      {chatCandidates.length > 0 && (
+        <div style={{ marginTop: '0.75rem', border: '1px solid var(--color-border, #e2e8f0)', borderRadius: '0.375rem', overflow: 'hidden' }}>
+          <div style={{ padding: '0.5rem 0.75rem', background: 'var(--color-bg-secondary, #f8fafc)', fontSize: '0.8rem', fontWeight: 500 }}>
+            채팅 선택
+          </div>
+          {chatCandidates.map((c) => (
+            <button
+              key={c.chat_id}
+              onClick={() => selectCandidate(c)}
+              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', padding: '0.5rem 0.75rem', background: 'none', border: 'none', borderTop: '1px solid var(--color-border, #e2e8f0)', cursor: 'pointer', fontSize: '0.8rem', textAlign: 'left' }}
+            >
+              <span>{c.chat_type === 'private' ? '👤' : '👥'} {c.title}</span>
+              <span style={{ fontFamily: 'monospace', color: 'var(--color-text-secondary, #94a3b8)' }}>{c.chat_id}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 버튼 */}
+      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
+        <button className="btn-primary" onClick={handleSave}>저장</button>
+        <button
+          onClick={handleTest}
+          disabled={testing || !isConnected}
+          style={{ fontSize: '0.85rem' }}
+        >
+          {testing ? '발송 중...' : '테스트 메시지 보내기'}
+        </button>
+      </div>
+
+      {/* 상태 메시지 */}
       {status && (
         <div className={status.success ? 'success-box' : 'error-box'} style={{ marginTop: '0.75rem' }}>
           {status.message}
         </div>
       )}
+
+      {/* 설정 가이드 */}
+      <div style={{ marginTop: '1rem', borderTop: '1px solid var(--color-border, #e2e8f0)', paddingTop: '0.75rem' }}>
+        <button
+          onClick={() => setShowGuide(!showGuide)}
+          style={{ fontSize: '0.8rem', color: 'var(--color-primary, #3b82f6)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+        >
+          {showGuide ? '▲ 안내 닫기' : '▼ 처음이신가요? 설정 방법 보기'}
+        </button>
+
+        {showGuide && (
+          <div style={{ background: 'var(--color-bg-secondary, #f8fafc)', padding: '1rem', borderRadius: '0.5rem', marginTop: '0.5rem', fontSize: '0.8rem', lineHeight: 1.7 }}>
+            <strong>1단계: 텔레그램 봇 만들기</strong>
+            <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0.75rem' }}>
+              <li>텔레그램 앱에서 <strong>@BotFather</strong> 검색 → 대화 시작</li>
+              <li><code>/newbot</code> 입력 → 봇 이름, 사용자명 지정</li>
+              <li>발급된 <strong>봇 토큰</strong>을 위 입력란에 붙여넣기</li>
+            </ol>
+            <strong>2단계: Chat ID 확인</strong>
+            <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0.75rem' }}>
+              <li>만든 봇에게 아무 메시지 전송 (예: "안녕")</li>
+              <li>위의 <strong>[자동 조회]</strong> 버튼 클릭 → Chat ID 자동 입력</li>
+            </ol>
+            <strong>여러 명이 알림을 받고 싶을 때</strong>
+            <ol style={{ paddingLeft: '1.2rem', margin: '0.3rem 0 0' }}>
+              <li>텔레그램 <strong>그룹</strong> 생성 → 봇을 그룹에 초대</li>
+              <li>그룹에서 아무 메시지 전송</li>
+              <li>[자동 조회] 클릭 → 그룹 선택 (Chat ID가 <code>-</code>로 시작)</li>
+            </ol>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

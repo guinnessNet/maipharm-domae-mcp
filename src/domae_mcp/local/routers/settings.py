@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Optional
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -234,9 +235,93 @@ def get_telegram():
 
 @router.put("/settings/telegram", response_model=MessageResponse)
 def save_telegram(req: TelegramSettings):
-    """텔레그램 설정 저장."""
+    """텔레그램 설정 저장. 실행 중인 모니터링에 즉시 반영."""
     _config.set_telegram(req.token, req.chat_id)
+
+    # 실행 중인 모니터링 서비스에 즉시 반영
+    from domae_mcp.local.routers.monitor import _monitor_service
+    if _monitor_service and _monitor_service.is_running:
+        from domae_mcp.core.services.telegram_service import TelegramService
+        _monitor_service.update_telegram(TelegramService(token=req.token, chat_id=req.chat_id))
+        logger.info("실행 중인 모니터링에 텔레그램 설정 반영됨")
+
     return MessageResponse(success=True, message="텔레그램 설정이 저장되었습니다.")
+
+
+@router.post("/settings/telegram/test", response_model=MessageResponse)
+def test_telegram():
+    """현재 저장된 설정으로 테스트 메시지 발송."""
+    from domae_mcp.core.services.telegram_service import TelegramService
+
+    tg = _config.get_telegram()
+    token = tg.get("token", "")
+    chat_id = tg.get("chat_id", "")
+    if not token or not chat_id:
+        return MessageResponse(success=False, message="봇 토큰과 Chat ID를 먼저 설정해주세요.")
+
+    svc = TelegramService(token=token, chat_id=chat_id)
+    result = svc.send_message("✅ 도매 모니터링 알림 테스트 메시지입니다.")
+    if result is not None:
+        return MessageResponse(success=True, message="테스트 메시지를 발송했습니다. 텔레그램을 확인해주세요.")
+    return MessageResponse(success=False, message="발송 실패. 봇 토큰과 Chat ID를 다시 확인해주세요.")
+
+
+class ChatIdCandidate(BaseModel):
+    chat_id: str
+    title: str
+    chat_type: str
+
+
+class FetchChatIdResponse(BaseModel):
+    success: bool
+    message: str
+    candidates: list[ChatIdCandidate] = []
+
+
+@router.post("/settings/telegram/fetch-chat-id", response_model=FetchChatIdResponse)
+def fetch_chat_id(req: TelegramSettings):
+    """봇 토큰으로 getUpdates를 호출하여 사용 가능한 Chat ID 목록을 반환."""
+    token = req.token
+    if not token:
+        return FetchChatIdResponse(success=False, message="봇 토큰을 입력해주세요.")
+
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            return FetchChatIdResponse(success=False, message="봇 토큰이 유효하지 않습니다.")
+
+        seen: dict[str, ChatIdCandidate] = {}
+        for update in data.get("result", []):
+            msg = update.get("message") or update.get("my_chat_member", {}).get("chat")
+            if not msg:
+                continue
+            chat = msg.get("chat") or msg
+            cid = str(chat.get("id", ""))
+            if not cid or cid in seen:
+                continue
+            chat_type = chat.get("type", "private")
+            if chat_type == "private":
+                title = chat.get("first_name", "") + " " + chat.get("last_name", "")
+                title = title.strip() or "개인 채팅"
+            else:
+                title = chat.get("title", "그룹")
+            seen[cid] = ChatIdCandidate(chat_id=cid, title=title, chat_type=chat_type)
+
+        candidates = list(seen.values())
+        if not candidates:
+            return FetchChatIdResponse(
+                success=False,
+                message="봇에게 메시지를 먼저 보내주세요. (봇 검색 → 아무 메시지 전송)",
+            )
+
+        return FetchChatIdResponse(success=True, message=f"{len(candidates)}개 채팅 발견", candidates=candidates)
+    except Exception as e:
+        logger.error("Chat ID 조회 실패: %s", e, exc_info=True)
+        return FetchChatIdResponse(success=False, message="조회 중 오류가 발생했습니다.")
 
 
 # ── 스케줄 엔드포인트 ──

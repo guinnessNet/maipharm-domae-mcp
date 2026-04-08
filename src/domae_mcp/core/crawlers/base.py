@@ -42,6 +42,7 @@ class BaseCrawler(ABC):
     """
 
     SUPPLIER_NAME: str = ""
+    SUPPORTS_CART_SYNC: bool = False
 
     def __init__(self):
         self.session = requests.Session()
@@ -67,6 +68,11 @@ class BaseCrawler(ABC):
     def order(self, product_id: str, quantity: int) -> OrderResult:
         """주문 실행. 미구현 크롤러는 기본 실패 반환."""
         return OrderResult(success=False, message="주문 미지원 도매상입니다.")
+
+    def order_batch(self, items: list[dict]) -> list[OrderResult]:
+        """복수 품목 일괄 주문. items: [{"product_id": str, "quantity": int}, ...]
+        기본 구현은 order()를 순차 호출. 크롤러별로 오버라이드하여 일괄 처리 가능."""
+        return [self.order(item["product_id"], item["quantity"]) for item in items]
 
     def get_cart(self) -> list[dict]:
         """장바구니 조회. 미구현 크롤러는 빈 리스트 반환."""

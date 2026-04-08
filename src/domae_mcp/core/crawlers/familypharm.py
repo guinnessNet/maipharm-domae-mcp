@@ -6,10 +6,13 @@ family-pharm.co.kr — JSP 기반 도매몰.
 """
 
 import json
+import logging
 import re
 import urllib3
 from bs4 import BeautifulSoup as bs
 from domae_mcp.core.crawlers.base import BaseCrawler, SearchResult, OrderResult
+
+logger = logging.getLogger(__name__)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -154,7 +157,7 @@ class FamilypharmCrawler(BaseCrawler):
             return []
 
     def _clear_cart(self, items: list[dict]):
-        """장바구니에서 지정 품목 삭제"""
+        """장바구니에서 지정 품목 삭제 + 검증"""
         if not items:
             return
         delete_data = [{"cd": item["goodscd"]} for item in items]
@@ -163,6 +166,19 @@ class FamilypharmCrawler(BaseCrawler):
             data={"jsonstr": json.dumps(delete_data)},
             verify=False,
         )
+        # 비우기 검증
+        remaining = self._get_cart_items()
+        if remaining:
+            logger.warning("장바구니 비우기 실패, 재시도 (%d개 남음)", len(remaining))
+            delete_data = [{"cd": item["goodscd"]} for item in remaining]
+            self.session.post(
+                CART_DELETE_URL,
+                data={"jsonstr": json.dumps(delete_data)},
+                verify=False,
+            )
+            remaining = self._get_cart_items()
+            if remaining:
+                raise RuntimeError(f"장바구니 비우기 실패: {len(remaining)}개 남음")
 
     def _add_to_cart(self, product_id: str, quantity: int, price: int = 0):
         """장바구니에 제품 담기"""
@@ -206,17 +222,25 @@ class FamilypharmCrawler(BaseCrawler):
         """주문: 기존장바구니 캐싱 → 비우기 → 담기 → 전송 → 복원"""
         self.ensure_login(self._login_id, self._login_pw)
 
+        # 가격 조회
+        price = 0
+        try:
+            results = self.search(product_id)
+            price = next((r.price for r in results if r.product_id == product_id), 0)
+        except Exception:
+            logger.warning("가격 조회 실패, product_id=%s", product_id)
+
         saved_items = []
         try:
             # 1. 기존 장바구니 캐싱
             saved_items = self._get_cart_items()
 
-            # 2. 장바구니 비우기
+            # 2. 장바구니 비우기 (검증 포함)
             if saved_items:
                 self._clear_cart(saved_items)
 
-            # 3. 주문할 제품 담기
-            self._add_to_cart(product_id, quantity)
+            # 3. 주문할 제품 담기 (가격 포함)
+            self._add_to_cart(product_id, quantity, price=price)
 
             # 4. 주문 전송
             success = self._submit_order(product_id)
