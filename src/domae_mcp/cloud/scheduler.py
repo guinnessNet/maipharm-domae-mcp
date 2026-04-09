@@ -794,9 +794,10 @@ class CloudScheduler:
                 ]
 
                 try:
-                    # SUPPORTS_CART_SYNC 모드: 장바구니에 이미 담겨있으므로 바로 전송
+                    # SUPPORTS_CART_SYNC 모드: 장바구니 = 재고 선점 상태이므로 누락 재담기 없이 바로 위임.
+                    # 잔존 여부 확인 + 전송은 모두 크롤러 내부(order_batch)에서 처리한다.
+                    # 동시 cart_sync 작업과 경합 방지를 위해 도매상별 락만 획득.
                     if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
-                        # 도매상별 락 획득 (동시 cart_sync 작업과 경합 방지)
                         lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
                         lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
                         if not lock_acquired:
@@ -805,13 +806,6 @@ class CloudScheduler:
                             lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
 
                         try:
-                            # 장바구니 내용 검증 — 누락 항목 재담기
-                            cart = crawler._get_cart_items()
-                            cart_pids = {c["pc"] for c in cart}
-                            for bi in batch_items:
-                                if bi["product_id"] not in cart_pids:
-                                    logger.info("batch_order cart_sync: %s 누락 — 재담기", bi["product_id"])
-                                    crawler._add_to_cart(bi["product_id"], bi["quantity"])
                             results = crawler.order_batch(batch_items)
                         finally:
                             if lock_acquired:
@@ -1074,11 +1068,25 @@ class CloudScheduler:
                 for item in items
             ]
 
+            # SUPPORTS_CART_SYNC 도매상은 동시 cart_sync 작업과 경합 방지를 위해 락 획득
+            ao_lock_key = None
+            ao_lock_acquired = False
+            if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
+                ao_lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
+                ao_lock_acquired = self._redis.set(ao_lock_key, "1", nx=True, ex=120)
+                if not ao_lock_acquired:
+                    logger.warning("auto_order: %s 장바구니 락 획득 실패, 대기 후 재시도", supplier_name)
+                    time.sleep(3)
+                    ao_lock_acquired = self._redis.set(ao_lock_key, "1", nx=True, ex=120)
+
             try:
                 results = crawler.order_batch(batch_items)
             except Exception as e:
                 results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                            for _ in items]
+            finally:
+                if ao_lock_key and ao_lock_acquired:
+                    self._redis.delete(ao_lock_key)
 
             # 길이 불일치 방어
             if len(results) != len(items):
