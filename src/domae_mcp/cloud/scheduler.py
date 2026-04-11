@@ -171,7 +171,17 @@ class CloudScheduler:
             self._db_pool.putconn(conn)
 
     def _load_crawlers(self, conn):
-        """DB에서 크롤러 코드 로드 (동적 import, SHA-256 해시 검증)"""
+        """DB에서 크롤러 코드 로드 (AES-GCM 복호화 → SHA-256 해시 검증 → 동적 import)
+
+        저장 포맷:
+        - 신규: 'v1:' prefix + base64(nonce+ciphertext+tag) — AES-256-GCM 암호화
+        - 레거시: 평문 (마이그레이션 전 레코드)
+        decrypt_crawler_code가 둘 다 처리.
+
+        재진입 시 기존 캐시는 초기화 (DB에서 비활성화된 크롤러가 메모리에 잔존하는 것 방지).
+        """
+        self._crawlers.clear()
+
         cur = conn.cursor()
         cur.execute('SELECT name, code, "codeHash" FROM domae_crawlers WHERE "isActive" = true')
         rows = cur.fetchall()
@@ -181,22 +191,33 @@ class CloudScheduler:
         # base.py import 경로 확보
         # domae_mcp 패키지가 설치되어 있어야 함
         from domae_mcp.core.crawlers.base import BaseCrawler
+        from domae_mcp.cloud.crypto import decrypt_crawler_code
 
-        for name, code, code_hash in rows:
-            # SHA-256 해시 검증
+        for name, stored_code, code_hash in rows:
+            # 1) 복호화 (legacy 평문은 그대로 반환)
+            try:
+                plain_code = decrypt_crawler_code(stored_code)
+            except Exception as e:
+                logger.error("크롤러 [%s] 복호화 실패: %s", name, e)
+                continue
+
+            # 2) SHA-256 해시 검증 (평문 기준)
             if code_hash is None:
                 logger.error("크롤러 [%s] 로드 거부: codeHash가 NULL입니다. 보안 정책에 의해 해시 없는 코드는 실행할 수 없습니다.", name)
                 continue
 
-            computed = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            computed = hashlib.sha256(plain_code.encode("utf-8")).hexdigest()
             if computed != code_hash:
-                logger.error("크롤러 [%s] 로드 거부: 코드 해시 불일치 (expected=%s, computed=%s)", name, code_hash[:16], computed[:16])
+                logger.error(
+                    "크롤러 [%s] 로드 거부: 코드 해시 불일치 (expected=%s, computed=%s)",
+                    name, code_hash[:16], computed[:16],
+                )
                 continue
 
             try:
                 file_path = os.path.join(cache_dir, f"{name}.py")
                 with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(code)
+                    f.write(plain_code)
 
                 spec = importlib.util.spec_from_file_location(f"domae_cloud.{name}", file_path)
                 module = importlib.util.module_from_spec(spec)
@@ -214,7 +235,7 @@ class CloudScheduler:
                 logger.error("크롤러 로드 실패 [%s]: %s", name, e)
 
         self._crawlers_loaded = True
-        logger.info("크롤러 %d개 로드 완료", len(self._crawlers))
+        logger.info("크롤러 %d개 로드 완료 (암호화 복호화 포함)", len(self._crawlers))
 
     def _search_all(self, keyword: str, credentials: dict) -> list:
         """모든 도매상에서 검색"""
