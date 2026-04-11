@@ -669,6 +669,7 @@ class CloudScheduler:
         product_id = job["product_id"]
         quantity = job["quantity"]
         db_order_id = job.get("db_order_id")  # quick-order가 전달한 pending 레코드 ID
+        db_batch_id = job.get("db_batch_id")  # quick-order의 단건 batch ID (주문이력 노출용)
 
         # 결과를 DB 먼저 + response_key 나중에 반영하는 헬퍼
         # — 순서 중요: DB가 먼저 확정돼야 서버 timeout 후에도 최종 상태가 정확함
@@ -687,8 +688,20 @@ class CloudScheduler:
                                 message = %s
                             WHERE id = %s
                         """, (success, order_id, message, db_order_id))
+                        # quick-order 단건 batch도 함께 마감 (서버 timeout/disconnect 대비)
+                        # — 서버가 즉시 마감했을 수도 있으나, UPDATE는 멱등이므로 중복 안전
+                        if db_batch_id:
+                            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                            upd_cur.execute("""
+                                UPDATE domae_order_batches
+                                SET status = %s,
+                                    "successCount" = %s,
+                                    "failCount" = %s,
+                                    "completedAt" = %s
+                                WHERE id = %s
+                            """, ("completed", 1 if success else 0, 0 if success else 1, utc_now, db_batch_id))
                         upd_conn.commit()
-                        logger.info("order DB finalize: dbOrderId=%s success=%s", db_order_id, success)
+                        logger.info("order DB finalize: dbOrderId=%s dbBatchId=%s success=%s", db_order_id, db_batch_id, success)
                     finally:
                         try:
                             self._db_pool.putconn(upd_conn)
