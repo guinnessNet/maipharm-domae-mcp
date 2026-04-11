@@ -12,16 +12,22 @@ import logging
 import os
 import sys
 import tempfile
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from domae_mcp.core.crawlers.base import BaseCrawler
+from domae_mcp.core.crawlers._client_key import _CRAWLER_CLIENT_KEY_B64
 
 logger = logging.getLogger(__name__)
+
+# Step 1.5 — 서버가 번들 내 크롤러 코드를 이 prefix로 암호화해서 보낼 때 메모리 복호화.
+_ENCRYPTED_PREFIX = "v1:"
 
 # ─── 상수 ──────────────────────────────────────────
 SERVER_URL = "https://api.pharmsq.com/api/domae"
@@ -124,9 +130,10 @@ class CrawlerLoader:
                         logger.debug("크롤러 캐시 유효, 서버 동일 버전")
                         return cached_bundle
 
-            # 전체 번들 다운로드
+            # 전체 번들 다운로드 (Step 1.5 — 암호화 번들 요청)
             resp = httpx.get(
                 f"{SERVER_URL}/crawlers",
+                params={"encrypted": "1"},
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=30.0,
             )
@@ -251,37 +258,64 @@ class CrawlerLoader:
 
     # ─── 동적 import ──────────────────────────────
 
+    def _decrypt_client_ciphertext(self, stored: str) -> str:
+        """번들 내 크롤러 코드가 "v1:" prefix로 암호화돼 있으면 CLIENT_KEY로 복호화.
+        prefix 없으면 legacy 평문으로 간주하고 그대로 반환 (하위호환).
+        """
+        if not stored.startswith(_ENCRYPTED_PREFIX):
+            return stored
+        key = base64.b64decode(_CRAWLER_CLIENT_KEY_B64)
+        if len(key) != 32:
+            raise RuntimeError("로컬 MCP 크롤러 client 키가 32바이트가 아닙니다.")
+        aesgcm = AESGCM(key)
+        raw = base64.b64decode(stored[len(_ENCRYPTED_PREFIX):])
+        if len(raw) < 12 + 16:
+            raise RuntimeError("크롤러 암호문 길이 부족")
+        nonce = raw[:12]
+        ciphertext = raw[12:]
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return plaintext.decode("utf-8")
+
     def _import_crawlers(self, bundle: dict) -> dict[str, type[BaseCrawler]]:
-        """번들의 크롤러 코드를 .py 파일로 저장하고 동적 import.
+        """번들의 크롤러 코드를 **메모리에서** 복호화 + exec하여 동적 import.
+
+        Step 1.5 변경: 디스크에 .py 파일을 쓰지 않음 (crawlers 캐시 디렉토리에 .py 잔존 방지).
+        bundle.json 자체는 여전히 atomic write로 캐시되지만, encrypted=True면 내부 code 값은
+        "v1:..." 암호문이라 메모장으로 열어도 Python 소스가 드러나지 않음.
 
         크롤러 코드의 하드 요구사항:
         1. from domae_mcp.core.crawlers.base import BaseCrawler, SearchResult, OrderResult 사용
         2. domae_mcp 패키지가 pip install 되어 있어야 import 성공
-        3. 상대 import 사용 금지 (캐시 디렉토리에서 로드되므로)
+        3. 상대 import 사용 금지
         4. requirements.txt에 포함된 패키지만 사용 가능
         """
         crawlers_code = bundle.get("crawlers", {})
         loaded = {}
 
-        for module_name, code in crawlers_code.items():
+        for module_name, raw_code in crawlers_code.items():
             try:
-                # 1. 캐시 디렉토리에 atomic write
-                file_path = self._cache_dir / f"{module_name}.py"
-                fd, tmp = tempfile.mkstemp(dir=str(self._cache_dir), suffix=".tmp")
-                try:
-                    os.write(fd, code.encode("utf-8"))
-                finally:
-                    os.close(fd)
-                os.replace(tmp, str(file_path))
+                # 1) 서버가 암호화해 보냈으면 메모리에서만 복호화
+                plain_code = self._decrypt_client_ciphertext(raw_code)
 
-                # 2. importlib로 동적 로드
+                # 2) 캐시 디렉토리에 남아있을 수 있는 레거시 .py 파일 제거
+                legacy_file = self._cache_dir / f"{module_name}.py"
+                if legacy_file.exists():
+                    try:
+                        legacy_file.unlink()
+                    except OSError as e:
+                        logger.warning("레거시 .py 제거 실패 [%s]: %s", module_name, e)
+
+                # 3) 메모리에서 동적 모듈 생성 → exec
                 module_fqn = f"domae_crawlers.{module_name}"
-                spec = importlib.util.spec_from_file_location(module_fqn, str(file_path))
-                module = importlib.util.module_from_spec(spec)
+                module = types.ModuleType(module_fqn)
+                module.__file__ = f"<encrypted:{module_name}>"
+                module.__loader__ = None
+                module.__spec__ = None
                 sys.modules[module_fqn] = module
-                spec.loader.exec_module(module)
+                compiled = compile(plain_code, f"<crawler:{module_name}>", "exec")
+                exec(compiled, module.__dict__)
 
-                # 3. BaseCrawler 서브클래스 찾기
+                # 4) BaseCrawler 서브클래스 찾기
                 for attr_name in dir(module):
                     attr = getattr(module, attr_name)
                     if (
@@ -297,5 +331,5 @@ class CrawlerLoader:
             except Exception as e:
                 logger.error("크롤러 로드 실패 [%s]: %s", module_name, e)
 
-        logger.info("크롤러 %d/%d개 로드 완료", len(loaded), len(crawlers_code))
+        logger.info("크롤러 %d/%d개 로드 완료 (메모리 import)", len(loaded), len(crawlers_code))
         return loaded
