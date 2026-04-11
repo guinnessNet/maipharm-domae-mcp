@@ -526,6 +526,34 @@ class CloudScheduler:
         keywords = job.get("keywords", [])
         requested_suppliers = job.get("suppliers", [])
 
+        # 중복 검색 방지 락 (서버 dedup이 빠지거나 다른 경로로 들어온 중복 잡 차단)
+        # 서버 락(`domae:search:lock:...`)과 충돌하지 않도록 별도 prefix 사용
+        # TTL 180s — 도매상 1곳 최대 120s + 60s 버퍼
+        dedup_payload = json.dumps({
+            "m": monitor_id,
+            "k": sorted([str(k).strip() for k in keywords]),
+            "s": sorted([str(s) for s in requested_suppliers]),
+        }, sort_keys=True, ensure_ascii=False)
+        dedup_hash = hashlib.sha1(dedup_payload.encode("utf-8")).hexdigest()
+        worker_lock_key = f"domae:search:worker_lock:{monitor_id}:{dedup_hash}"
+        # Redis 일시 장애 시 fail-open: set이 throw하면 락 없이 진행 (worker.py가 exception을 잡아줌)
+        try:
+            lock_ok = self._redis.set(worker_lock_key, "1", nx=True, ex=180)
+        except Exception as e:
+            logger.warning("dedup 락 set 실패 (fail-open으로 진행): %s", e)
+            lock_ok = True
+            worker_lock_key = None  # finally에서 delete 안 하도록
+        if not lock_ok:
+            logger.warning(
+                "search_on_demand 중복 잡 차단: monitor=%s keywords=%s",
+                monitor_id, keywords,
+            )
+            try:
+                self._redis.lpush(stream_key, json.dumps({"type": "done"}))
+            except Exception:
+                pass
+            return
+
         conn = self._get_conn()
         try:
             # 1. 모니터 정보 조회 (credentials 가져오기)
@@ -604,6 +632,12 @@ class CloudScheduler:
                 pass
         finally:
             self._db_pool.putconn(conn)
+            # dedup 락 해제 (TTL이 안전망). fail-open으로 None이 들어왔을 수 있음.
+            if worker_lock_key:
+                try:
+                    self._redis.delete(worker_lock_key)
+                except Exception:
+                    pass
 
     def order(self, job: dict):
         """단건 주문 실행 — response_key로 결과 반환"""
