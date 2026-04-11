@@ -640,12 +640,51 @@ class CloudScheduler:
                     pass
 
     def order(self, job: dict):
-        """단건 주문 실행 — response_key로 결과 반환"""
+        """단건 주문 실행 — DB finalize 먼저 + response_key 로 결과 반환"""
         monitor_id = job["monitor_id"]
         response_key = job["response_key"]
+        response_key_ttl = int(job.get("response_key_ttl", 180))
         supplier_name = job["supplier"]
         product_id = job["product_id"]
         quantity = job["quantity"]
+        db_order_id = job.get("db_order_id")  # quick-order가 전달한 pending 레코드 ID
+
+        # 결과를 DB 먼저 + response_key 나중에 반영하는 헬퍼
+        # — 순서 중요: DB가 먼저 확정돼야 서버 timeout 후에도 최종 상태가 정확함
+        # — 모든 내부 예외는 이 함수 안에서 삼키고 절대 밖으로 던지지 않음 (재귀 finalize 방지)
+        def _finalize(success: bool, order_id: str | None, message: str):
+            # 1) DB UPDATE 먼저 (quick-order 경로만)
+            if db_order_id:
+                try:
+                    upd_conn = self._get_conn()
+                    try:
+                        upd_cur = upd_conn.cursor()
+                        upd_cur.execute("""
+                            UPDATE domae_cloud_orders
+                            SET success = %s,
+                                "orderId" = %s,
+                                message = %s
+                            WHERE id = %s
+                        """, (success, order_id, message, db_order_id))
+                        upd_conn.commit()
+                        logger.info("order DB finalize: dbOrderId=%s success=%s", db_order_id, success)
+                    finally:
+                        try:
+                            self._db_pool.putconn(upd_conn)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error("order DB finalize 실패 [dbOrderId=%s]: %s", db_order_id, e, exc_info=True)
+
+            # 2) response_key lpush + TTL 설정 (서버 BRPOP용)
+            payload = {"success": success, "order_id": order_id, "message": message}
+            try:
+                self._redis.lpush(response_key, json.dumps(payload))
+                # TTL은 lpush 직후에 설정해야 key가 존재해서 적용됨
+                # 서버가 BRPOP으로 즉시 consume하면 key 자동 삭제, timeout 시엔 TTL로 정리
+                self._redis.expire(response_key, response_key_ttl)
+            except Exception as e:
+                logger.warning("order response_key lpush/expire 실패: %s", e)
 
         conn = self._get_conn()
         try:
@@ -658,7 +697,7 @@ class CloudScheduler:
             """, (monitor_id,))
             row = cur.fetchone()
             if not row:
-                self._redis.lpush(response_key, json.dumps({"success": False, "message": "모니터 없음"}))
+                _finalize(False, None, "모니터 없음")
                 return
 
             raw_creds = row[0]
@@ -671,16 +710,12 @@ class CloudScheduler:
 
             cred = credentials.get(supplier_name)
             if not cred:
-                self._redis.lpush(response_key, json.dumps({
-                    "success": False, "message": f"{supplier_name} 계정 미등록"
-                }))
+                _finalize(False, None, f"{supplier_name} 계정 미등록")
                 return
 
             crawler_cls = self._crawlers.get(supplier_name)
             if not crawler_cls:
-                self._redis.lpush(response_key, json.dumps({
-                    "success": False, "message": f"{supplier_name} 크롤러 없음"
-                }))
+                _finalize(False, None, f"{supplier_name} 크롤러 없음")
                 return
 
             # 3. 주문 실행
@@ -688,11 +723,11 @@ class CloudScheduler:
             crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
             result = crawler.order(product_id, quantity)
 
-            self._redis.lpush(response_key, json.dumps({
-                "success": result.success,
-                "order_id": getattr(result, "order_id", None),
-                "message": getattr(result, "message", ""),
-            }))
+            _finalize(
+                success=bool(result.success),
+                order_id=getattr(result, "order_id", None),
+                message=getattr(result, "message", "") or "",
+            )
 
             # 텔레그램 알림
             if telegram_chat_id:
@@ -711,7 +746,7 @@ class CloudScheduler:
 
         except Exception as e:
             logger.error("order 실패 [%s]: %s", monitor_id, e, exc_info=True)
-            self._redis.lpush(response_key, json.dumps({"success": False, "message": str(e)}))
+            _finalize(False, None, str(e))
         finally:
             self._db_pool.putconn(conn)
 
