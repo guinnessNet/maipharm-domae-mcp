@@ -644,11 +644,13 @@ class CloudScheduler:
             # 4. 도매상별 병렬 검색 + 완료 시 즉시 stream 전송
             def _search_and_stream(supplier_name, crawler_cls, cred):
                 try:
-                    supplier_results = self._search_supplier(supplier_name, crawler_cls, cred, keywords)
+                    supplier_payload = self._search_supplier(supplier_name, crawler_cls, cred, keywords)
                     self._redis.lpush(stream_key, json.dumps({
                         "type": "partial",
                         "supplier": supplier_name,
-                        "results": supplier_results,
+                        "results": supplier_payload["results"],
+                        "login_ok": supplier_payload["login_ok"],
+                        "failed_keywords": list(supplier_payload["failed_keywords"]),
                     }))
                 except Exception as e:
                     logger.warning("도매상 검색 실패 [%s]: %s", supplier_name, e)
