@@ -148,20 +148,19 @@ class Notifier:
     @staticmethod
     def send_stock_drop_alert(
         chat_id: str,
-        supplier: str,
+        supplier: str,  # 호환성 위해 유지 (표시하지 않음 — 전 도매 합산 기준)
         product_name: str,
         old_qty: int,
         new_qty: int,
         price: int,
     ) -> Optional[int]:
-        """급격한 재고 감소 알림 (30% 이상)."""
-        safe_sup = html.escape(supplier)
+        """급격한 재고 감소 알림 (30% 이상, 전 도매 합산 기준)."""
         safe_name = html.escape(product_name)
         pct = round((1 - new_qty / old_qty) * 100) if old_qty > 0 else 100
         price_str = f"단가 {price:,}원" if price else ""
         text = (
             f"🔴 <b>재고 급감</b>\n"
-            f"{safe_sup} {safe_name}\n"
+            f"{safe_name}\n"
             f"{old_qty}개 → {new_qty}개 (▼{pct}%)\n"
             f"{price_str}"
         ).strip()
