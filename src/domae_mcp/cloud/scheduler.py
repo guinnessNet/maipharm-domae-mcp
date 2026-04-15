@@ -112,25 +112,26 @@ class CloudScheduler:
                     except Exception as e:
                         logger.error("도매 검색 실패 [%s]: %s", supplier, e)
 
-            # 4. 결과 저장
+            # 4. 변동 감지 — 저장 BEFORE (prev baseline이 현재 save에 덮이지 않도록)
+            all_alerts = []
+            if all_results:
+                for keyword in products:
+                    keyword_results = [r for r in all_results if r["keyword"] == keyword]
+                    if keyword_results:
+                        alerts = self._detect_alerts(conn, monitor_id, keyword, keyword_results)
+                        all_alerts.extend(alerts)
+
+            # 5. 결과 저장
             if all_results:
                 self._save_results(conn, monitor_id, all_results)
 
-            # 5. lastRunAt 업데이트
+            # 6. lastRunAt 업데이트
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute(
                 'UPDATE domae_cloud_monitors SET "lastRunAt" = %s, "updatedAt" = %s WHERE id = %s',
                 (utc_now, utc_now, monitor_id)
             )
             conn.commit()
-
-            # 6. 변동 감지 + 이벤트별 개별 알림
-            all_alerts = []
-            for keyword in products:
-                keyword_results = [r for r in all_results if r["keyword"] == keyword]
-                if keyword_results:
-                    alerts = self._detect_alerts(conn, monitor_id, keyword, keyword_results)
-                    all_alerts.extend(alerts)
 
             if all_alerts and telegram_chat_id:
                 from domae_mcp.cloud.notifier import Notifier
@@ -437,18 +438,14 @@ class CloudScheduler:
         """
         cur = conn.cursor()
 
-        # 직전 스냅샷 (현재 저장 직전의 최신 스냅샷)
+        # 직전 스냅샷 (DISTINCT ON per supplier+product — save 호출 BEFORE 실행이므로 순수 prev)
         cur.execute("""
             SELECT DISTINCT ON (supplier, "productName")
                    supplier, "productName", quantity, price, "productId"
             FROM domae_inventory_snapshots
             WHERE "monitorId" = %s
-              AND "scannedAt" < (
-                  SELECT MAX("scannedAt") FROM domae_inventory_snapshots
-                  WHERE "monitorId" = %s
-              )
             ORDER BY supplier, "productName", "scannedAt" DESC
-        """, (monitor_id, monitor_id))
+        """, (monitor_id,))
 
         prev_map = {}
         for row in cur.fetchall():
@@ -464,24 +461,56 @@ class CloudScheduler:
 
         alerts = []
 
-        # 제품별 도매 합산 재고 계산 (drop 알림 합산용)
-        # prev 합산: product_name → total prev qty
-        prev_product_totals = {}
-        for key, val in prev_map.items():
-            product_name = key.split("|", 1)[1]
-            prev_product_totals[product_name] = prev_product_totals.get(product_name, 0) + val["quantity"]
-
-        # new 합산: product_name → {total_qty, max_price}
-        new_product_totals = {}
+        # new_results를 (supplier, product_name) 인덱스로 변환
+        new_map = {}
         for r in new_results:
-            pname = r["product_name"]
-            qty = r.get("quantity") or 0
-            price = r.get("price") or 0
-            if pname not in new_product_totals:
-                new_product_totals[pname] = {"qty": 0, "price": 0, "product_id": r.get("product_id", "")}
-            new_product_totals[pname]["qty"] += qty
-            if price > new_product_totals[pname]["price"]:
-                new_product_totals[pname]["price"] = price
+            key = f"{r['supplier']}|{r['product_name']}"
+            new_map[key] = {
+                "quantity": r.get("quantity") or 0,
+                "price": r.get("price") or 0,
+                "product_id": r.get("product_id", ""),
+            }
+
+        # 제품별 supplier 집합 수집 (prev ∪ new) — 부분 응답으로 인한 합산 왜곡 방지
+        # 누락된 supplier는 prev 값을 new로도 사용 (= "변화 없음" 가정)
+        product_suppliers: dict = {}
+        for key in set(prev_map.keys()) | set(new_map.keys()):
+            supplier, pname = key.split("|", 1)
+            product_suppliers.setdefault(pname, set()).add(supplier)
+
+        prev_product_totals: dict = {}
+        new_product_totals: dict = {}
+        for pname, suppliers in product_suppliers.items():
+            prev_total = 0
+            new_total = 0
+            max_price = 0
+            product_id = ""
+            for sup in suppliers:
+                key = f"{sup}|{pname}"
+                prev_val = prev_map.get(key)
+                new_val = new_map.get(key)
+
+                # prev: 과거 스냅샷. 없으면 0 (신규 supplier).
+                prev_qty = prev_val["quantity"] if prev_val else 0
+                # new: 이번 scan 결과. 없으면 prev 값 유지(부분 응답 → 변화 없음 가정)
+                if new_val is not None:
+                    new_qty = new_val["quantity"]
+                    price = new_val["price"]
+                    if new_val.get("product_id"):
+                        product_id = new_val["product_id"]
+                else:
+                    new_qty = prev_qty
+                    price = prev_val["price"] if prev_val else 0
+                    if prev_val and prev_val.get("product_id"):
+                        product_id = prev_val["product_id"]
+
+                prev_total += prev_qty
+                new_total += new_qty
+                if price > max_price:
+                    max_price = price
+
+            prev_product_totals[pname] = prev_total
+            new_product_totals[pname] = {"qty": new_total, "price": max_price, "product_id": product_id}
 
         # 이미 합산 drop 알림을 생성한 제품 추적
         drop_alerted_products = set()
