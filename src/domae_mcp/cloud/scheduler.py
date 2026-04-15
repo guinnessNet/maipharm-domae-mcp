@@ -484,19 +484,21 @@ class CloudScheduler:
         if not product_names:
             return []  # 비교 불가
 
-        # 이전 cycle의 snapshot batch 합산 (MAX scannedAt 기준)
-        # _detect_alerts는 _save_results BEFORE 호출되므로 MAX scannedAt = 직전 cycle
+        # 이전 cycle의 searchedAt batch 합산 (프론트 /cloud/results/summary와 동일 스코프)
+        # - domae_cloud_results 사용: keyword 컬럼이 있어 cross-keyword 오염 차단
+        # - _save_results가 domae_inventory_snapshots와 동일 utc_now로 INSERT하므로 값 동일
+        # - _detect_alerts가 _save_results BEFORE 실행 → MAX(searchedAt) = 직전 cycle
         cur.execute("""
             SELECT "productName", SUM(COALESCE(quantity, 0))::int
-            FROM domae_inventory_snapshots
+            FROM domae_cloud_results
             WHERE "monitorId" = %s
-              AND "productName" = ANY(%s)
-              AND "scannedAt" = (
-                  SELECT MAX("scannedAt") FROM domae_inventory_snapshots
-                  WHERE "monitorId" = %s
+              AND keyword = %s
+              AND "searchedAt" = (
+                  SELECT MAX("searchedAt") FROM domae_cloud_results
+                  WHERE "monitorId" = %s AND keyword = %s
               )
             GROUP BY "productName"
-        """, (monitor_id, product_names, monitor_id))
+        """, (monitor_id, keyword, monitor_id, keyword))
         prev_totals: dict = {row[0]: row[1] for row in cur.fetchall()}
 
         if not prev_totals:
