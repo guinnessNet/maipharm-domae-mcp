@@ -97,6 +97,9 @@ class CloudScheduler:
             }
 
             all_results = []
+            # supplier별 (keyword) 실패 정보 — 크롤러 에러 vs 정상 empty 구분
+            # failed_lookups[supplier] = set of keywords that errored (로그인 실패 시 전 키워드)
+            failed_lookups: dict = {}
             with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
                 futures = {
                     executor.submit(
@@ -107,19 +110,29 @@ class CloudScheduler:
                 for future in as_completed(futures):
                     supplier = futures[future]
                     try:
-                        results = future.result(timeout=120)
-                        all_results.extend(results)
+                        ret = future.result(timeout=120)
+                        all_results.extend(ret["results"])
+                        if not ret["login_ok"]:
+                            failed_lookups[supplier] = set(products)  # 전 키워드 무응답
+                        elif ret["failed_keywords"]:
+                            failed_lookups[supplier] = ret["failed_keywords"]
                     except Exception as e:
+                        failed_lookups[supplier] = set(products)
                         logger.error("도매 검색 실패 [%s]: %s", supplier, e)
 
             # 4. 변동 감지 — 저장 BEFORE (prev baseline이 현재 save에 덮이지 않도록)
             all_alerts = []
-            if all_results:
-                for keyword in products:
-                    keyword_results = [r for r in all_results if r["keyword"] == keyword]
-                    if keyword_results:
-                        alerts = self._detect_alerts(conn, monitor_id, keyword, keyword_results)
-                        all_alerts.extend(alerts)
+            for keyword in products:
+                keyword_results = [r for r in all_results if r["keyword"] == keyword]
+                # 이 키워드에서 에러난 supplier 집합
+                failed_for_kw = {
+                    sup for sup, kws in failed_lookups.items() if keyword in kws
+                }
+                if keyword_results or failed_for_kw:
+                    alerts = self._detect_alerts(
+                        conn, monitor_id, keyword, keyword_results, failed_for_kw
+                    )
+                    all_alerts.extend(alerts)
 
             # 5. 결과 저장
             if all_results:
@@ -155,6 +168,7 @@ class CloudScheduler:
                                 old_qty=alert["old_qty"],
                                 new_qty=alert["new_qty"],
                                 price=alert.get("price", 0),
+                                total_value=alert.get("total_value", 0),
                             )
                         time.sleep(0.3)  # 텔레그램 rate limit 방지
                     except Exception as e:
@@ -270,9 +284,19 @@ class CloudScheduler:
 
         return results
 
-    def _search_supplier(self, supplier_name: str, crawler_cls, cred: dict, keywords: list) -> list:
-        """도매 1개에 대해 1회 로그인 후 전 품목 순차 검색."""
+    def _search_supplier(self, supplier_name: str, crawler_cls, cred: dict, keywords: list) -> dict:
+        """도매 1개에 대해 1회 로그인 후 전 품목 순차 검색.
+
+        Returns:
+            {
+              "results": list,
+              "login_ok": bool,             # 로그인 성공 여부 (False면 모든 키워드 무응답)
+              "failed_keywords": set[str],  # 검색 실패한 키워드 (로그인 성공했지만 개별 키워드 에러)
+            }
+        """
         results = []
+        failed_keywords: set = set()
+        login_ok = True
         try:
             crawler = crawler_cls()
             crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
@@ -292,13 +316,15 @@ class CloudScheduler:
                             "product_id": r.product_id,
                         })
                 except Exception as e:
+                    failed_keywords.add(keyword)
                     logger.warning("검색 실패 [%s/%s]: %s", supplier_name, keyword, e)
                 time.sleep(0.5)  # 같은 사이트 내 품목 간 딜레이
 
         except Exception as e:
+            login_ok = False
             logger.error("도매 로그인 실패 [%s]: %s", supplier_name, e)
 
-        return results
+        return {"results": results, "login_ok": login_ok, "failed_keywords": failed_keywords}
 
     def _save_results(self, conn, monitor_id: str, results: list):
         """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리)"""
@@ -425,27 +451,43 @@ class CloudScheduler:
         except Exception as e:
             logger.warning("스냅샷 압축 실패 [%s]: %s", monitor_id, e)
 
-    def _detect_alerts(self, conn, monitor_id: str, keyword: str, new_results: list) -> list:
+    def _detect_alerts(
+        self,
+        conn,
+        monitor_id: str,
+        keyword: str,
+        new_results: list,
+        failed_suppliers: set = None,
+    ) -> list:
         """이전 스냅샷과 비교하여 핵심 이벤트만 감지.
 
         감지 이벤트:
         1. 재입고: 직전 스냅샷 재고 0 → 현재 > 0
-        2. 급격한 재고 감소: 직전 스냅샷 대비 30% 이상 감소
+        2. 급격한 재고 감소: 직전 스냅샷 대비 30% 이상 감소 (전 도매 합산)
 
-        Returns:
-            이벤트 dict 리스트:
-            [{"type": "restock"|"drop", "supplier": ..., "product_name": ..., ...}]
+        Args:
+            failed_suppliers: 이번 scan에서 에러난 supplier 집합. 이들만 "변화없음" 가정 적용.
+                             정상 empty 응답 supplier는 new_qty=0으로 취급 (실제 품절 가능).
         """
+        failed_suppliers = failed_suppliers or set()
         cur = conn.cursor()
 
-        # 직전 스냅샷 (DISTINCT ON per supplier+product — save 호출 BEFORE 실행이므로 순수 prev)
+        # 현재 키워드의 제품명 집합 (cross-keyword 오염 방지)
+        # prev 쿼리를 이 제품명으로만 한정. new_results가 비어있을 때도 failed_suppliers 평가 위해
+        # 가능한 제품명을 직전 스냅샷에서 추론하되, 그 경우엔 prev_map 전체를 사용하는 게 아니라
+        # failed_suppliers만 있고 new_results가 비었으면 아예 비교 불가 → 빈 알림 반환.
+        product_names = list({r["product_name"] for r in new_results})
+        if not product_names:
+            return []
+
         cur.execute("""
             SELECT DISTINCT ON (supplier, "productName")
                    supplier, "productName", quantity, price, "productId"
             FROM domae_inventory_snapshots
             WHERE "monitorId" = %s
+              AND "productName" = ANY(%s)
             ORDER BY supplier, "productName", "scannedAt" DESC
-        """, (monitor_id,))
+        """, (monitor_id, product_names))
 
         prev_map = {}
         for row in cur.fetchall():
@@ -471,8 +513,7 @@ class CloudScheduler:
                 "product_id": r.get("product_id", ""),
             }
 
-        # 제품별 supplier 집합 수집 (prev ∪ new) — 부분 응답으로 인한 합산 왜곡 방지
-        # 누락된 supplier는 prev 값을 new로도 사용 (= "변화 없음" 가정)
+        # 제품별 supplier 집합 (prev ∪ new)
         product_suppliers: dict = {}
         for key in set(prev_map.keys()) | set(new_map.keys()):
             supplier, pname = key.split("|", 1)
@@ -485,32 +526,44 @@ class CloudScheduler:
             new_total = 0
             max_price = 0
             product_id = ""
+            total_value = 0  # Σ(price_i × qty_i) — 진짜 잔여금액
             for sup in suppliers:
                 key = f"{sup}|{pname}"
                 prev_val = prev_map.get(key)
                 new_val = new_map.get(key)
 
-                # prev: 과거 스냅샷. 없으면 0 (신규 supplier).
                 prev_qty = prev_val["quantity"] if prev_val else 0
-                # new: 이번 scan 결과. 없으면 prev 값 유지(부분 응답 → 변화 없음 가정)
+
                 if new_val is not None:
+                    # 이번 scan에서 실제 응답 받음 — 그 값 사용 (empty=0 포함)
                     new_qty = new_val["quantity"]
                     price = new_val["price"]
                     if new_val.get("product_id"):
                         product_id = new_val["product_id"]
-                else:
+                elif sup in failed_suppliers:
+                    # 크롤러 에러 — prev 값 유지 (변화없음 가정)
                     new_qty = prev_qty
                     price = prev_val["price"] if prev_val else 0
                     if prev_val and prev_val.get("product_id"):
                         product_id = prev_val["product_id"]
+                else:
+                    # 정상 응답했지만 이 supplier+product 조합이 없음 = 실제로 해당 supplier에서 사라짐
+                    new_qty = 0
+                    price = prev_val["price"] if prev_val else 0
 
                 prev_total += prev_qty
                 new_total += new_qty
+                total_value += price * new_qty
                 if price > max_price:
                     max_price = price
 
             prev_product_totals[pname] = prev_total
-            new_product_totals[pname] = {"qty": new_total, "price": max_price, "product_id": product_id}
+            new_product_totals[pname] = {
+                "qty": new_total,
+                "price": max_price,
+                "product_id": product_id,
+                "total_value": total_value,
+            }
 
         # 이미 합산 drop 알림을 생성한 제품 추적
         drop_alerted_products = set()
@@ -565,6 +618,7 @@ class CloudScheduler:
                             "old_qty": total_prev,
                             "new_qty": total_new,
                             "price": agg["price"],
+                            "total_value": agg.get("total_value", 0),
                         })
 
         return alerts

@@ -153,13 +153,17 @@ class Notifier:
         old_qty: int,
         new_qty: int,
         price: int,
+        total_value: int = 0,
     ) -> Optional[int]:
-        """급격한 재고 감소 알림 (30% 이상)."""
+        """급격한 재고 감소 알림 (30% 이상).
+
+        total_value: supplier별 (price × qty) 실제 합산액. 0이면 price×new_qty로 폴백.
+        """
         safe_sup = html.escape(supplier)
         safe_name = html.escape(product_name)
         pct = round((1 - new_qty / old_qty) * 100) if old_qty > 0 else 100
-        total_value = (price or 0) * (new_qty or 0)
-        total_str = f"잔여 총금액 {total_value:,}원\n" if total_value else ""
+        actual_total = total_value if total_value else (price or 0) * (new_qty or 0)
+        total_str = f"잔여 총금액 {actual_total:,}원\n" if actual_total else ""
         price_str = f"단가 {price:,}원" if price else ""
         text = (
             f"🔴 <b>재고 급감</b>\n"
