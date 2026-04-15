@@ -167,7 +167,6 @@ class CloudScheduler:
                                 old_qty=alert["old_qty"],
                                 new_qty=alert["new_qty"],
                                 price=alert.get("price", 0),
-                                total_value=alert.get("total_value", 0),
                             )
                         time.sleep(0.3)  # 텔레그램 rate limit 방지
                     except Exception as e:
@@ -540,7 +539,6 @@ class CloudScheduler:
             new_total = 0
             max_price = 0
             product_id = ""
-            total_value = 0  # Σ(price_i × qty_i) — 진짜 잔여금액
             for sup in suppliers:
                 key = f"{sup}|{pname}"
                 prev_val = prev_map.get(key)
@@ -567,7 +565,6 @@ class CloudScheduler:
 
                 prev_total += prev_qty
                 new_total += new_qty
-                total_value += (price or 0) * (new_qty or 0)
                 if (price or 0) > max_price:
                     max_price = price or 0
 
@@ -576,7 +573,6 @@ class CloudScheduler:
                 "qty": new_total,
                 "price": max_price,
                 "product_id": product_id,
-                "total_value": total_value,
             }
 
         # 이미 합산 drop 알림을 생성한 제품 추적
@@ -632,7 +628,6 @@ class CloudScheduler:
                             "old_qty": total_prev,
                             "new_qty": total_new,
                             "price": agg["price"],
-                            "total_value": agg.get("total_value", 0),
                         })
 
         return alerts
