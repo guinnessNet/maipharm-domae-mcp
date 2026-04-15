@@ -121,18 +121,17 @@ class CloudScheduler:
                         logger.error("도매 검색 실패 [%s]: %s", supplier, e)
 
             # 4. 변동 감지 — 저장 BEFORE (prev baseline이 현재 save에 덮이지 않도록)
+            # 모든 감시 키워드에 대해 호출 — true-stockout(전 도매 empty 응답)도 감지되도록
             all_alerts = []
             for keyword in products:
                 keyword_results = [r for r in all_results if r["keyword"] == keyword]
-                # 이 키워드에서 에러난 supplier 집합
                 failed_for_kw = {
                     sup for sup, kws in failed_lookups.items() if keyword in kws
                 }
-                if keyword_results or failed_for_kw:
-                    alerts = self._detect_alerts(
-                        conn, monitor_id, keyword, keyword_results, failed_for_kw
-                    )
-                    all_alerts.extend(alerts)
+                alerts = self._detect_alerts(
+                    conn, monitor_id, keyword, keyword_results, failed_for_kw
+                )
+                all_alerts.extend(alerts)
 
             # 5. 결과 저장
             if all_results:
@@ -327,9 +326,17 @@ class CloudScheduler:
         return {"results": results, "login_ok": login_ok, "failed_keywords": failed_keywords}
 
     def _save_results(self, conn, monitor_id: str, results: list):
-        """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리)"""
+        """검색 결과 DB 저장 (스냅샷 누적 + 24h 정리).
+
+        INVARIANT (불변조건):
+            단일 호출 내 모든 row는 동일한 `utc_now`(scannedAt/searchedAt)를 공유해야 한다.
+            프론트 재고 히스토리 차트(cloud.ts GET /cloud/products/:keyword/history)가
+            "같은 scannedAt = 같은 스캔 싸이클"로 가정하고 시점별 supplier 합산을 수행하므로,
+            supplier별로 타임스탬프가 달라지면 차트가 per-supplier 값만 그려 과소 표시된다.
+            향후 per-supplier 타임스탬프 도입 시 차트 쿼리도 함께 수정해야 함.
+        """
         cur = conn.cursor()
-        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)  # 반드시 1회만 생성
 
         # 24시간 초과 스냅샷을 일별 평균으로 압축 보존
         self._compact_old_snapshots(cur, monitor_id)
@@ -472,13 +479,20 @@ class CloudScheduler:
         failed_suppliers = failed_suppliers or set()
         cur = conn.cursor()
 
-        # 현재 키워드의 제품명 집합 (cross-keyword 오염 방지)
-        # prev 쿼리를 이 제품명으로만 한정. new_results가 비어있을 때도 failed_suppliers 평가 위해
-        # 가능한 제품명을 직전 스냅샷에서 추론하되, 그 경우엔 prev_map 전체를 사용하는 게 아니라
-        # failed_suppliers만 있고 new_results가 비었으면 아예 비교 불가 → 빈 알림 반환.
+        # 현재 키워드의 제품명 집합 — cross-keyword 오염 방지 + true-stockout 감지 커버리지
+        # new_results가 비어 있으면(전 도매 품절 or 전 도매 크롤러 에러) domae_cloud_results의
+        # 과거 기록에서 이 keyword와 연결된 product_name들을 복원해 prev 비교를 시도.
         product_names = list({r["product_name"] for r in new_results})
         if not product_names:
-            return []
+            cur.execute("""
+                SELECT DISTINCT "productName"
+                FROM domae_cloud_results
+                WHERE "monitorId" = %s AND keyword = %s
+            """, (monitor_id, keyword))
+            product_names = [row[0] for row in cur.fetchall() if row[0]]
+
+        if not product_names:
+            return []  # 이 키워드로 과거에 검색된 적 없음 → 비교 불가
 
         cur.execute("""
             SELECT DISTINCT ON (supplier, "productName")
@@ -553,9 +567,9 @@ class CloudScheduler:
 
                 prev_total += prev_qty
                 new_total += new_qty
-                total_value += price * new_qty
-                if price > max_price:
-                    max_price = price
+                total_value += (price or 0) * (new_qty or 0)
+                if (price or 0) > max_price:
+                    max_price = price or 0
 
             prev_product_totals[pname] = prev_total
             new_product_totals[pname] = {
