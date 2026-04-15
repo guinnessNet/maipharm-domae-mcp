@@ -97,9 +97,6 @@ class CloudScheduler:
             }
 
             all_results = []
-            # supplier별 (keyword) 실패 정보 — 크롤러 에러 vs 정상 empty 구분
-            # failed_lookups[supplier] = set of keywords that errored (로그인 실패 시 전 키워드)
-            failed_lookups: dict = {}
             with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
                 futures = {
                     executor.submit(
@@ -111,26 +108,18 @@ class CloudScheduler:
                     supplier = futures[future]
                     try:
                         ret = future.result(timeout=120)
-                        all_results.extend(ret["results"])
-                        if not ret["login_ok"]:
-                            failed_lookups[supplier] = set(products)  # 전 키워드 무응답
-                        elif ret["failed_keywords"]:
-                            failed_lookups[supplier] = ret["failed_keywords"]
+                        # _search_supplier는 하위 호환 위해 dict 반환
+                        results = ret["results"] if isinstance(ret, dict) else ret
+                        all_results.extend(results)
                     except Exception as e:
-                        failed_lookups[supplier] = set(products)
                         logger.error("도매 검색 실패 [%s]: %s", supplier, e)
 
             # 4. 변동 감지 — 저장 BEFORE (prev baseline이 현재 save에 덮이지 않도록)
-            # 모든 감시 키워드에 대해 호출 — true-stockout(전 도매 empty 응답)도 감지되도록
+            # 전 도매 스캔 완료 후 제품별 합산 기준으로 drop 감지 (프론트 "재고모니터링"과 동일 기준)
             all_alerts = []
             for keyword in products:
                 keyword_results = [r for r in all_results if r["keyword"] == keyword]
-                failed_for_kw = {
-                    sup for sup, kws in failed_lookups.items() if keyword in kws
-                }
-                alerts = self._detect_alerts(
-                    conn, monitor_id, keyword, keyword_results, failed_for_kw
-                )
+                alerts = self._detect_alerts(conn, monitor_id, keyword, keyword_results)
                 all_alerts.extend(alerts)
 
             # 5. 결과 저장
@@ -463,26 +452,28 @@ class CloudScheduler:
         monitor_id: str,
         keyword: str,
         new_results: list,
-        failed_suppliers: set = None,
     ) -> list:
-        """이전 스냅샷과 비교하여 핵심 이벤트만 감지.
+        """전체 도매 스캔 완료 후 합산 기준 알림 감지.
 
         감지 이벤트:
-        1. 재입고: 직전 스냅샷 재고 0 → 현재 > 0
-        2. 급격한 재고 감소: 직전 스냅샷 대비 30% 이상 감소 (전 도매 합산)
+        1. 재입고: (supplier, product_name) 기준 직전 스냅샷 0 → 현재 > 0 — 도매별 즉시 알림
+        2. 재고 급감: product_name 기준 전 도매 합산 비교
+           - old_qty = 직전 cycle(MAX scannedAt) snapshot batch의 합
+           - new_qty = 현재 cycle all_results의 합 (프론트 "재고모니터링" 표시값과 동일)
+           - 30% 이상 감소 시 1건 알림
 
-        Args:
-            failed_suppliers: 이번 scan에서 에러난 supplier 집합. 이들만 "변화없음" 가정 적용.
-                             정상 empty 응답 supplier는 new_qty=0으로 취급 (실제 품절 가능).
+        Note:
+            - drop 계산은 프론트 summary 쿼리(latest searchedAt batch)와 같은 의미의 합산.
+              일부 크롤러가 이번 cycle에 실패하면 new_qty가 실제보다 낮아져 false drop 가능.
+              이 경우는 드물고, 합산 기준의 일관성을 우선함.
         """
-        failed_suppliers = failed_suppliers or set()
         cur = conn.cursor()
 
-        # 현재 키워드의 제품명 집합 — cross-keyword 오염 방지 + true-stockout 감지 커버리지
-        # new_results가 비어 있으면(전 도매 품절 or 전 도매 크롤러 에러) domae_cloud_results의
-        # 과거 기록에서 이 keyword와 연결된 product_name들을 복원해 prev 비교를 시도.
+        # 현재 키워드의 제품명 집합
         product_names = list({r["product_name"] for r in new_results})
         if not product_names:
+            # new_results 비어있음 = 전 도매 empty 응답(true-stockout) 또는 전 도매 실패
+            # 과거 기록에서 이 키워드와 연결된 product_name 복원
             cur.execute("""
                 SELECT DISTINCT "productName"
                 FROM domae_cloud_results
@@ -491,144 +482,89 @@ class CloudScheduler:
             product_names = [row[0] for row in cur.fetchall() if row[0]]
 
         if not product_names:
-            return []  # 이 키워드로 과거에 검색된 적 없음 → 비교 불가
+            return []  # 비교 불가
 
+        # 이전 cycle의 snapshot batch 합산 (MAX scannedAt 기준)
+        # _detect_alerts는 _save_results BEFORE 호출되므로 MAX scannedAt = 직전 cycle
+        cur.execute("""
+            SELECT "productName", SUM(COALESCE(quantity, 0))::int
+            FROM domae_inventory_snapshots
+            WHERE "monitorId" = %s
+              AND "productName" = ANY(%s)
+              AND "scannedAt" = (
+                  SELECT MAX("scannedAt") FROM domae_inventory_snapshots
+                  WHERE "monitorId" = %s
+              )
+            GROUP BY "productName"
+        """, (monitor_id, product_names, monitor_id))
+        prev_totals: dict = {row[0]: row[1] for row in cur.fetchall()}
+
+        if not prev_totals:
+            return []  # 첫 cycle — 비교 기준 없음
+
+        # 재입고 감지용 supplier별 직전 재고 (per-supplier DISTINCT ON)
         cur.execute("""
             SELECT DISTINCT ON (supplier, "productName")
-                   supplier, "productName", quantity, price, "productId"
+                   supplier, "productName", quantity
             FROM domae_inventory_snapshots
             WHERE "monitorId" = %s
               AND "productName" = ANY(%s)
             ORDER BY supplier, "productName", "scannedAt" DESC
         """, (monitor_id, product_names))
+        prev_per_supplier: dict = {
+            f"{row[0]}|{row[1]}": row[2] or 0 for row in cur.fetchall()
+        }
 
-        prev_map = {}
-        for row in cur.fetchall():
-            key = f"{row[0]}|{row[1]}"
-            prev_map[key] = {
-                "quantity": row[2] or 0,
-                "price": row[3] or 0,
-                "product_id": row[4] or "",
-            }
-
-        if not prev_map:
-            return []  # 첫 검색이면 비교 불가
+        # 현재 cycle 합산 (프론트 summary와 동일 기준)
+        new_totals: dict = {}
+        new_meta: dict = {}  # {pname: {"price": max, "product_id": first_nonempty}}
+        for r in new_results:
+            pname = r["product_name"]
+            qty = r.get("quantity") or 0
+            price = r.get("price") or 0
+            new_totals[pname] = new_totals.get(pname, 0) + qty
+            meta = new_meta.setdefault(pname, {"price": 0, "product_id": ""})
+            if price > meta["price"]:
+                meta["price"] = price
+            if not meta["product_id"] and r.get("product_id"):
+                meta["product_id"] = r["product_id"]
 
         alerts = []
 
-        # new_results를 (supplier, product_name) 인덱스로 변환
-        new_map = {}
+        # 1. 재입고 (도매별 즉시)
         for r in new_results:
-            key = f"{r['supplier']}|{r['product_name']}"
-            new_map[key] = {
-                "quantity": r.get("quantity") or 0,
-                "price": r.get("price") or 0,
-                "product_id": r.get("product_id", ""),
-            }
-
-        # 제품별 supplier 집합 (prev ∪ new)
-        product_suppliers: dict = {}
-        for key in set(prev_map.keys()) | set(new_map.keys()):
-            supplier, pname = key.split("|", 1)
-            product_suppliers.setdefault(pname, set()).add(supplier)
-
-        prev_product_totals: dict = {}
-        new_product_totals: dict = {}
-        for pname, suppliers in product_suppliers.items():
-            prev_total = 0
-            new_total = 0
-            max_price = 0
-            product_id = ""
-            for sup in suppliers:
-                key = f"{sup}|{pname}"
-                prev_val = prev_map.get(key)
-                new_val = new_map.get(key)
-
-                prev_qty = prev_val["quantity"] if prev_val else 0
-
-                if new_val is not None:
-                    # 이번 scan에서 실제 응답 받음 — 그 값 사용 (empty=0 포함)
-                    new_qty = new_val["quantity"]
-                    price = new_val["price"]
-                    if new_val.get("product_id"):
-                        product_id = new_val["product_id"]
-                elif sup in failed_suppliers:
-                    # 크롤러 에러 — prev 값 유지 (변화없음 가정)
-                    new_qty = prev_qty
-                    price = prev_val["price"] if prev_val else 0
-                    if prev_val and prev_val.get("product_id"):
-                        product_id = prev_val["product_id"]
-                else:
-                    # 정상 응답했지만 이 supplier+product 조합이 없음 = 실제로 해당 supplier에서 사라짐
-                    new_qty = 0
-                    price = prev_val["price"] if prev_val else 0
-
-                prev_total += prev_qty
-                new_total += new_qty
-                if (price or 0) > max_price:
-                    max_price = price or 0
-
-            prev_product_totals[pname] = prev_total
-            new_product_totals[pname] = {
-                "qty": new_total,
-                "price": max_price,
-                "product_id": product_id,
-            }
-
-        # 이미 합산 drop 알림을 생성한 제품 추적
-        drop_alerted_products = set()
-
-        for r in new_results:
-            key = f"{r['supplier']}|{r['product_name']}"
-            prev = prev_map.get(key)
             new_qty = r.get("quantity") or 0
-            new_price = r.get("price") or 0
-
-            if prev is None:
-                # 신규 제품 — 재입고와 동일 취급 (재고 있을 때만)
-                if new_qty > 0:
-                    alerts.append({
-                        "type": "restock",
-                        "supplier": r["supplier"],
-                        "product_name": r["product_name"],
-                        "product_id": r.get("product_id", ""),
-                        "quantity": new_qty,
-                        "price": new_price,
-                    })
+            if new_qty <= 0:
                 continue
-
-            prev_qty = prev["quantity"]
-
-            # 1. 재입고: 0 → N (도매별 개별 유지)
-            if prev_qty == 0 and new_qty > 0:
+            key = f"{r['supplier']}|{r['product_name']}"
+            prev_qty = prev_per_supplier.get(key)
+            if prev_qty is None or prev_qty == 0:
                 alerts.append({
                     "type": "restock",
                     "supplier": r["supplier"],
                     "product_name": r["product_name"],
                     "product_id": r.get("product_id", ""),
                     "quantity": new_qty,
-                    "price": new_price,
+                    "price": r.get("price") or 0,
                 })
 
-            # 2. 재고 감소: 전체 도매 합산 비교 → 1건만 알림
-            pname = r["product_name"]
-            if pname not in drop_alerted_products:
-                total_prev = prev_product_totals.get(pname, 0)
-                total_new = new_product_totals.get(pname, {}).get("qty", 0)
-                if total_prev >= 10 and total_new < total_prev:
-                    drop_pct = (total_prev - total_new) / total_prev
-                    if drop_pct >= 0.3:
-                        drop_alerted_products.add(pname)
-                        agg = new_product_totals[pname]
-                        alerts.append({
-                            "type": "drop",
-                            "supplier": "전체",
-                            "product_name": pname,
-                            "product_id": agg.get("product_id", ""),
-                            "old_qty": total_prev,
-                            "new_qty": total_new,
-                            "price": agg["price"],
-                        })
+        # 2. 재고 급감 (전 도매 합산, 30% 이상)
+        for pname in set(prev_totals.keys()) | set(new_totals.keys()):
+            old_total = prev_totals.get(pname, 0)
+            new_total = new_totals.get(pname, 0)
+            if old_total >= 10 and new_total < old_total:
+                drop_pct = (old_total - new_total) / old_total
+                if drop_pct >= 0.3:
+                    meta = new_meta.get(pname, {"price": 0, "product_id": ""})
+                    alerts.append({
+                        "type": "drop",
+                        "supplier": "전체",
+                        "product_name": pname,
+                        "product_id": meta["product_id"],
+                        "old_qty": old_total,
+                        "new_qty": new_total,
+                        "price": meta["price"],
+                    })
 
         return alerts
 
