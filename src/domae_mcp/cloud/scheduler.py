@@ -97,6 +97,10 @@ class CloudScheduler:
             }
 
             all_results = []
+            if not target_suppliers:
+                logger.warning("검색 대상 도매업체 없음 [%s] — 건너뜀", monitor_id)
+                return
+
             with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
                 futures = {
                     executor.submit(
