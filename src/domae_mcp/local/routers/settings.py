@@ -214,13 +214,18 @@ def test_credentials(req: TestCredentialRequest):
             detail=f"{req.supplier} 계정이 설정되지 않았습니다.",
         )
 
+    from domae_mcp.core.crawlers.base import CrawlerError
+
     try:
         crawler = CrawlerRegistry.get(req.supplier)
         crawler.ensure_login(cred["login_id"], cred["login_pw"])
         return MessageResponse(success=True, message="로그인 성공")
+    except CrawlerError as e:
+        logger.warning("로그인 실패 (%s): %s", req.supplier, e)
+        return MessageResponse(success=False, message="로그인 실패: ID/비밀번호를 확인해주세요")
     except Exception as e:
-        logger.error("로그인 실패 (%s): %s", req.supplier, e, exc_info=True)
-        return MessageResponse(success=False, message="로그인 실패: 잠시 후 다시 시도해주세요")
+        logger.error("로그인 예외 (%s): %s", req.supplier, e, exc_info=True)
+        return MessageResponse(success=False, message="로그인 중 오류가 발생했습니다")
 
 
 # ── 텔레그램 엔드포인트 ──

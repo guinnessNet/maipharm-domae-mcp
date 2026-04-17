@@ -79,10 +79,13 @@ class BaseCrawler(ABC):
         return []
 
     def ensure_login(self, login_id: str, login_pw: str) -> bool:
-        """로그인 상태 확인 후 필요 시 로그인."""
-        if not self._logged_in:
-            self._logged_in = self.login(login_id, login_pw)
-        return self._logged_in
+        """로그인 상태 확인 후 필요 시 로그인. 실패 시 CrawlerError 발생."""
+        if self._logged_in:
+            return True
+        if not self.login(login_id, login_pw):
+            raise CrawlerError(f"{self.SUPPLIER_NAME or type(self).__name__} 로그인 실패")
+        self._logged_in = True
+        return True
 
     def _soup(self, html: str, parser: str = "lxml") -> BeautifulSoup:
         """HTML → BeautifulSoup"""
