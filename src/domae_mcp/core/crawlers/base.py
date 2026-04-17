@@ -19,6 +19,11 @@ class SearchResult:
     price: int = 0
     supplier: str = ""
     product_id: str = ""
+    # 다지점 도매 (지오영/복산 등)의 센터별 재고 분리.
+    # 기본값 0/""로 두면 단일센터 도매는 기존 동작 그대로.
+    local_stock: int = 0
+    other_stock: int = 0
+    other_move_code: str = ""
 
 
 @dataclass
@@ -27,6 +32,9 @@ class OrderResult:
     success: bool = False
     message: str = ""
     order_id: str = ""
+    # 분할 주문용. 단일 주문은 fulfilled=quantity, failed=0 으로 채움.
+    fulfilled_quantity: int = 0
+    failed_quantity: int = 0
 
 
 class CrawlerError(Exception):
