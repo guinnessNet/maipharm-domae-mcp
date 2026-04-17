@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 VERIFY_URL = "https://api.pharmsq.com/api/domae/verify"
 HEARTBEAT_URL = "https://api.pharmsq.com/api/domae/heartbeat"
+# 서버 CSRF 가드가 Origin/Referer 없는 POST 를 403 으로 막기 때문에 데스크톱 앱은 허용 Origin 을 명시한다.
+PHARMSQ_ORIGIN = "https://pharmsq.com"
 OFFLINE_GRACE_DAYS = 7
 
 
@@ -53,7 +55,10 @@ class ApiKeyManager:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     VERIFY_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Origin": PHARMSQ_ORIGIN,
+                    },
                     timeout=5.0,
                 )
 
@@ -121,7 +126,10 @@ class ApiKeyManager:
             async with httpx.AsyncClient() as client:
                 await client.post(
                     HEARTBEAT_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Origin": PHARMSQ_ORIGIN,
+                    },
                     json={
                         "version": __version__,
                         "search_count": stats.get("search_count", 0),
