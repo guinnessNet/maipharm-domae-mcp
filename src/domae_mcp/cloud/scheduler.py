@@ -791,6 +791,19 @@ class CloudScheduler:
             # 3. 주문 실행
             crawler = crawler_cls()
             crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            # 주문마다 새 크롤러 인스턴스라 토큰/단가 캐시가 비어 있다.
+            # job 에 싣려온 product_name 으로 선행 search 를 1회 수행해
+            # 캐시를 채운다. search 결과는 버리며 캐시를 쓰는 크롤러(TJ팜 등)만
+            # 영향을 받는다.
+            product_name_hint = job.get("product_name", "") or ""
+            if product_name_hint:
+                try:
+                    crawler.search(product_name_hint)
+                except Exception as e:
+                    logger.warning(
+                        "order 전 선행 search 실패 [%s / %s]: %s",
+                        supplier_name, product_name_hint, e,
+                    )
             result = crawler.order(product_id, quantity)
 
             _finalize(
@@ -927,8 +940,18 @@ class CloudScheduler:
                     logged_in_crawlers[supplier_name] = crawler
                 crawler = logged_in_crawlers[supplier_name]
 
+                # 토큰 캐시를 요구하는 크롤러(TJ팜 등)를 위해 각 product_name 으로
+                # 선행 search 를 수행해 내부 캐시를 채운다.
+                for _, _gi in group_items:
+                    _name = _gi.get("product_name") or ""
+                    if _name:
+                        try:
+                            crawler.search(_name)
+                        except Exception as _e:
+                            logger.warning("batch_order 선행 search 실패 [%s / %s]: %s", supplier_name, _name, _e)
+
                 batch_items = [
-                    {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1)}
+                    {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", "")}
                     for _, item in group_items
                 ]
 
@@ -994,6 +1017,12 @@ class CloudScheduler:
                             still_failed.append((idx, item, orig_result))
                             continue
                         try:
+                            _retry_name = item.get("product_name") or ""
+                            if _retry_name:
+                                try:
+                                    crawler.search(_retry_name)
+                                except Exception:
+                                    pass
                             retry_result = crawler.order(pid, qty)
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
@@ -1202,8 +1231,17 @@ class CloudScheduler:
             crawler = crawler_cls()
             crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
+            # 토큰 캐시 준비용 선행 search (TJ팜 등)
+            for _it in items:
+                _name = _it.get("product_name") or ""
+                if _name:
+                    try:
+                        crawler.search(_name)
+                    except Exception as _e:
+                        logger.warning("auto_order 선행 search 실패 [%s / %s]: %s", supplier_name, _name, _e)
+
             batch_items = [
-                {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1)}
+                {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", "")}
                 for item in items
             ]
 
@@ -1606,6 +1644,13 @@ class CloudScheduler:
                         break
             except Exception:
                 pass
+
+            # TJ팜 등 토큰 캐시 기반 크롤러용 선행 search
+            if product_name and product_name != product_id:
+                try:
+                    crawler.search(product_name)
+                except Exception:
+                    pass
 
             result = crawler.order(product_id, quantity)
 
@@ -2191,6 +2236,13 @@ class CloudScheduler:
                     logger.info("telegram_order 크롤러 검색: product_id=%s results=%d", product_id, len(search_results))
             except Exception as e:
                 logger.warning("telegram_order 제품 조회 실패: %s", e)
+
+            # TJ팜 등 토큰 캐시 기반 크롤러용 선행 search
+            if product_name and product_name != product_id:
+                try:
+                    crawler.search(product_name)
+                except Exception:
+                    pass
 
             result = crawler.order(product_id, quantity)
             logger.info(

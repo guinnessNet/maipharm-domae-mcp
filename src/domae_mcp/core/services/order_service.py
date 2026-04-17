@@ -47,6 +47,13 @@ class OrderService:
             try:
                 crawler = CrawlerRegistry.get(supplier)
                 crawler.ensure_login(credentials["login_id"], credentials["login_pw"])
+                # 토큰/단가 캐시가 필요한 크롤러(TJ팜 등)를 위해 product_name 으로 선행 search.
+                # 결과는 버리고 크롤러 내부 상태만 확보.
+                if product_name:
+                    try:
+                        crawler.search(product_name)
+                    except Exception:
+                        logger.warning("order 전 선행 search 실패: %s / %s", supplier, product_name)
                 result = crawler.order(product_id, quantity)
             except Exception as e:
                 logger.error("주문 실패: %s %s", supplier, product_name, exc_info=True)
