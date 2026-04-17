@@ -146,14 +146,40 @@ API 키 없으면 크롤러 0개 → 검색/주문 불가.
 ## Git Commit
 - 커밋 메시지는 항상 한글로 간략하게 작성한다 (1줄, 50자 이내 권장)
 
+## 릴리즈
+
+### 버전 동기화 규칙 (중요)
+릴리즈 전 반드시 **두 파일의 버전을 함께** 수정해야 한다:
+- `src/domae_mcp/__init__.py` — `__version__ = "X.Y.Z"`
+- `pyproject.toml` — `version = "X.Y.Z"`
+
+`__init__.py`의 `__version__`은 `api_key.py` / `desktop/updater.py` / `__main__.py --version`에서 참조된다.
+mismatch 시 exe가 스스로를 구버전으로 인식 → auto-updater 무한 루프.
+
+### 릴리즈 절차
+1. 두 파일 버전 수정 → 한글 커밋 (예: `v1.3.1 — 버전 동기화`)
+2. 브랜치 push → `git tag vX.Y.Z` → `git push origin vX.Y.Z`
+3. `.github/workflows/release.yml`이 자동 실행:
+   - 프론트 빌드 → `src/domae_mcp/static/`에 복사
+   - PyInstaller (`domae.spec`)로 `MaipharmDomae.exe` 빌드 (windows-latest)
+   - sdist/wheel 빌드 (ubuntu-latest)
+   - `MaipharmDomae.exe` + `maipharm-domae-mcp-vX.Y.Z.zip` + `*.whl`을 GitHub Release에 업로드
+
+### 절대 하지 말 것
+- **이미 배포된 태그를 force-push로 교체하지 마라** — 해당 태그로 이미 업데이트된 사용자 exe의 updater가 꼬인다. 수정이 필요하면 patch release (예: v1.3.0 버그 → v1.3.1)
+- `__init__.py`와 `pyproject.toml` 중 한쪽만 올리지 마라
+
+### 로컬 exe 빌드 (개발/디버깅용)
+```bash
+pip install pyinstaller
+cd frontend && npm run build && cp -r dist/* ../src/domae_mcp/static/
+cd .. && python -m PyInstaller domae.spec --clean --noconfirm
+# → dist/MaipharmDomae.exe (약 54MB)
+```
+
 ## 설계 문서
 - `docs/ARCHITECTURE.md` — 시스템 아키텍처 (로컬 모드)
 - `docs/API_SPEC.md` — REST API + MCP Tools 명세
 - `docs/DATABASE_SCHEMA.md` — DB 스키마
-- `docs/PROJECT_STRUCTURE.md` — 프로젝트 구조 + domae-v2 매핑
-- `docs/BUSINESS_ARCHITECTURE.md` — 비즈니스 아키텍처 (로컬/클라우드 이중 구조, 요금제, 팜스퀘어 연동)
-- `docs/WORKFLOW.md` — 구현 워크플로우 (Phase 0~7, 의존성 맵, 병렬 작업 계획)
-- `docs/WORKFLOW_v2.md` — 구현 워크플로우 v2 (UX 분석 반영, 현재 기준)
-- `docs/DESIGN_CRAWLER_DISTRIBUTION.md` — 크롤러 서버 배포 시스템 설계
-- `docs/DEPLOY.md` — 배포 가이드 (로컬/클라우드/PyPI)
 - `docs/USER_GUIDE.md` — 사용자 가이드 (약국 대상, 비개발자용)
+- `docs/TELEGRAM_REDESIGN.md` — 텔레그램 알림 설계
