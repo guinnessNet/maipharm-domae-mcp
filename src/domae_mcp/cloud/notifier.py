@@ -120,14 +120,15 @@ class Notifier:
         quantity: int,
         price: int,
     ) -> Optional[int]:
-        """재입고 알림 — 인라인 주문 버튼 포함."""
+        """재입고 알림 — 전 도매 품절 해제 시 1회. 수량은 전 도매 합산, supplier는 주문 버튼 대상(최다 재고 도매)."""
         safe_sup = html.escape(supplier)
         safe_name = html.escape(product_name)
         price_str = f"단가 {price:,}원" if price else "가격 미확인"
         text = (
-            f"🟢 <b>입고</b>\n"
-            f"{safe_sup} {safe_name}\n"
-            f"{quantity}개 입고 | {price_str}"
+            f"🟢 <b>재입고</b> (전 도매 품절 해제)\n"
+            f"{safe_name}\n"
+            f"합산 {quantity}개 | {price_str}\n"
+            f"주문 가능: {safe_sup}"
         )
 
         # 콜백 데이터: C:{monitor_id_8자}:{supplier}:{product_id}:{qty}

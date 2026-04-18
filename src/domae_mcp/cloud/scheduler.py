@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import sys
@@ -457,19 +458,25 @@ class CloudScheduler:
         keyword: str,
         new_results: list,
     ) -> list:
-        """전체 도매 스캔 완료 후 합산 기준 알림 감지.
+        """키워드(모니터 등록 단위) 합산 기준 알림 감지.
+
+        정책:
+            하나의 모니터 등록(keyword = 보험코드/약품명)에서 나온 모든 검색결과
+            (도매·제품명·포장단위 무관)의 quantity 를 합산하여 **단일 수량** 으로 취급한다.
+            따라서 per-supplier 또는 per-product_name 기준이 아니라 오직 전체 합산값의
+            상태 변화만 감지한다.
 
         감지 이벤트:
-        1. 재입고: (supplier, product_name) 기준 직전 스냅샷 0 → 현재 > 0 — 도매별 즉시 알림
-        2. 재고 급감: product_name 기준 전 도매 합산 비교
-           - old_qty = 직전 cycle(MAX scannedAt) snapshot batch의 합
-           - new_qty = 현재 cycle all_results의 합 (프론트 "재고모니터링" 표시값과 동일)
-           - 30% 이상 감소 시 1건 알림
+            1. 재입고: 합산 0 → 양수 전환 시 1회 (전 도매 품절 해제)
+            2. 재고 급감: 합산이 직전 cycle 대비 30% 이상 감소
+
+        첫 cycle(prev 없음)은 비교 기준이 없으므로 모두 skip.
+
+        주문 버튼 컨텍스트용 대표 row 는 새 cycle 에서 재고가 가장 많은 도매를 선택.
 
         Note:
-            - drop 계산은 프론트 summary 쿼리(latest searchedAt batch)와 같은 의미의 합산.
-              일부 크롤러가 이번 cycle에 실패하면 new_qty가 실제보다 낮아져 false drop 가능.
-              이 경우는 드물고, 합산 기준의 일관성을 우선함.
+            크롤러 일부가 이번 cycle 에 실패하면 new_total 이 일시적으로 낮아져
+            false drop 또는 false restock 이 발생할 수 있음. 합산 일관성을 우선함.
         """
         cur = conn.cursor()
 
@@ -508,69 +515,72 @@ class CloudScheduler:
         if not prev_totals:
             return []  # 첫 cycle — 비교 기준 없음
 
-        # 재입고 감지용 supplier별 직전 재고 (per-supplier DISTINCT ON)
-        cur.execute("""
-            SELECT DISTINCT ON (supplier, "productName")
-                   supplier, "productName", quantity
-            FROM domae_inventory_snapshots
-            WHERE "monitorId" = %s
-              AND "productName" = ANY(%s)
-            ORDER BY supplier, "productName", "scannedAt" DESC
-        """, (monitor_id, product_names))
-        prev_per_supplier: dict = {
-            f"{row[0]}|{row[1]}": row[2] or 0 for row in cur.fetchall()
-        }
-
-        # 현재 cycle 합산 (프론트 summary와 동일 기준)
+        # 현재 cycle 합산 (프론트 summary와 동일 기준, per product_name)
         new_totals: dict = {}
-        new_meta: dict = {}  # {pname: {"price": max, "product_id": first_nonempty}}
         for r in new_results:
             pname = r["product_name"]
             qty = r.get("quantity") or 0
-            price = r.get("price") or 0
             new_totals[pname] = new_totals.get(pname, 0) + qty
-            meta = new_meta.setdefault(pname, {"price": 0, "product_id": ""})
-            if price > meta["price"]:
-                meta["price"] = price
-            if not meta["product_id"] and r.get("product_id"):
-                meta["product_id"] = r["product_id"]
+
+        # 키워드(전 도매·전 제품명) 합산 — 사용자 정책: 등록 1건 = 수량 1개
+        old_keyword_total = sum(prev_totals.values())
+        new_keyword_total = sum(new_totals.values())
+
+        # 대표 row: 새 cycle 에서 재고가 가장 많은 도매 (주문 버튼용)
+        positive_rows = [r for r in new_results if (r.get("quantity") or 0) > 0]
+        top_row = max(
+            positive_rows,
+            key=lambda r: r.get("quantity") or 0,
+            default=None,
+        )
+
+        # 대표 표시 약명: 도매마다 "코싹엘정", "한미 코싹엘정 120mg/30T",
+        # "코싹엘정120mg(병) 30T 한미" 처럼 뒤에 용량·포장·T수·(병)·제약사가
+        # 붙은 변형이 섞여 있다. 뒤꼬리(용량 단위 \d+mg/ml/g/T 이후, 또는 괄호)
+        # 를 잘라 공통 접두(약명 본체)만 남긴 뒤 가장 짧은 이름을 채택한다.
+        # keyword 가 보험코드(숫자)인 경우에도 실제 약명이 메시지에 노출된다.
+        cleaned_names: set = set()
+        for r in new_results:
+            nm = r.get("product_name") or ""
+            # 용량·포장 뒤꼬리 제거: "...정120mg(병) 30T 한미" / "...정 120mg/30T" → 본체만
+            nm = re.sub(r'\s*\d+\s*(mg|ml|g|T|t)\b.*$', '', nm, flags=re.IGNORECASE)
+            # 뒤에 남은 괄호 블록 + 이후 꼬리 제거: "...정 (병) ..." → "...정"
+            nm = re.sub(r'\s*\(.*?\).*$', '', nm)
+            nm = nm.strip()
+            if nm:
+                cleaned_names.add(nm)
+
+        rep_supplier = top_row["supplier"] if top_row else "전체"
+        rep_product_name = min(cleaned_names, key=len) if cleaned_names else keyword
+        rep_product_id = (top_row.get("product_id") if top_row else "") or ""
+        rep_price = (top_row.get("price") if top_row else 0) or 0
 
         alerts = []
 
-        # 1. 재입고 (도매별 즉시)
-        for r in new_results:
-            new_qty = r.get("quantity") or 0
-            if new_qty <= 0:
-                continue
-            key = f"{r['supplier']}|{r['product_name']}"
-            prev_qty = prev_per_supplier.get(key)
-            if prev_qty is None or prev_qty == 0:
-                alerts.append({
-                    "type": "restock",
-                    "supplier": r["supplier"],
-                    "product_name": r["product_name"],
-                    "product_id": r.get("product_id", ""),
-                    "quantity": new_qty,
-                    "price": r.get("price") or 0,
-                })
+        # 1. 재입고: 전 도매 합산 0 → 양수 전환 시 1회
+        if old_keyword_total == 0 and new_keyword_total > 0:
+            alerts.append({
+                "type": "restock",
+                "supplier": rep_supplier,
+                "product_name": rep_product_name,
+                "product_id": rep_product_id,
+                "quantity": new_keyword_total,
+                "price": rep_price,
+            })
 
-        # 2. 재고 급감 (전 도매 합산, 30% 이상)
-        for pname in set(prev_totals.keys()) | set(new_totals.keys()):
-            old_total = prev_totals.get(pname, 0)
-            new_total = new_totals.get(pname, 0)
-            if old_total >= 10 and new_total < old_total:
-                drop_pct = (old_total - new_total) / old_total
-                if drop_pct >= 0.3:
-                    meta = new_meta.get(pname, {"price": 0, "product_id": ""})
-                    alerts.append({
-                        "type": "drop",
-                        "supplier": "전체",
-                        "product_name": pname,
-                        "product_id": meta["product_id"],
-                        "old_qty": old_total,
-                        "new_qty": new_total,
-                        "price": meta["price"],
-                    })
+        # 2. 재고 급감: 전 도매 합산 30% 이상 감소
+        if old_keyword_total >= 10 and new_keyword_total < old_keyword_total:
+            drop_pct = (old_keyword_total - new_keyword_total) / old_keyword_total
+            if drop_pct >= 0.3:
+                alerts.append({
+                    "type": "drop",
+                    "supplier": "전체",
+                    "product_name": rep_product_name,
+                    "product_id": rep_product_id,
+                    "old_qty": old_keyword_total,
+                    "new_qty": new_keyword_total,
+                    "price": rep_price,
+                })
 
         return alerts
 
