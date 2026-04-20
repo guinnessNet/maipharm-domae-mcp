@@ -720,7 +720,10 @@ class CloudScheduler:
         # 결과를 DB 먼저 + response_key 나중에 반영하는 헬퍼
         # — 순서 중요: DB가 먼저 확정돼야 서버 timeout 후에도 최종 상태가 정확함
         # — 모든 내부 예외는 이 함수 안에서 삼키고 절대 밖으로 던지지 않음 (재귀 finalize 방지)
-        def _finalize(success: bool, order_id: str | None, message: str):
+        def _finalize(success: bool, order_id: str | None, message: str,
+                      adjusted_quantity: int | None = None,
+                      available_stock: int | None = None,
+                      reason_code: str | None = None):
             # 1) DB UPDATE 먼저 (quick-order 경로만)
             if db_order_id:
                 try:
@@ -731,23 +734,41 @@ class CloudScheduler:
                             UPDATE domae_cloud_orders
                             SET success = %s,
                                 "orderId" = %s,
-                                message = %s
+                                message = %s,
+                                "adjustedQuantity" = %s,
+                                "availableStock" = %s,
+                                "reasonCode" = %s
                             WHERE id = %s
-                        """, (success, order_id, message, db_order_id))
-                        # quick-order 단건 batch도 함께 마감 (서버 timeout/disconnect 대비)
-                        # — 서버가 즉시 마감했을 수도 있으나, UPDATE는 멱등이므로 중복 안전
+                        """, (success, order_id, message,
+                              adjusted_quantity, available_stock, reason_code,
+                              db_order_id))
+                        # quick-order 단건 batch도 함께 마감
                         if db_batch_id:
                             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                            # 수량 조정 집계 계산
+                            _adj_count = 1 if reason_code == "stock_adjusted" else 0
+                            _missing = 0
+                            try:
+                                if reason_code == "stock_adjusted" and adjusted_quantity is not None:
+                                    _missing = max(0, int(quantity) - int(adjusted_quantity))
+                                elif reason_code == "stock_zero":
+                                    _missing = int(quantity)
+                            except Exception:
+                                pass
                             upd_cur.execute("""
                                 UPDATE domae_order_batches
                                 SET status = %s,
                                     "successCount" = %s,
                                     "failCount" = %s,
+                                    "adjustedCount" = %s,
+                                    "missingQuantity" = %s,
                                     "completedAt" = %s
                                 WHERE id = %s
-                            """, ("completed", 1 if success else 0, 0 if success else 1, utc_now, db_batch_id))
+                            """, ("completed", 1 if success else 0, 0 if success else 1,
+                                  _adj_count, _missing, utc_now, db_batch_id))
                         upd_conn.commit()
-                        logger.info("order DB finalize: dbOrderId=%s dbBatchId=%s success=%s", db_order_id, db_batch_id, success)
+                        logger.info("order DB finalize: dbOrderId=%s dbBatchId=%s success=%s reason=%s adj=%s",
+                                    db_order_id, db_batch_id, success, reason_code, adjusted_quantity)
                     finally:
                         try:
                             self._db_pool.putconn(upd_conn)
@@ -757,7 +778,12 @@ class CloudScheduler:
                     logger.error("order DB finalize 실패 [dbOrderId=%s]: %s", db_order_id, e, exc_info=True)
 
             # 2) response_key lpush + TTL 설정 (서버 BRPOP용)
-            payload = {"success": success, "order_id": order_id, "message": message}
+            payload = {
+                "success": success, "order_id": order_id, "message": message,
+                "adjusted_quantity": adjusted_quantity,
+                "available_stock": available_stock,
+                "reason_code": reason_code,
+            }
             try:
                 self._redis.lpush(response_key, json.dumps(payload))
                 # TTL은 lpush 직후에 설정해야 key가 존재해서 적용됨
@@ -814,12 +840,16 @@ class CloudScheduler:
                         "order 전 선행 search 실패 [%s / %s]: %s",
                         supplier_name, product_name_hint, e,
                     )
-            result = crawler.order(product_id, quantity)
+            # product_name 을 crawler.order 에 전달 → Phase 2 fallback 의 refetch_stock 이 search 기반 폴백 사용 가능
+            result = crawler.order(product_id, quantity, product_name=product_name_hint)
 
             _finalize(
                 success=bool(result.success),
                 order_id=getattr(result, "order_id", None),
                 message=getattr(result, "message", "") or "",
+                adjusted_quantity=getattr(result, "adjusted_quantity", None),
+                available_stock=getattr(result, "available_stock", None),
+                reason_code=getattr(result, "reason_code", None),
             )
 
             # 텔레그램 알림
@@ -888,9 +918,13 @@ class CloudScheduler:
             # 4. 도매상별 그룹핑 → 일괄 주문
             success_count = 0
             fail_count = 0
-            success_lines = []  # 텔레그램 알림용
-            fail_lines = []
-            logged_in_crawlers = {}  # 도매상별 로그인 캐시
+            adjusted_count = 0          # 수량 자동 조정된 품목 수 (부분 재고)
+            missing_qty_total = 0       # 요청 - 실제 주문된 총 수량 (누락 수량)
+            success_lines = []          # 텔레그램 알림용 — 정상 성공
+            adjusted_lines = []         # 수량 조정 성공 (⚠️ 섹션)
+            missing_lines = []          # 재고 0 누락 (❌ 섹션)
+            fail_lines = []             # 기타 실패
+            logged_in_crawlers = {}     # 도매상별 로그인 캐시
 
             # 4-1. 사전 검증 + 도매상별 그룹핑
             from collections import OrderedDict
@@ -923,13 +957,15 @@ class CloudScheduler:
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                     quantity, price, success, "productId", "orderId", message, "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     quantity, price, success, "productId", "orderId", message, "orderedAt",
+                     "adjustedQuantity", "availableStock", "reasonCode")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     _generate_cuid(), monitor_id, batch_id, item.get("supplier") or "",
                     item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
                     item.get("quantity", 1), item.get("price"), False,
                     item.get("product_id"), None, msg, utc_now,
+                    None, None, "other",
                 ))
                 cart_item_id = item.get("cart_item_id")
                 if cart_item_id:
@@ -1007,10 +1043,21 @@ class CloudScheduler:
 
                 # ── 실패 항목 1회 재시도 (안전 검증은 각 크롤러 내장) ──
                 # 재시도 불필요한 실패 사유 (재시도해도 결과 동일)
-                NO_RETRY_KEYWORDS = ["재고 부족", "로그인 실패", "계정 미등록", "크롤러 없음", "미지원"]
+                # NOTE: "재고 부족"/"재고 0" 은 크롤러 내부(PartialStockFallbackMixin)가 수량 조정
+                #       재시도를 이미 수행했으므로 워커 레벨 재시도는 무의미.
+                #       "수량 조정 후 재시도 실패" 는 Phase 2 submit 도 실패한 것이므로
+                #       원래 수량으로 다시 재시도하면 카트 오염 위험만 있음.
+                NO_RETRY_KEYWORDS = [
+                    "재고 0", "재고 부족", "수량 조정 후 재시도",
+                    "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
+                ]
                 retryable = []
                 for entry in failed:
                     msg = getattr(entry[2], "message", "")
+                    rcode = getattr(entry[2], "reason_code", None)
+                    # reason_code 가 stock_zero/stock_adjusted 는 크롤러가 이미 판정한 확정 결과
+                    if rcode in ("stock_zero", "stock_adjusted"):
+                        continue
                     if any(kw in msg for kw in NO_RETRY_KEYWORDS):
                         continue
                     retryable.append(entry)
@@ -1033,7 +1080,7 @@ class CloudScheduler:
                                     crawler.search(_retry_name)
                                 except Exception:
                                     pass
-                            retry_result = crawler.order(pid, qty)
+                            retry_result = crawler.order(pid, qty, product_name=_retry_name)
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
                                 succeeded.append((idx, item, retry_result))
@@ -1050,21 +1097,34 @@ class CloudScheduler:
                     order_id_val = getattr(result, "order_id", None)
                     order_message = getattr(result, "message", "")
                     order_price = item.get("price")
+                    original_qty = int(item.get("quantity", 1))
+                    adjusted_qty = getattr(result, "adjusted_quantity", None)
+                    avail_stock = getattr(result, "available_stock", None)
+                    rcode = getattr(result, "reason_code", None) or "ok"
                     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute("""
                         INSERT INTO domae_cloud_orders
                         (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                         quantity, price, success, "productId", "orderId", message, "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         quantity, price, success, "productId", "orderId", message, "orderedAt",
+                         "adjustedQuantity", "availableStock", "reasonCode")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         _generate_cuid(), monitor_id, batch_id, supplier_name,
                         item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                        item.get("quantity", 1), order_price, True,
+                        original_qty, order_price, True,
                         item.get("product_id"), order_id_val, order_message, utc_now,
+                        adjusted_qty, avail_stock, rcode,
                     ))
                     success_count += 1
-                    _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{item.get('quantity', 1)}"
-                    success_lines.append(_tg_line)
+                    if rcode == "stock_adjusted" and adjusted_qty is not None:
+                        missing_qty_total += max(0, original_qty - int(adjusted_qty))
+                        adjusted_count += 1
+                        _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
+                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} (재고 {avail_stock})")
+                        adjusted_lines.append(_tg_line)
+                    else:
+                        _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{original_qty}"
+                        success_lines.append(_tg_line)
                     cart_item_id = item.get("cart_item_id")
                     if cart_item_id:
                         cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
@@ -1072,21 +1132,33 @@ class CloudScheduler:
                 for idx, item, result in failed:
                     order_message = getattr(result, "message", "")
                     order_price = item.get("price")
+                    original_qty = int(item.get("quantity", 1))
+                    adjusted_qty = getattr(result, "adjusted_quantity", None)
+                    avail_stock = getattr(result, "available_stock", None)
+                    rcode = getattr(result, "reason_code", None) or "other"
                     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     cur.execute("""
                         INSERT INTO domae_cloud_orders
                         (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                         quantity, price, success, "productId", "orderId", message, "orderedAt")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         quantity, price, success, "productId", "orderId", message, "orderedAt",
+                         "adjustedQuantity", "availableStock", "reasonCode")
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         _generate_cuid(), monitor_id, batch_id, supplier_name,
                         item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                        item.get("quantity", 1), order_price, False,
+                        original_qty, order_price, False,
                         item.get("product_id"), None, order_message, utc_now,
+                        adjusted_qty, avail_stock, rcode,
                     ))
                     fail_count += 1
-                    _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{item.get('quantity', 1)}"
-                    fail_lines.append(_tg_line + (f" — {order_message}" if order_message else ""))
+                    if rcode == "stock_zero":
+                        missing_qty_total += original_qty
+                        _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
+                                    f" — 요청 {original_qty} (재고 0)")
+                        missing_lines.append(_tg_line)
+                    else:
+                        _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{original_qty}"
+                        fail_lines.append(_tg_line + (f" — {order_message}" if order_message else ""))
                     cart_item_id = item.get("cart_item_id")
                     if cart_item_id:
                         cur.execute(
@@ -1094,23 +1166,22 @@ class CloudScheduler:
                             (utc_now, order_message, cart_item_id)
                         )
 
-                # batch 카운트 업데이트
-                cur.execute("""
-                    UPDATE domae_order_batches
-                    SET "successCount" = %s, "failCount" = %s
-                    WHERE id = %s
-                """, (success_count, fail_count, batch_id))
+                # 각 supplier 처리 후 부분 커밋 (row 기록만 확정)
                 conn.commit()
 
                 time.sleep(1)  # 도매상 간 딜레이
 
-            # 5. batch 완료
+            # 5. batch 완료 — 집계값 + status 를 한 번에 업데이트
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute("""
                 UPDATE domae_order_batches
-                SET status = %s, "completedAt" = %s
+                SET status = %s, "completedAt" = %s,
+                    "successCount" = %s, "failCount" = %s,
+                    "adjustedCount" = %s, "missingQuantity" = %s
                 WHERE id = %s
-            """, ("completed", utc_now, batch_id))
+            """, ("completed", utc_now,
+                  success_count, fail_count, adjusted_count, missing_qty_total,
+                  batch_id))
             conn.commit()
 
             # 6. 텔레그램 알림
@@ -1118,15 +1189,32 @@ class CloudScheduler:
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     parts = ["📦 도매 일괄주문 완료\n"]
+                    # 헤드라인: 누락 수량 요약
+                    if missing_qty_total > 0:
+                        parts.append(f"📉 {missing_qty_total}개 주문 누락되었습니다\n")
                     if success_lines:
-                        parts.append(f"✅ 성공 {success_count}건")
+                        parts.append(f"✅ 성공 {len(success_lines)}건")
                         parts.extend(success_lines[:10])
                         if len(success_lines) > 10:
                             parts.append(f" ... 외 {len(success_lines) - 10}건")
-                    if fail_lines:
+                    if adjusted_lines:
                         if success_lines:
                             parts.append("")
-                        parts.append(f"❌ 실패 {fail_count}건")
+                        parts.append(f"⚠️ 수량 조정 {len(adjusted_lines)}건")
+                        parts.extend(adjusted_lines[:10])
+                        if len(adjusted_lines) > 10:
+                            parts.append(f" ... 외 {len(adjusted_lines) - 10}건")
+                    if missing_lines:
+                        if success_lines or adjusted_lines:
+                            parts.append("")
+                        parts.append(f"❌ 재고 0 주문 누락 {len(missing_lines)}건")
+                        parts.extend(missing_lines[:10])
+                        if len(missing_lines) > 10:
+                            parts.append(f" ... 외 {len(missing_lines) - 10}건")
+                    if fail_lines:
+                        if success_lines or adjusted_lines or missing_lines:
+                            parts.append("")
+                        parts.append(f"❌ 실패 {len(fail_lines)}건")
                         parts.extend(fail_lines[:10])
                         if len(fail_lines) > 10:
                             parts.append(f" ... 외 {len(fail_lines) - 10}건")
@@ -1142,22 +1230,43 @@ class CloudScheduler:
             logger.error("batch_order 실패 [%s]: %s", batch_id, e, exc_info=True)
             try:
                 cur = conn.cursor()
-                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                # 중간까지 처리된 집계값 보존하면서 status=failed 로 마킹
+                cur.execute("""
+                    UPDATE domae_order_batches
+                    SET status = %s,
+                        "successCount" = %s, "failCount" = %s,
+                        "adjustedCount" = %s, "missingQuantity" = %s
+                    WHERE id = %s
+                """, ("failed",
+                      success_count, fail_count, adjusted_count, missing_qty_total,
+                      batch_id))
                 conn.commit()
             except Exception:
                 pass
             # 부분 성공이라도 텔레그램 알림 발송
-            if telegram_chat_id and (success_lines or fail_lines):
+            if telegram_chat_id and (success_lines or adjusted_lines or missing_lines or fail_lines):
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     parts = [f"📦 도매 일괄주문 오류 (일부 처리됨)\n"]
+                    if missing_qty_total > 0:
+                        parts.append(f"📉 {missing_qty_total}개 주문 누락되었습니다\n")
                     if success_lines:
-                        parts.append(f"✅ 성공 {success_count}건")
+                        parts.append(f"✅ 성공 {len(success_lines)}건")
                         parts.extend(success_lines[:10])
-                    if fail_lines:
+                    if adjusted_lines:
                         if success_lines:
                             parts.append("")
-                        parts.append(f"❌ 실패 {fail_count}건")
+                        parts.append(f"⚠️ 수량 조정 {len(adjusted_lines)}건")
+                        parts.extend(adjusted_lines[:10])
+                    if missing_lines:
+                        if success_lines or adjusted_lines:
+                            parts.append("")
+                        parts.append(f"❌ 재고 0 주문 누락 {len(missing_lines)}건")
+                        parts.extend(missing_lines[:10])
+                    if fail_lines:
+                        if success_lines or adjusted_lines or missing_lines:
+                            parts.append("")
+                        parts.append(f"❌ 실패 {len(fail_lines)}건")
                         parts.extend(fail_lines[:10])
                     parts.append(f"\n⚠️ 오류: {str(e)[:100]}")
                     Notifier.send_telegram(telegram_chat_id, "\n".join(parts))
@@ -1662,7 +1771,7 @@ class CloudScheduler:
                 except Exception:
                     pass
 
-            result = crawler.order(product_id, quantity)
+            result = crawler.order(product_id, quantity, product_name=product_name or "")
 
             if result.success:
                 # 성공 → 메시지 편집: 버튼 제거 + 완료 표시
@@ -2254,7 +2363,7 @@ class CloudScheduler:
                 except Exception:
                     pass
 
-            result = crawler.order(product_id, quantity)
+            result = crawler.order(product_id, quantity, product_name=product_name or "")
             logger.info(
                 "telegram_order 완료: supplier=%s product=%s(%s) qty=%d success=%s msg=%s",
                 supplier_name, product_id, product_name, quantity,
