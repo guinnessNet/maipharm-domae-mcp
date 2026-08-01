@@ -1902,6 +1902,22 @@ class CloudScheduler:
             if not self._crawlers_loaded:
                 self._load_crawlers(conn)
 
+            # 재고 확인용 검색 키워드. job payload 에 없으면 DB 에서 조회한다.
+            # (product_id 로 검색하면 백제처럼 복합키를 쓰는 도매는 항상 0건이 된다)
+            product_name = job.get("product_name") or ""
+            if not product_name:
+                cur.execute(
+                    'SELECT "productName" FROM domae_urgent_orders WHERE id = %s',
+                    (urgent_order_id,),
+                )
+                name_row = cur.fetchone()
+                product_name = (name_row[0] if name_row else "") or ""
+            if not product_name:
+                logger.error(
+                    "urgent_order_immediate: product_name 확보 실패 urgent=%s — 재고 확인 불가",
+                    urgent_order_id,
+                )
+
             filled = 0
             details = []
 
@@ -1938,7 +1954,8 @@ class CloudScheduler:
                     scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     if first_scanned_at is None:
                         first_scanned_at = scanned_at
-                    search_results = crawler.search(product_id_val)
+                    # product_name 으로 검색 후 product_id 로 매칭 (위 주석 참조)
+                    search_results = crawler.search(product_name)
                     available = 0
                     for sr in search_results:
                         if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
@@ -1946,6 +1963,10 @@ class CloudScheduler:
                             break
 
                     if available == 0:
+                        logger.info(
+                            "urgent immediate: 재고 없음 또는 매칭 실패 [%s] name=%r pid=%s (검색 %d건)",
+                            supplier_name, product_name, product_id_val, len(search_results),
+                        )
                         details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "재고 없음"})
                         supplier_results[supplier_name] = {"qty": 0}
                         continue
@@ -2471,7 +2492,11 @@ class CloudScheduler:
                     scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     if first_scanned_at is None:
                         first_scanned_at = scanned_at
-                    search_results = crawler.search(product_id_val)
+                    # ⚠️ product_id 가 아니라 product_name 으로 검색한다.
+                    # product_id 는 도매별 내부 코드이며 검색 키워드가 아니다.
+                    # 예) 백제는 "ITEM_CD|ITEM_GB_CD" 복합키 → keyword 로 넘기면 0건 →
+                    #     available=0 으로 빠져 주문이 아예 시도되지 않았다.
+                    search_results = crawler.search(product_name)
                     available = 0
                     for sr in search_results:
                         if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
@@ -2479,6 +2504,10 @@ class CloudScheduler:
                             break
 
                     if available == 0:
+                        logger.info(
+                            "urgent: 재고 없음 또는 매칭 실패 [%s] name=%r pid=%s (검색 %d건)",
+                            supplier_name, product_name, product_id_val, len(search_results),
+                        )
                         supplier_results[supplier_name] = {"qty": 0}
                         continue
 
