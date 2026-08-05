@@ -455,10 +455,9 @@ class CloudScheduler:
             conn.rollback()
             logger.error("모니터 실행 실패 [%s]: %s", monitor_id, e, exc_info=True)
         finally:
-            # 획득 이후 어느 경로로 빠져나가든 락을 돌려준다. 놓치면 TTL(120초) 동안
-            # 해당 도매상의 주문·동기화가 전부 막힌다.
-            for _sn, _tok in cart_locks.items():
-                _release_cart_lock(self._redis, monitor_id, _sn, _tok)
+            # execute() 는 장바구니 락을 취득하지 않는다. 락 해제는 batch_order 전용이며
+            # 여기에 두면 cart_locks 미정의로 NameError 가 나 putconn 이 실행되지 않는다
+            # (2026-08-06 커넥션 풀 고갈 장애의 원인). finally 에는 반환만 남긴다.
             self._db_pool.putconn(conn)
 
     def _load_crawlers(self, conn):
@@ -1577,8 +1576,12 @@ class CloudScheduler:
                 # 공급사 루프 종료 시 즉시 해제. 바깥 finally 에도 같은 해제가 있지만
                 # 토큰 비교 방식이라 두 번 호출해도 무해하고, 여기서 먼저 풀면
                 # 후속 처리(텔레그램 발송 등) 동안 락을 잡고 있지 않는다.
-                for _sn, _tok in cart_locks.items():
-                    _release_cart_lock(self._redis, monitor_id, _sn, _tok)
+                # 여기서 예외가 나가면 바깥 finally 의 putconn 까지 건너뛸 수 있으므로 삼킨다.
+                try:
+                    for _sn, _tok in cart_locks.items():
+                        _release_cart_lock(self._redis, monitor_id, _sn, _tok)
+                except Exception as _e:
+                    logger.error("장바구니 락 해제 실패(루프) [%s]: %s", monitor_id, _e)
 
             # 5. batch 완료 — 집계값 + status 를 한 번에 업데이트
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1687,8 +1690,13 @@ class CloudScheduler:
         finally:
             # 획득 이후 어느 경로로 빠져나가든 락을 돌려준다. 놓치면 TTL(120초) 동안
             # 해당 도매상의 주문·동기화가 전부 막힌다. (토큰 비교라 이중 해제는 무해)
-            for _sn, _tok in cart_locks.items():
-                _release_cart_lock(self._redis, monitor_id, _sn, _tok)
+            # 락 해제가 실패해도 putconn 은 반드시 실행한다 — 커넥션 누수가 락 잔존보다
+            # 훨씬 치명적이다(락은 TTL 로 풀리지만 커넥션은 프로세스 재시작까지 안 돌아온다).
+            try:
+                for _sn, _tok in cart_locks.items():
+                    _release_cart_lock(self._redis, monitor_id, _sn, _tok)
+            except Exception as _e:
+                logger.error("장바구니 락 해제 실패 [%s]: %s", monitor_id, _e)
             self._db_pool.putconn(conn)
 
     def auto_order(self, job: dict):
