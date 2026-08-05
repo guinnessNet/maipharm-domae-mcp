@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 
+from domae_mcp.cloud.reconcile import reconcile_cart
+
 
 def _generate_cuid() -> str:
     """Prisma cuid() 호환 ID 생성 (25자, 'c'로 시작)."""
@@ -29,6 +31,128 @@ def _generate_cuid() -> str:
     return f"c{ts_part}{rand_part}"[:25]
 
 logger = logging.getLogger(__name__)
+
+# ─── 장바구니 락 / 지연 재큐잉 (설계: CART_RECONCILE_DESIGN.md 3.4) ───
+CART_LOCK_TTL = 120
+DELAYED_QUEUE = "domae:jobs:delayed"
+MAX_REQUEUE = 3
+REQUEUE_BACKOFF = [5, 15, 45]
+
+_LOCK_RELEASE_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+                     "return redis.call('del', KEYS[1]) else return 0 end")
+_LOCK_RENEW_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+                   "return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end")
+
+
+class _LockUnavailable(Exception):
+    """공급사 락을 못 잡았다 — 주문하지 말고 재큐잉해야 한다."""
+
+    def __init__(self, supplier):
+        super().__init__("%s 장바구니 락 획득 실패" % supplier)
+        self.supplier = supplier
+
+
+class _ReconcileFatal(Exception):
+    """대조가 fail-closed 판정 — 주문을 중단해야 한다."""
+
+
+def _cart_lock_key(monitor_id: str, supplier: str) -> str:
+    return f"domae:cart:lock:{monitor_id}:{supplier}"
+
+
+def _acquire_cart_lock(redis_client, monitor_id: str, supplier: str, retries: int = 1):
+    """고유 토큰으로 락 획득. 실패 시 None — 호출자는 주문을 진행하면 안 된다."""
+    token = _generate_cuid()
+    key = _cart_lock_key(monitor_id, supplier)
+    for attempt in range(retries + 1):
+        if redis_client.set(key, token, nx=True, ex=CART_LOCK_TTL):
+            return token
+        if attempt < retries:
+            time.sleep(3)
+    return None
+
+
+def _release_cart_lock(redis_client, monitor_id: str, supplier: str, token):
+    """토큰이 일치할 때만 해제. 만료 후 남의 락을 지우지 않는다."""
+    if not token:
+        return
+    try:
+        redis_client.eval(_LOCK_RELEASE_LUA, 1, _cart_lock_key(monitor_id, supplier), token)
+    except Exception as e:
+        logger.warning("장바구니 락 해제 실패 [%s]: %s", supplier, e)
+
+
+def _renew_cart_lock(redis_client, monitor_id: str, supplier: str, token) -> bool:
+    """전송 직전 lease 연장. 이미 남의 소유면 False → 주문 중단해야 한다."""
+    if not token:
+        return False
+    try:
+        return bool(redis_client.eval(_LOCK_RENEW_LUA, 1,
+                                      _cart_lock_key(monitor_id, supplier),
+                                      token, CART_LOCK_TTL * 1000))
+    except Exception as e:
+        logger.warning("장바구니 락 연장 실패 [%s]: %s", supplier, e)
+        return False
+
+
+def _requeue_delayed(redis_client, job: dict, reason: str) -> bool:
+    """지연 큐(ZSET)로 재큐잉. Redis list 에는 지연이 없어 즉시 재소비되므로 ZSET 을 쓴다.
+
+    반환 False = 재시도 소진 → 호출자가 실패로 마감해야 한다.
+    """
+    retry = int(job.get("retry_count", 0))
+    if retry >= MAX_REQUEUE:
+        logger.error("재큐잉 소진 (%d회) — %s", retry, reason)
+        return False
+    delay = REQUEUE_BACKOFF[min(retry, len(REQUEUE_BACKOFF) - 1)]
+    new_job = dict(job)
+    new_job["retry_count"] = retry + 1
+    try:
+        redis_client.zadd(DELAYED_QUEUE,
+                          {json.dumps(new_job, ensure_ascii=False): time.time() + delay})
+        logger.info("재큐잉 %d회차 (%ds 후): %s", retry + 1, delay, reason)
+        return True
+    except Exception as e:
+        logger.error("재큐잉 실패: %s", e)
+        return False
+
+
+def _record_order_result(cur, monitor_id, batch_id, supplier_name, item, *,
+                         success, message, order_id=None, adjusted_qty=None,
+                         avail_stock=None, reason_code=None):
+    """주문 결과 기록.
+
+    서버가 미리 만든 pending 행(db_order_id)이 있으면 **UPDATE** 한다. 새로 INSERT 하면
+    재큐잉·워커 재실행 때 실물 주문 1건에 DB 2행이 생긴다.
+    대조가 추가한 차집합 품목만 db_order_id 가 없어 INSERT 로 떨어진다.
+    """
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db_order_id = item.get("db_order_id")
+    if db_order_id:
+        cur.execute("""
+            UPDATE domae_cloud_orders
+            SET success = %s, message = %s, "orderId" = %s, "orderedAt" = %s,
+                "adjustedQuantity" = %s, "availableStock" = %s, "reasonCode" = %s
+            WHERE id = %s
+        """, (success, message, order_id, utc_now,
+              adjusted_qty, avail_stock, reason_code, db_order_id))
+        if cur.rowcount:
+            return
+        logger.warning("db_order_id=%s 행이 없어 신규 INSERT 로 폴백", db_order_id)
+
+    cur.execute("""
+        INSERT INTO domae_cloud_orders
+        (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
+         quantity, price, success, "productId", "orderId", message, "orderedAt",
+         "adjustedQuantity", "availableStock", "reasonCode")
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        _generate_cuid(), monitor_id, batch_id, supplier_name,
+        item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
+        int(item.get("quantity", 1)), item.get("price"), success,
+        item.get("product_id"), order_id, message, utc_now,
+        adjusted_qty, avail_stock, reason_code,
+    ))
 
 
 class CloudScheduler:
@@ -979,6 +1103,7 @@ class CloudScheduler:
             for supplier_name, group_items in supplier_groups.items():
                 cred = credentials[supplier_name]
                 crawler_cls = self._crawlers[supplier_name]
+                extra_items = []   # 대조가 배치에 편입한 차집합 품목
 
                 if supplier_name not in logged_in_crawlers:
                     crawler = crawler_cls()
@@ -1002,24 +1127,65 @@ class CloudScheduler:
                 ]
 
                 try:
-                    # SUPPORTS_CART_SYNC 모드: 장바구니 = 재고 선점 상태이므로 누락 재담기 없이 바로 위임.
-                    # 잔존 여부 확인 + 전송은 모두 크롤러 내부(order_batch)에서 처리한다.
-                    # 동시 cart_sync 작업과 경합 방지를 위해 도매상별 락만 획득.
+                    # SUPPORTS_CART_SYNC 모드: 장바구니 = 재고 선점 상태.
+                    # 대조 → 페이로드 검증 → 커밋 → 전송을 같은 락 안에서 수행한다.
                     if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
-                        lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
-                        lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
-                        if not lock_acquired:
-                            logger.warning("batch_order: %s 장바구니 락 획득 실패, 대기 후 재시도", supplier_name)
-                            time.sleep(3)
-                            lock_acquired = self._redis.set(lock_key, "1", nx=True, ex=120)
-
+                        lock_token = _acquire_cart_lock(self._redis, monitor_id, supplier_name)
+                        if not lock_token:
+                            raise _LockUnavailable(supplier_name)
                         try:
+                            rec = reconcile_cart(conn, self._redis, monitor_id,
+                                                 supplier_name, crawler)
+                            if rec.fatal:
+                                conn.rollback()
+                                raise _ReconcileFatal(rec.fatal)
+
+                            # 페이로드에 없는데 웹 카트에 있는 품목은 전송에 함께 실린다.
+                            # 기록 없이 주문되지 않도록 이번 배치에 편입한다.
+                            payload_pids = {i.get("product_id") for i in batch_items}
+                            for w in rec.web_items:
+                                if w["product_id"] in payload_pids:
+                                    continue
+                                extra = {
+                                    "product_id": w["product_id"],
+                                    "quantity": w.get("quantity", 1),
+                                    "product_name": w.get("product_name") or w["product_id"],
+                                    "price": w.get("price"),
+                                }
+                                batch_items.append(dict(extra))
+                                group_items.append((len(group_items), extra))
+                                extra_items.append(extra)
+
+                            # 대조 결과는 외부 전송 전에 durable 해야 한다 (설계 3.3 커밋 경계)
+                            conn.commit()
+
+                            if not _renew_cart_lock(self._redis, monitor_id,
+                                                    supplier_name, lock_token):
+                                raise _ReconcileFatal("전송 직전 락 상실 — 주문 중단")
+
                             results = crawler.order_batch(batch_items)
                         finally:
-                            if lock_acquired:
-                                self._redis.delete(lock_key)
+                            _release_cart_lock(self._redis, monitor_id,
+                                               supplier_name, lock_token)
                     else:
                         results = crawler.order_batch(batch_items)
+                except _LockUnavailable as e:
+                    # 주문하지 않고 재큐잉한다. 상태 전이도 하지 않아 재사용 조건을 유지한다.
+                    conn.rollback()
+                    if _requeue_delayed(self._redis, job, str(e)):
+                        cur.execute(
+                            'UPDATE domae_order_batches SET status = %s WHERE id = %s',
+                            ("pending", batch_id))
+                        conn.commit()
+                        logger.warning("batch_order 락 미획득 → 재큐잉: %s", supplier_name)
+                        return
+                    results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
+                               for _ in group_items]
+                except _ReconcileFatal as e:
+                    conn.rollback()
+                    logger.error("batch_order 대조 중단 [%s]: %s", supplier_name, e)
+                    results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
+                               for _ in group_items]
                 except Exception as e:
                     results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                                for _ in group_items]
@@ -1052,7 +1218,11 @@ class CloudScheduler:
                     "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
                 ]
                 retryable = []
-                for entry in failed:
+                # 복산 등 SUPPORTS_CART_SYNC 도매상은 전송 단위가 품목이 아니라 장바구니 전체다.
+                # 품목별 order() 재시도는 (a) 요청 외 품목 가드에 걸려 항상 거부되고
+                # (b) 통과하더라도 카트 전체를 다시 전송해 중복 주문이 된다.
+                _skip_item_retry = getattr(crawler_cls, "SUPPORTS_CART_SYNC", False)
+                for entry in ([] if _skip_item_retry else failed):
                     msg = getattr(entry[2], "message", "")
                     rcode = getattr(entry[2], "reason_code", None)
                     # reason_code 가 stock_zero/stock_adjusted 는 크롤러가 이미 판정한 확정 결과
@@ -1102,19 +1272,10 @@ class CloudScheduler:
                     avail_stock = getattr(result, "available_stock", None)
                     rcode = getattr(result, "reason_code", None) or "ok"
                     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    cur.execute("""
-                        INSERT INTO domae_cloud_orders
-                        (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                         quantity, price, success, "productId", "orderId", message, "orderedAt",
-                         "adjustedQuantity", "availableStock", "reasonCode")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        _generate_cuid(), monitor_id, batch_id, supplier_name,
-                        item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                        original_qty, order_price, True,
-                        item.get("product_id"), order_id_val, order_message, utc_now,
-                        adjusted_qty, avail_stock, rcode,
-                    ))
+                    _record_order_result(
+                        cur, monitor_id, batch_id, supplier_name, item,
+                        success=True, message=order_message, order_id=order_id_val,
+                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
                     success_count += 1
                     if rcode == "stock_adjusted" and adjusted_qty is not None:
                         missing_qty_total += max(0, original_qty - int(adjusted_qty))
@@ -1137,19 +1298,10 @@ class CloudScheduler:
                     avail_stock = getattr(result, "available_stock", None)
                     rcode = getattr(result, "reason_code", None) or "other"
                     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    cur.execute("""
-                        INSERT INTO domae_cloud_orders
-                        (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                         quantity, price, success, "productId", "orderId", message, "orderedAt",
-                         "adjustedQuantity", "availableStock", "reasonCode")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        _generate_cuid(), monitor_id, batch_id, supplier_name,
-                        item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                        original_qty, order_price, False,
-                        item.get("product_id"), None, order_message, utc_now,
-                        adjusted_qty, avail_stock, rcode,
-                    ))
+                    _record_order_result(
+                        cur, monitor_id, batch_id, supplier_name, item,
+                        success=False, message=order_message,
+                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
                     fail_count += 1
                     if rcode == "stock_zero":
                         missing_qty_total += original_qty
