@@ -9,7 +9,12 @@
 호출자 계약
   - 이 함수는 conn 의 트랜잭션에서 쓰기만 하고 커밋하지 않는다.
   - 호출자는 **외부 주문 전송 전에 반드시 커밋**해야 한다 (설계 3.3 커밋 경계).
-  - 결과의 fatal 이 설정되면 호출자는 주문을 중단해야 한다.
+  - fatal 이 설정되면 호출자는 주문을 중단하고 rollback 해야 한다.
+
+트랜잭션 주의
+  PostgreSQL 은 SQL 하나가 실패하면 트랜잭션 전체가 aborted 가 된다. 따라서
+  진실 원천(장바구니·삭제의도) 관련 SQL 실패는 **삼키지 않고 fatal** 로 올린다.
+  알림처럼 부가적인 쓰기만 SAVEPOINT 로 감싸 실패해도 본 트랜잭션을 살린다.
 """
 import json
 import logging
@@ -41,20 +46,29 @@ def _cuid():
     return _generate_cuid()
 
 
-def _load_web_cart(crawler):
-    """제품 단위로 합산된 웹 장바구니. 크롤러가 get_cart() 를 제공하지 않으면 직접 합산."""
+def _qty(value) -> int:
+    try:
+        return int(str(value).replace(",", "") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _load_web_cart(crawler) -> dict:
+    """제품 단위로 합산된 웹 장바구니 {product_id: {...}}."""
     if hasattr(crawler, "get_cart"):
-        return list(crawler.get_cart())
-    merged = {}
-    for line in crawler._get_cart_items():
-        pid = line["pc"]
-        entry = merged.setdefault(pid, {"product_id": pid, "quantity": 0, "price": 0})
-        entry["quantity"] += int(str(line.get("qty", "0")).replace(",", "") or 0)
-        entry["price"] = max(entry["price"], int(str(line.get("price", "0")).replace(",", "") or 0))
-    return list(merged.values())
+        rows = list(crawler.get_cart())
+    else:
+        merged = {}
+        for line in crawler._get_cart_items():
+            pid = line["pc"]
+            entry = merged.setdefault(pid, {"product_id": pid, "quantity": 0, "price": 0})
+            entry["quantity"] += _qty(line.get("qty"))
+            entry["price"] = max(entry["price"], _qty(line.get("price")))
+        rows = list(merged.values())
+    return {r["product_id"]: r for r in rows}
 
 
-def _load_db_items(conn, monitor_id, supplier_name):
+def _load_db_items(conn, monitor_id, supplier_name) -> dict:
     cur = conn.cursor()
     cur.execute(
         'SELECT id, "productId", quantity, "productName", price '
@@ -70,25 +84,24 @@ def _load_db_items(conn, monitor_id, supplier_name):
     }
 
 
-def _load_tombstones(conn, redis_client, monitor_id, supplier_name, product_ids):
-    """삭제 의도 조회. 진실 원천은 DB, Redis 는 캐시일 뿐이다.
+def _load_tombstones(conn, redis_client, monitor_id, supplier_name, product_ids) -> set:
+    """미확인 삭제 의도. 진실 원천은 DB, Redis 는 캐시.
 
-    테이블이 아직 없으면(마이그레이션 전) Redis 캐시만으로 동작한다.
+    DB 조회 실패는 삼키지 않는다 — 삭제 의도를 모르는 채 진행하면
+    사용자가 지운 약을 되살려 주문하게 된다. 예외를 그대로 올린다.
     """
     tombs = set()
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT to_regclass('public.domae_cart_deletions')")
-        if cur.fetchone()[0] is not None and product_ids:
-            cur.execute(
-                'SELECT "productId" FROM domae_cart_deletions '
-                'WHERE "monitorId" = %s AND supplier = %s AND "productId" = ANY(%s) '
-                'AND "confirmedAt" IS NULL',
-                (monitor_id, supplier_name, list(product_ids)),
-            )
-            tombs.update(r[0] for r in cur.fetchall())
-    except Exception as e:
-        logger.warning("삭제의도 조회 실패 (Redis 캐시로 폴백): %s", e)
+    cur.execute("SELECT to_regclass('public.domae_cart_deletions')")
+    has_table = cur.fetchone()[0] is not None
+    if has_table and product_ids:
+        cur.execute(
+            'SELECT "productId" FROM domae_cart_deletions '
+            'WHERE "monitorId" = %s AND supplier = %s AND "productId" = ANY(%s) '
+            'AND "confirmedAt" IS NULL',
+            (monitor_id, supplier_name, list(product_ids)),
+        )
+        tombs.update(r[0] for r in cur.fetchall())
 
     if redis_client is not None:
         for pid in product_ids:
@@ -97,30 +110,37 @@ def _load_tombstones(conn, redis_client, monitor_id, supplier_name, product_ids)
                                            supplier=supplier_name, product_id=pid)
                 if redis_client.get(key):
                     tombs.add(pid)
-            except Exception:
-                pass
+            except Exception as e:
+                # Redis 는 캐시일 뿐이므로 조회 실패는 치명적이지 않다.
+                logger.warning("tombstone 캐시 조회 실패 (pc=%s): %s", pid, e)
     return tombs
 
 
-def _confirm_deletion(conn, monitor_id, supplier_name, product_id):
+def _confirm_deletion(conn, redis_client, monitor_id, supplier_name, product_id):
+    """웹에서 사라진 것을 확인했으므로 삭제 의도를 확정한다.
+
+    기록 실패를 삼키면 의도가 영원히 미확인으로 남아 나중에 정상 추가한 품목까지
+    삭제 대상으로 취급된다. 예외를 그대로 올린다.
+    """
     cur = conn.cursor()
-    try:
+    cur.execute("SELECT to_regclass('public.domae_cart_deletions')")
+    if cur.fetchone()[0] is not None:
         cur.execute(
             'UPDATE domae_cart_deletions SET "confirmedAt" = now() '
             'WHERE "monitorId" = %s AND supplier = %s AND "productId" = %s '
             'AND "confirmedAt" IS NULL',
             (monitor_id, supplier_name, product_id),
         )
-    except Exception as e:
-        logger.warning("삭제 확인 기록 실패 (pc=%s): %s", product_id, e)
+    if redis_client is not None:
+        try:
+            redis_client.delete(TOMBSTONE_KEY.format(
+                monitor_id=monitor_id, supplier=supplier_name, product_id=product_id))
+        except Exception:
+            pass
 
 
 def _upsert_cart_item(conn, monitor_id, supplier_name, item):
-    """고아 항목을 DB 장바구니에 기록.
-
-    기존 실패 행(failedAt 있음)은 조회에서 빠지지만 unique 제약에는 걸리므로
-    충돌 시 되살리는 필드를 전부 명시한다.
-    """
+    """고아 항목을 DB 장바구니에 기록. 실패는 호출자가 fatal 로 처리한다."""
     cur = conn.cursor()
     cur.execute(
         'INSERT INTO domae_cart_items '
@@ -143,8 +163,31 @@ def _upsert_cart_item(conn, monitor_id, supplier_name, item):
     )
 
 
+def _in_savepoint(conn, name, fn):
+    """부가 쓰기를 SAVEPOINT 로 감싼다 — 실패해도 본 트랜잭션은 살아남는다."""
+    cur = conn.cursor()
+    cur.execute("SAVEPOINT %s" % name)
+    try:
+        fn(cur)
+    except Exception as e:
+        cur.execute("ROLLBACK TO SAVEPOINT %s" % name)
+        logger.warning("%s 실패 (본 트랜잭션은 유지): %s", name, e)
+        return False
+    cur.execute("RELEASE SAVEPOINT %s" % name)
+    return True
+
+
+def _mark_item_failed(conn, item_id, reason):
+    def _do(cur):
+        cur.execute(
+            'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = %s, '
+            '"failedAt" = now(), "failReason" = %s, "updatedAt" = now() WHERE id = %s',
+            ("failed", str(reason)[:200], "대조 재담기 실패", item_id))
+    _in_savepoint(conn, "sp_mark_failed", _do)
+
+
 def _notify(conn, monitor_id, supplier_name, result):
-    """대조로 바뀐 내용을 사용자에게 알린다. 실패해도 주문은 막지 않는다."""
+    """대조로 바뀐 내용을 알린다. 부가 기능이라 실패해도 주문은 막지 않는다."""
     if not result.changed:
         return
     parts = []
@@ -156,19 +199,18 @@ def _notify(conn, monitor_id, supplier_name, result):
         parts.append("수량 %d건 보정" % len(result.adjusted))
     body = "%s 장바구니 자동 반영 — %s" % (supplier_name, ", ".join(parts))
     notif_id = _cuid()
-    try:
-        cur = conn.cursor()
+
+    def _do(cur):
         cur.execute(
             'INSERT INTO domae_notifications '
             '(id, "monitorId", type, category, title, body, data, "isRead", "createdAt") '
             "VALUES (%s, %s, 'cart_reconcile', 'domae', %s, %s, %s, false, now())",
             (notif_id, monitor_id, "%s 장바구니 자동 반영" % supplier_name, body,
              json.dumps({"added": result.added, "restored": result.restored,
-                         "adjusted": result.adjusted}, ensure_ascii=False)),
-        )
+                         "adjusted": result.adjusted}, ensure_ascii=False)))
+
+    if _in_savepoint(conn, "sp_notify", _do):
         result.notification_ids.append(notif_id)
-    except Exception as e:
-        logger.warning("대조 알림 기록 실패: %s", e)
 
 
 def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
@@ -179,86 +221,98 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
     """
     result = ReconcileResult()
 
-    # 1. 웹 장바구니 — 못 읽으면 고아 유무를 알 수 없다 → 즉시 중단
+    def _skip(pid):
+        return in_flight_product_id is not None and pid == in_flight_product_id
+
+    # ── 1. 웹 장바구니 ──────────────────────────────────
     try:
-        web_items = _load_web_cart(crawler)
+        web = {p: v for p, v in _load_web_cart(crawler).items() if not _skip(p)}
     except Exception as e:
         result.fatal = "웹 장바구니 조회 실패: %s" % e
         logger.error("reconcile: %s", result.fatal)
         return result
-
-    def _skip(pid):
-        return in_flight_product_id is not None and pid == in_flight_product_id
-
-    web = {i["product_id"]: i for i in web_items if not _skip(i["product_id"])}
     result.web_items = list(web.values())
 
+    # ── 2. DB 장바구니 ──────────────────────────────────
     try:
-        db = _load_db_items(conn, monitor_id, supplier_name)
+        db = {p: v for p, v in _load_db_items(conn, monitor_id, supplier_name).items()
+              if not _skip(p)}
     except Exception as e:
         result.fatal = "DB 장바구니 조회 실패: %s" % e
         logger.error("reconcile: %s", result.fatal)
         return result
-    db = {pid: v for pid, v in db.items() if not _skip(pid)}
 
-    tombs = _load_tombstones(conn, redis_client, monitor_id, supplier_name,
-                             set(web) | set(db))
+    # ── 3. 삭제 의도 (진실 원천 조회 실패는 fatal) ──────────
+    try:
+        tombs = _load_tombstones(conn, redis_client, monitor_id, supplier_name,
+                                 set(web) | set(db))
+    except Exception as e:
+        result.fatal = "삭제 의도 조회 실패: %s" % e
+        logger.error("reconcile: %s", result.fatal)
+        return result
 
-    # 2. 웹에만 있는 항목
-    for pid in sorted(set(web) - set(db)):
-        item = web[pid]
-        if pid in tombs:
-            # 사용자가 지운 항목이 웹에 남아있다 — 되살리지 말고 웹에서 제거
+    # ── 4. tombstone 우선 처리 (DB 존재 여부와 무관) ────────
+    # 삭제 의도가 있는 품목은 웹에서 없애고, 절대 재담기하지 않는다.
+    for pid in sorted(tombs & (set(web) | set(db))):
+        if pid in web:
             try:
                 crawler.remove_from_cart(pid)
-                still = any(i["product_id"] == pid for i in _load_web_cart(crawler))
-                if still:
+                if pid in _load_web_cart(crawler):
                     raise RuntimeError("삭제 후에도 장바구니에 잔존")
-                _confirm_deletion(conn, monitor_id, supplier_name, pid)
             except Exception as e:
                 result.fatal = "삭제 대상 품목 제거 실패 (pc=%s): %s" % (pid, e)
                 logger.error("reconcile: %s", result.fatal)
                 return result
-            continue
+            web.pop(pid, None)
         try:
-            _upsert_cart_item(conn, monitor_id, supplier_name, item)
-            result.added.append(item)
+            _confirm_deletion(conn, redis_client, monitor_id, supplier_name, pid)
+        except Exception as e:
+            result.fatal = "삭제 확인 기록 실패 (pc=%s): %s" % (pid, e)
+            logger.error("reconcile: %s", result.fatal)
+            return result
+        if pid in db:
+            # 사용자가 지웠는데 DB 행이 남아있다 — 주문 대상에서 빼되 데이터는 지우지 않는다.
+            _mark_item_failed(conn, db[pid]["id"], "삭제 의도 있는 품목")
+            result.failed.append({"product_id": pid, "reason": "삭제 의도 있는 품목"})
+            db.pop(pid, None)
+
+    # 재검증에서 기대할 최종 상태 {제품: 수량}
+    expected = {pid: _qty(v.get("quantity")) for pid, v in web.items()}
+
+    # ── 5. 웹에만 있는 항목 → DB 기록 ─────────────────────
+    for pid in sorted(set(web) - set(db)):
+        try:
+            _upsert_cart_item(conn, monitor_id, supplier_name, web[pid])
+            result.added.append(web[pid])
         except Exception as e:
             result.fatal = "고아 항목 기록 실패 (pc=%s): %s" % (pid, e)
             logger.error("reconcile: %s", result.fatal)
             return result
 
-    # 3. DB에만 있는 항목 → 재담기 (실패해도 개별 실패로만 처리)
+    # ── 6. DB에만 있는 항목 → 재담기 (개별 실패 허용) ────────
     for pid in sorted(set(db) - set(web)):
         row = db[pid]
+        want = _qty(row.get("quantity"))
         try:
-            crawler._add_to_cart(pid, row["quantity"], price=row.get("price") or 0)
-            present = any(i["product_id"] == pid for i in _load_web_cart(crawler))
-            if not present:
-                raise RuntimeError("담기 후에도 장바구니에 없음")
+            crawler._add_to_cart(pid, want, price=row.get("price") or 0)
+            got = _qty(_load_web_cart(crawler).get(pid, {}).get("quantity"))
+            if got != want:
+                raise RuntimeError("담긴 수량 불일치 (기대 %d / 실제 %d)" % (want, got))
             cur = conn.cursor()
             cur.execute(
                 'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = NULL, '
                 '"syncedAt" = now(), "updatedAt" = now() WHERE id = %s',
                 ("synced", row["id"]))
             result.restored.append(row)
+            expected[pid] = want
         except Exception as e:
             logger.warning("reconcile 재담기 실패 (pc=%s): %s", pid, e)
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    'UPDATE domae_cart_items SET "syncStatus" = %s, "syncError" = %s, '
-                    '"failedAt" = now(), "failReason" = %s, "updatedAt" = now() '
-                    'WHERE id = %s',
-                    ("failed", str(e)[:200], "대조 재담기 실패", row["id"]))
-            except Exception:
-                pass
+            _mark_item_failed(conn, row["id"], e)
             result.failed.append({"product_id": pid, "reason": str(e)[:200]})
 
-    # 4. 양쪽에 있으나 수량이 다름 → 실제 선점된 웹 기준으로 DB 보정
+    # ── 7. 양쪽 존재, 수량 불일치 → 웹 기준으로 DB 보정 ──────
     for pid in sorted(set(web) & set(db)):
-        web_qty = int(web[pid].get("quantity") or 0)
-        db_qty = int(db[pid].get("quantity") or 0)
+        web_qty, db_qty = _qty(web[pid].get("quantity")), _qty(db[pid].get("quantity"))
         if web_qty == db_qty:
             continue
         try:
@@ -273,25 +327,25 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
             logger.error("reconcile: %s", result.fatal)
             return result
 
-    # 5. 재검증 — 대조와 전송 사이에 상태가 바뀌면 결과가 무효다
+    # ── 8. 재검증 — 제품뿐 아니라 수량까지 일치해야 한다 ──────
+    # 제품 집합만 보면 2개가 20개로 바뀐 것을 놓치고, DB 이력과 실제 전송량이 어긋난다.
     try:
-        final_items = _load_web_cart(crawler)
+        final = {p: v for p, v in _load_web_cart(crawler).items() if not _skip(p)}
     except Exception as e:
         result.fatal = "재검증 조회 실패: %s" % e
         logger.error("reconcile: %s", result.fatal)
         return result
-    final_pids = {i["product_id"] for i in final_items if not _skip(i["product_id"])}
-    expected = (set(web) | set(db)) - tombs - {f["product_id"] for f in result.failed}
-    if final_pids != expected:
+    actual = {pid: _qty(v.get("quantity")) for pid, v in final.items()}
+    if actual != expected:
         result.fatal = "재검증 불일치 (기대 %s / 실제 %s)" % (
-            sorted(expected), sorted(final_pids))
+            sorted(expected.items()), sorted(actual.items()))
         logger.error("reconcile: %s", result.fatal)
         return result
-    result.web_items = [i for i in final_items if not _skip(i["product_id"])]
+    result.web_items = list(final.values())
 
     _notify(conn, monitor_id, supplier_name, result)
 
-    if result.changed:
+    if result.changed or result.failed:
         logger.info("reconcile[%s]: 고아 %d · 재담기 %d · 수량보정 %d · 실패 %d",
                     supplier_name, len(result.added), len(result.restored),
                     len(result.adjusted), len(result.failed))
