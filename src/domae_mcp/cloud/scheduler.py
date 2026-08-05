@@ -117,6 +117,50 @@ def _requeue_delayed(redis_client, job: dict, reason: str) -> bool:
         return False
 
 
+def _fail_pending_rows(cur, batch_id, message):
+    """배치를 조기 실패시킬 때 서버가 만든 pending 주문행도 함께 마감한다.
+
+    배치만 failed 로 바꾸면 품목 이력이 success=null, message='pending' 으로 영원히 남는다.
+    """
+    cur.execute(
+        'UPDATE domae_cloud_orders SET success = false, message = %s '
+        'WHERE "batchId" = %s AND success IS NULL', (message, batch_id))
+
+
+def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
+    """확정된 주문이 이미 있으면 배치를 실제 행 기준으로 마감하고 True 를 돌려준다.
+
+    단순히 completed 로 덮으면 successCount 등 집계가 하위 행과 어긋난다.
+    """
+    cur.execute('SELECT count(*) FROM domae_cloud_orders '
+                'WHERE "batchId" = %s AND success IS NOT NULL', (batch_id,))
+    if not cur.fetchone()[0]:
+        return False
+
+    logger.error("batch 재실행 중단: batch=%s (%s)", batch_id, reason)
+    cur.execute(
+        'UPDATE domae_cloud_orders SET success = false, message = %s '
+        'WHERE "batchId" = %s AND success IS NULL', (reason, batch_id))
+    cur.execute("""
+        SELECT count(*) FILTER (WHERE success), count(*) FILTER (WHERE NOT success),
+               coalesce(sum(CASE WHEN "reasonCode" = 'stock_adjusted' THEN 1 ELSE 0 END), 0),
+               coalesce(sum(CASE WHEN "reasonCode" = 'stock_zero' THEN quantity
+                                 WHEN "adjustedQuantity" IS NOT NULL
+                                 THEN greatest(0, quantity - "adjustedQuantity")
+                                 ELSE 0 END), 0)
+        FROM domae_cloud_orders WHERE "batchId" = %s
+    """, (batch_id,))
+    ok, ng, adj, missing = cur.fetchone()
+    cur.execute("""
+        UPDATE domae_order_batches
+        SET status = %s, "completedAt" = now(), "successCount" = %s, "failCount" = %s,
+            "adjustedCount" = %s, "missingQuantity" = %s
+        WHERE id = %s
+    """, ("partial_fail" if ok else "failed", ok, ng, adj, missing, batch_id))
+    conn.commit()
+    return True
+
+
 def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_items,
                        batch_items):
     """대조 결과를 주문 페이로드에 반영한다. **외부 전송 전에** 호출해야 한다.
@@ -143,6 +187,21 @@ def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_it
                 "price": w.get("price"),
                 "cart_item_id": w.get("cart_item_id"),
             }
+            # 재실행 시 같은 배치에 이미 만들어둔 pending 행이 있으면 재사용한다.
+            # 새로 INSERT 하면 워커 재실행마다 이력과 totalItems 가 부풀어 오른다.
+            cur.execute(
+                'SELECT id FROM domae_cloud_orders WHERE "batchId" = %s AND supplier = %s '
+                'AND "productId" = %s AND success IS NULL LIMIT 1',
+                (batch_id, supplier_name, pid))
+            _existing = cur.fetchone()
+            if _existing:
+                item["db_order_id"] = _existing[0]
+                cur.execute('UPDATE domae_cloud_orders SET quantity = %s WHERE id = %s',
+                            (qty, _existing[0]))
+                payload_items.append(item)
+                batch_items.append({"product_id": pid, "quantity": qty,
+                                    "product_name": item["product_name"]})
+                continue
             new_order_id = _generate_cuid()
             cur.execute("""
                 INSERT INTO domae_cloud_orders
@@ -1098,32 +1157,24 @@ class CloudScheduler:
         try:
             cur = conn.cursor()
 
-            # 1. 멱등 게이트 — 재큐잉·재실행이 이미 확정된 주문을 다시 보내면 안 된다.
-            cur.execute(
-                'SELECT count(*) FROM domae_cloud_orders '
-                'WHERE "batchId" = %s AND success IS NOT NULL', (batch_id,))
-            _confirmed = cur.fetchone()[0]
-            if _confirmed:
-                logger.error("batch_order 중단: batch=%s 에 이미 확정된 주문 %d건 존재 "
-                             "(중복 주문 방지)", batch_id, _confirmed)
-                cur.execute("""
-                    UPDATE domae_order_batches
-                    SET status = %s, "completedAt" = now() WHERE id = %s
-                """, ("completed", batch_id))
-                cur.execute(
-                    'UPDATE domae_cloud_orders SET success = false, message = %s '
-                    'WHERE "batchId" = %s AND success IS NULL',
-                    ("이미 확정된 배치 — 재실행 중단", batch_id))
-                conn.commit()
-                return
-
-            # batch status → processing
+            # 1. 배치 소유권 **원자적** 획득.
+            # SELECT 로 확인하고 UPDATE 하면 동시 실행 둘 다 통과해 중복 주문이 된다.
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-            cur.execute(
-                'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
-                ("processing", batch_id, monitor_id)
-            )
+            cur.execute("""
+                UPDATE domae_order_batches SET status = 'processing'
+                WHERE id = %s AND "monitorId" = %s AND status = 'pending'
+                RETURNING id
+            """, (batch_id, monitor_id))
+            if cur.fetchone() is None:
+                conn.rollback()
+                logger.warning("batch_order 중단: batch=%s 소유권 획득 실패 "
+                               "(이미 처리 중이거나 마감됨)", batch_id)
+                return
             conn.commit()
+
+            # 2. 멱등 게이트 — 이미 확정된 주문이 있으면 외부 전송을 반복하면 안 된다.
+            if _finalize_if_confirmed(conn, cur, batch_id, "이미 확정된 배치 — 재실행 중단"):
+                return
 
             # 2. credentials 조회
             cur.execute("""
@@ -1180,25 +1231,6 @@ class CloudScheduler:
                     continue
                 supplier_groups.setdefault(supplier_name, []).append((idx, item))
 
-            # 4-2. 사전 실패 항목 기록
-            for idx, msg in pre_fail.items():
-                item = items[idx]
-                fail_count += 1
-                fail_lines.append(
-                    f" · [{item.get('supplier', '?')}] {item.get('product_name', '')} ×{item.get('quantity', 1)} — {msg}"
-                )
-                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                _record_order_result(
-                    cur, monitor_id, batch_id, item.get("supplier") or "", item,
-                    success=False, message=msg, reason_code="other")
-                cart_item_id = item.get("cart_item_id")
-                if cart_item_id:
-                    cur.execute(
-                        'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
-                        (utc_now, msg, cart_item_id)
-                    )
-            conn.commit()
-
             # 4-2b. cart-sync 공급사 락 **전량 선취득**.
             # 하나라도 못 잡으면 아무 공급사도 전송하지 않은 상태에서 재큐잉해야 한다.
             # 앞 공급사를 보낸 뒤 뒤 공급사에서 실패하면 재실행 때 앞 공급사가 중복 주문된다.
@@ -1233,9 +1265,34 @@ class CloudScheduler:
                 conn.commit()
                 return
 
-            # 4-3. 도매상별 일괄 주문
+            # 4-2. 사전 실패 항목 기록
+            for idx, msg in pre_fail.items():
+                item = items[idx]
+                fail_count += 1
+                fail_lines.append(
+                    f" · [{item.get('supplier', '?')}] {item.get('product_name', '')} ×{item.get('quantity', 1)} — {msg}"
+                )
+                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                _record_order_result(
+                    cur, monitor_id, batch_id, item.get("supplier") or "", item,
+                    success=False, message=msg, reason_code="other")
+                cart_item_id = item.get("cart_item_id")
+                if cart_item_id:
+                    cur.execute(
+                        'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                        (utc_now, msg, cart_item_id)
+                    )
+            conn.commit()
+
+            # 4-3. 도매상별 일괄 주문.
+            # cart-sync 공급사를 먼저 처리한다. 뒤로 밀면 앞 공급사 처리 시간만큼
+            # lease 가 소진돼 전송 직전 락 상실로 떨어질 확률이 커진다.
+            _ordered = sorted(
+                supplier_groups.items(),
+                key=lambda kv: 0 if kv[0] in cart_locks else 1)
+            _sent_any = False   # 외부 전송을 한 번이라도 했는가 (재큐잉 안전성 판단)
             try:
-              for supplier_name, group_items in supplier_groups.items():
+              for supplier_name, group_items in _ordered:
                 cred = credentials[supplier_name]
                 crawler_cls = self._crawlers[supplier_name]
 
@@ -1292,13 +1349,27 @@ class CloudScheduler:
                                 # 실패로 확정하지 말고 재시도 가능 상태로 올린다.
                                 raise _LockUnavailable(supplier_name)
 
-                            results = crawler.order_batch(batch_items)
+                            _sent_any = True
+                        results = crawler.order_batch(batch_items)
                     else:
+                        _sent_any = True
                         results = crawler.order_batch(batch_items)
                 except _LockUnavailable as e:
-                    # 선취득이 실패하면 루프 진입 전에 이미 재큐잉된다. 여기 오면 방어적 처리.
+                    # lease 만료 등으로 전송 직전 락을 잃은 경우. 이 공급사는 전송하지 않았다.
                     conn.rollback()
-                    logger.error("batch_order 락 상실 [%s]: %s", supplier_name, e)
+                    if not _sent_any:
+                        # 아직 아무 공급사도 전송하지 않았으면 통째로 재큐잉해도 안전하다.
+                        if _requeue_delayed(self._redis, job, "lease 상실: %s" % supplier_name):
+                            cur.execute(
+                                'UPDATE domae_order_batches SET status = %s WHERE id = %s',
+                                ("pending", batch_id))
+                            conn.commit()
+                            logger.warning("batch_order lease 상실 → 미전송 재큐잉: %s",
+                                           supplier_name)
+                            return
+                    # 이미 전송한 공급사가 있으면 재큐잉이 중복 주문을 만든다 → 이 공급사만 실패.
+                    logger.error("batch_order 락 상실 [%s] (전송분 존재로 재큐잉 안 함): %s",
+                                 supplier_name, e)
                     results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                                for _ in group_items]
                 except _ReconcileFatal as e:
@@ -1603,6 +1674,7 @@ class CloudScheduler:
             row = cur.fetchone()
             if not row:
                 self._update_auto_order_log(conn, monitor_id, batch_id, "failed", "모니터 없음 또는 비활성")
+                _fail_pending_rows(cur, batch_id, "모니터 없음 또는 비활성")
                 cur.execute(
                     'UPDATE domae_order_batches SET status = %s WHERE id = %s',
                     ("failed", batch_id)
@@ -1622,6 +1694,7 @@ class CloudScheduler:
             cred = credentials.get(supplier_name)
             if not cred:
                 self._update_auto_order_log(conn, monitor_id, batch_id, "failed", f"{supplier_name} 계정 미등록")
+                _fail_pending_rows(cur, batch_id, f"{supplier_name} 계정 미등록")
                 cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
                 conn.commit()
                 if telegram_chat_id:
@@ -1633,6 +1706,7 @@ class CloudScheduler:
             crawler_cls = self._crawlers.get(supplier_name)
             if not crawler_cls:
                 self._update_auto_order_log(conn, monitor_id, batch_id, "failed", f"{supplier_name} 크롤러 없음")
+                _fail_pending_rows(cur, batch_id, f"{supplier_name} 크롤러 없음")
                 cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
                 conn.commit()
                 if telegram_chat_id:
@@ -2567,6 +2641,26 @@ class CloudScheduler:
                 self._cart_sync_respond(response_key, success, message)
                 logger.info("cart_sync %s: monitor=%s supplier=%s pid=%s → %s",
                             action, monitor_id, supplier_name, product_id, message)
+
+                # 설계 B — 액션이 끝난 뒤(그 전이 아니라) 나머지 품목을 대조한다.
+                # 액션 전에 하면 사용자가 방금 바꾼 수량을 웹 기준으로 되돌린다.
+                # 처리 중인 제품은 in-flight 로 제외한다.
+                # 여기서의 대조는 드리프트 수렴이 목적이라 실패해도 동기화 결과를 뒤집지 않는다.
+                if success:
+                    try:
+                        rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name,
+                                             crawler, in_flight_product_id=product_id)
+                        if rec.fatal:
+                            conn.rollback()
+                            logger.warning("cart_sync 후 대조 중단: %s", rec.fatal)
+                        else:
+                            conn.commit()
+                            if rec.changed:
+                                logger.info("cart_sync 후 대조 반영: 고아 %d · 재담기 %d · 보정 %d",
+                                            len(rec.added), len(rec.restored), len(rec.adjusted))
+                    except Exception as _e:
+                        conn.rollback()
+                        logger.warning("cart_sync 후 대조 실패: %s", _e)
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, lock_token)
 
