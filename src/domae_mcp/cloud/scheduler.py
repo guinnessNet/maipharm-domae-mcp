@@ -1138,8 +1138,12 @@ class CloudScheduler:
                 if single_token:
                     # 단건은 재담기를 끈다. 켜두면 요청하지 않은 품목이 웹 카트에 들어가
                     # 전량 전송에 휩쓸린다(대조가 바로주문을 깨는 회귀).
-                    rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name, crawler,
-                                         in_flight_product_id=product_id, restore=False)
+                    rec = reconcile_cart(
+                        conn, self._redis, monitor_id, supplier_name, crawler,
+                        in_flight_product_id=product_id, restore=False,
+                        exclude_batch_id=db_batch_id,
+                        renew_cb=lambda: _renew_cart_lock(
+                            self._redis, monitor_id, supplier_name, single_token))
                     if rec.fatal:
                         conn.rollback()
                         _finalize(success=False, order_id=None,
@@ -1374,8 +1378,11 @@ class CloudScheduler:
                         if not lock_token:
                             raise _LockUnavailable(supplier_name)
                         if True:
-                            rec = reconcile_cart(conn, self._redis, monitor_id,
-                                                 supplier_name, crawler)
+                            rec = reconcile_cart(
+                                conn, self._redis, monitor_id, supplier_name, crawler,
+                                exclude_batch_id=batch_id,
+                                renew_cb=lambda: _renew_cart_lock(
+                                    self._redis, monitor_id, supplier_name, lock_token))
                             if rec.fatal:
                                 conn.rollback()
                                 raise _ReconcileFatal(rec.fatal)
@@ -1795,7 +1802,11 @@ class CloudScheduler:
                     if not ao_token:
                         raise _LockUnavailable(supplier_name)
 
-                    rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name, crawler)
+                    rec = reconcile_cart(
+                        conn, self._redis, monitor_id, supplier_name, crawler,
+                        exclude_batch_id=batch_id,
+                        renew_cb=lambda: _renew_cart_lock(
+                            self._redis, monitor_id, supplier_name, ao_token))
                     if rec.fatal:
                         conn.rollback()
                         raise _ReconcileFatal(rec.fatal)
@@ -1828,6 +1839,8 @@ class CloudScheduler:
                 results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
                            for _ in items]
             except Exception as e:
+                # 대조 중 만든 pending 행이 커밋되면 고아가 된다 (batch_order 와 동일 처리)
+                conn.rollback()
                 results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                            for _ in items]
             finally:

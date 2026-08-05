@@ -162,6 +162,28 @@ def _confirm_deletion(conn, redis_client, monitor_id, supplier_name, product_id)
             pass
 
 
+def _has_unconfirmed_orders(conn, monitor_id, supplier_name, exclude_batch_id):
+    """이 도매상에 결과 미확정(success IS NULL) 주문이 다른 배치에 있는가.
+
+    전송 성공 직후 워커가 죽으면 실물 주문은 나갔는데 DB 는 미확정으로 남고
+    장바구니 행도 지워지지 않는다. 그 상태에서 다음 대조가 재담기하면
+    **같은 물량이 물리적으로 두 번 주문된다.** 미확정이 남아 있으면 재담기하지 않는다.
+    """
+    cur = conn.cursor()
+    if exclude_batch_id:
+        cur.execute(
+            'SELECT count(*) FROM domae_cloud_orders '
+            'WHERE "monitorId" = %s AND supplier = %s AND success IS NULL '
+            'AND ("batchId" IS NULL OR "batchId" <> %s)',
+            (monitor_id, supplier_name, exclude_batch_id))
+    else:
+        cur.execute(
+            'SELECT count(*) FROM domae_cloud_orders '
+            'WHERE "monitorId" = %s AND supplier = %s AND success IS NULL',
+            (monitor_id, supplier_name))
+    return cur.fetchone()[0]
+
+
 def _upsert_cart_item(conn, monitor_id, supplier_name, item) -> str:
     """고아 항목을 DB 장바구니에 기록하고 **행 id 를 돌려준다**.
 
@@ -259,7 +281,8 @@ def _notify(conn, monitor_id, supplier_name, result):
 
 
 def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
-                   *, in_flight_product_id=None, restore=True) -> ReconcileResult:
+                   *, in_flight_product_id=None, restore=True,
+                   exclude_batch_id=None, renew_cb=None) -> ReconcileResult:
     """웹 장바구니와 DB 장바구니를 대조하고 차이를 보정한다.
 
     fatal 이 설정되면 호출자는 **주문을 중단**해야 한다 (설계 3.3).
@@ -299,6 +322,10 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
     # ── 4. tombstone 우선 처리 (DB 존재 여부와 무관) ────────
     # 삭제 의도가 있는 품목은 웹에서 없애고, 절대 재담기하지 않는다.
     for pid in sorted(tombs & (set(web) | set(db))):
+        if renew_cb is not None and not renew_cb():
+            result.fatal = "삭제 처리 중 락 상실 — 중단"
+            logger.error("reconcile: %s", result.fatal)
+            return result
         if pid in web:
             try:
                 crawler.remove_from_cart(pid)
@@ -338,7 +365,27 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
     # ── 6. DB에만 있는 항목 → 재담기 (개별 실패 허용) ────────
     # restore=False 는 단건 주문 경로용. 거기서 재담기하면 요청하지도 않은 품목이
     # 웹 카트에 들어가 전량 전송에 휩쓸린다.
-    for pid in (sorted(set(db) - set(web)) if restore else []):
+    _to_restore = sorted(set(db) - set(web)) if restore else []
+    if _to_restore:
+        try:
+            pending = _has_unconfirmed_orders(conn, monitor_id, supplier_name,
+                                              exclude_batch_id)
+        except Exception as e:
+            result.fatal = "미확정 주문 확인 실패: %s" % e
+            logger.error("reconcile: %s", result.fatal)
+            return result
+        if pending:
+            # 웹 카트가 빈 이유가 "이미 주문돼서" 일 수 있다. 재담기하면 재주문이 된다.
+            result.fatal = ("결과 미확정 주문 %d건 존재 — 재담기 중단 "
+                            "(전송 후 크래시 시 중복 주문 방지)" % pending)
+            logger.error("reconcile: %s", result.fatal)
+            return result
+
+    for pid in _to_restore:
+        if renew_cb is not None and not renew_cb():
+            result.fatal = "재담기 중 락 상실 — 중단"
+            logger.error("reconcile: %s", result.fatal)
+            return result
         row = db[pid]
         want = _qty(row.get("quantity"))
         try:
