@@ -41,11 +41,30 @@ class CloudWorker:
         logger.info("워커 종료 시작...")
         self._running = False
 
+
+    def _drain_delayed(self):
+        """지연 큐(ZSET)에서 만기 잡을 우선 큐로 옮긴다.
+
+        Redis list 에는 지연 기능이 없어, 락 경합으로 재큐잉된 잡을 그냥 되넣으면
+        즉시 다시 집어 폭주한다. score(=재시도 시각)가 지난 것만 꺼낸다.
+        """
+        try:
+            now = time.time()
+            due = self._redis.zrangebyscore("domae:jobs:delayed", 0, now, start=0, num=20)
+            for member in due:
+                # 다른 워커와 경합해도 한 번만 옮기도록 zrem 성공한 쪽만 처리
+                if self._redis.zrem("domae:jobs:delayed", member):
+                    self._redis.lpush("domae:jobs:urgent", member)
+                    logger.info("지연 잡 재투입")
+        except Exception as e:
+            logger.warning("지연 큐 처리 실패: %s", e)
+
     def run(self):
         logger.info("도매 클라우드 워커 시작 (우선순위 큐 지원)")
 
         while self._running:
             try:
+                self._drain_delayed()
                 result = self._redis.brpop(["domae:jobs:urgent", "domae:jobs"], timeout=5)
                 if result is None:
                     continue

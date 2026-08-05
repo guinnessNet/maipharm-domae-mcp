@@ -965,7 +965,32 @@ class CloudScheduler:
                         supplier_name, product_name_hint, e,
                     )
             # product_name 을 crawler.order 에 전달 → Phase 2 fallback 의 refetch_stock 이 search 기반 폴백 사용 가능
-            result = crawler.order(product_id, quantity, product_name=product_name_hint)
+            # 단건 주문도 대조·전송이 같은 락 안에서 이뤄져야 한다. 락이 없으면
+            # cart_sync 가 끼어들어 카트가 바뀐 채로 전송될 수 있다.
+            single_token = None
+            if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
+                single_token = _acquire_cart_lock(self._redis, monitor_id, supplier_name)
+                if not single_token:
+                    _finalize(success=False, order_id=None,
+                              message=f"{supplier_name} 장바구니 락 획득 실패 — 주문 중단")
+                    return
+            try:
+                if single_token:
+                    rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name, crawler,
+                                         in_flight_product_id=product_id)
+                    if rec.fatal:
+                        conn.rollback()
+                        _finalize(success=False, order_id=None,
+                                  message=f"대조 중단: {rec.fatal}")
+                        return
+                    conn.commit()   # 외부 전송 전 durable
+                    if not _renew_cart_lock(self._redis, monitor_id, supplier_name, single_token):
+                        _finalize(success=False, order_id=None,
+                                  message="전송 직전 락 상실 — 주문 중단")
+                        return
+                result = crawler.order(product_id, quantity, product_name=product_name_hint)
+            finally:
+                _release_cart_lock(self._redis, monitor_id, supplier_name, single_token)
 
             _finalize(
                 success=bool(result.success),
@@ -1517,24 +1542,62 @@ class CloudScheduler:
             ]
 
             # SUPPORTS_CART_SYNC 도매상은 동시 cart_sync 작업과 경합 방지를 위해 락 획득
-            ao_lock_key = None
-            ao_lock_acquired = False
-            if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
-                ao_lock_key = f"domae:cart:lock:{monitor_id}:{supplier_name}"
-                ao_lock_acquired = self._redis.set(ao_lock_key, "1", nx=True, ex=120)
-                if not ao_lock_acquired:
-                    logger.warning("auto_order: %s 장바구니 락 획득 실패, 대기 후 재시도", supplier_name)
-                    time.sleep(3)
-                    ao_lock_acquired = self._redis.set(ao_lock_key, "1", nx=True, ex=120)
-
+            ao_token = None
+            is_cart_sync = getattr(crawler_cls, "SUPPORTS_CART_SYNC", False)
             try:
+                if is_cart_sync:
+                    ao_token = _acquire_cart_lock(self._redis, monitor_id, supplier_name)
+                    if not ao_token:
+                        raise _LockUnavailable(supplier_name)
+
+                    rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name, crawler)
+                    if rec.fatal:
+                        conn.rollback()
+                        raise _ReconcileFatal(rec.fatal)
+
+                    # 페이로드에 없는 웹 카트 품목도 전송에 실리므로 배치에 편입한다.
+                    payload_pids = {i.get("product_id") for i in batch_items}
+                    for w in rec.web_items:
+                        if w["product_id"] in payload_pids:
+                            continue
+                        extra = {
+                            "product_id": w["product_id"],
+                            "quantity": w.get("quantity", 1),
+                            "product_name": w.get("product_name") or w["product_id"],
+                            "price": w.get("price"),
+                        }
+                        batch_items.append({"product_id": extra["product_id"],
+                                            "quantity": extra["quantity"],
+                                            "product_name": extra["product_name"]})
+                        items.append(extra)
+
+                    conn.commit()   # 외부 전송 전 durable (설계 3.3)
+
+                    if not _renew_cart_lock(self._redis, monitor_id, supplier_name, ao_token):
+                        raise _ReconcileFatal("전송 직전 락 상실 — 주문 중단")
+
                 results = crawler.order_batch(batch_items)
+            except _LockUnavailable as e:
+                conn.rollback()
+                if _requeue_delayed(self._redis, job, str(e)):
+                    cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s',
+                                ("pending", batch_id))
+                    conn.commit()
+                    logger.warning("auto_order 락 미획득 → 재큐잉: %s", supplier_name)
+                    _release_cart_lock(self._redis, monitor_id, supplier_name, ao_token)
+                    return
+                results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
+                           for _ in items]
+            except _ReconcileFatal as e:
+                conn.rollback()
+                logger.error("auto_order 대조 중단 [%s]: %s", supplier_name, e)
+                results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
+                           for _ in items]
             except Exception as e:
                 results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                            for _ in items]
             finally:
-                if ao_lock_key and ao_lock_acquired:
-                    self._redis.delete(ao_lock_key)
+                _release_cart_lock(self._redis, monitor_id, supplier_name, ao_token)
 
             # 길이 불일치 방어
             if len(results) != len(items):
@@ -1554,17 +1617,9 @@ class CloudScheduler:
                 order_price = item.get("price")
 
                 utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                cur.execute("""
-                    INSERT INTO domae_cloud_orders
-                    (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                     quantity, price, success, "productId", "orderId", message, "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    _generate_cuid(), monitor_id, batch_id, supplier_name,
-                    item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
-                    item.get("quantity", 1), order_price, order_success,
-                    item.get("product_id"), order_id_val, order_message, utc_now,
-                ))
+                _record_order_result(
+                    cur, monitor_id, batch_id, supplier_name, item,
+                    success=order_success, message=order_message, order_id=order_id_val)
 
                 if order_success:
                     success_count += 1
@@ -2362,6 +2417,33 @@ class CloudScheduler:
                     crawler.remove_from_cart(product_id)
                     cart = crawler._get_cart_items()
                     still_exists = any(c["pc"] == product_id for c in cart)
+                    # 웹에서 사라진 것을 확인했으면 삭제 의도를 확정한다. 확정하지 않으면
+                    # 나중에 같은 제품을 정상 추가해도 대조가 삭제 대상으로 취급한다.
+                    try:
+                        _cur = conn.cursor()
+                        _cur.execute("SELECT to_regclass('public.domae_cart_deletions')")
+                        if _cur.fetchone()[0] is not None:
+                            if not still_exists:
+                                _cur.execute(
+                                    'UPDATE domae_cart_deletions SET "confirmedAt" = now() '
+                                    'WHERE "monitorId" = %s AND supplier = %s '
+                                    'AND "productId" = %s AND "confirmedAt" IS NULL',
+                                    (monitor_id, supplier_name, product_id))
+                                try:
+                                    self._redis.delete(
+                                        f"domae:cart:tombstone:{monitor_id}:{supplier_name}:{product_id}")
+                                except Exception:
+                                    pass
+                            else:
+                                _cur.execute(
+                                    'UPDATE domae_cart_deletions SET attempts = attempts + 1 '
+                                    'WHERE "monitorId" = %s AND supplier = %s '
+                                    'AND "productId" = %s AND "confirmedAt" IS NULL',
+                                    (monitor_id, supplier_name, product_id))
+                            conn.commit()
+                    except Exception as _e:
+                        conn.rollback()
+                        logger.warning("삭제 의도 갱신 실패 (pc=%s): %s", product_id, _e)
                     success = not still_exists
                     message = "삭제 동기화 완료" if success else "삭제 실패 (항목 잔존)"
 
