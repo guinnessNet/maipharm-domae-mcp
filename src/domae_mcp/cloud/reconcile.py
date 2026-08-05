@@ -54,18 +54,41 @@ def _qty(value) -> int:
 
 
 def _load_web_cart(crawler) -> dict:
-    """제품 단위로 합산된 웹 장바구니 {product_id: {...}}."""
+    """제품 단위로 합산된 웹 장바구니 {product_id: {...}}.
+
+    복산은 한 제품이 센터별로 여러 줄에 나뉜다. `get_cart()` 가 합산해 준다고 **가정하지
+    않는다** — 크롤러 판본이 어긋나면 뒤 줄이 앞 줄을 덮어 수량이 축소되고, 재검증도 같은
+    방식으로 읽어 통과해 버린다(실제 전송량 ≠ 이력). 여기서 항상 다시 합산한다.
+    """
     if hasattr(crawler, "get_cart"):
-        rows = list(crawler.get_cart())
+        rows = [
+            {"product_id": r.get("product_id"), "quantity": r.get("quantity"),
+             "price": r.get("price"), "product_name": r.get("product_name"),
+             "cart_item_id": r.get("cart_item_id")}
+            for r in crawler.get_cart()
+        ]
     else:
-        merged = {}
-        for line in crawler._get_cart_items():
-            pid = line["pc"]
-            entry = merged.setdefault(pid, {"product_id": pid, "quantity": 0, "price": 0})
-            entry["quantity"] += _qty(line.get("qty"))
-            entry["price"] = max(entry["price"], _qty(line.get("price")))
-        rows = list(merged.values())
-    return {r["product_id"]: r for r in rows}
+        rows = [
+            {"product_id": line["pc"], "quantity": line.get("qty"),
+             "price": line.get("price"), "product_name": line.get("name")}
+            for line in crawler._get_cart_items()
+        ]
+
+    merged = {}
+    for r in rows:
+        pid = r.get("product_id")
+        if not pid:
+            continue
+        entry = merged.setdefault(
+            pid, {"product_id": pid, "quantity": 0, "price": 0, "product_name": None,
+                  "cart_item_id": None})
+        entry["quantity"] += _qty(r.get("quantity"))
+        entry["price"] = max(entry["price"], _qty(r.get("price")))
+        if not entry["product_name"] and r.get("product_name"):
+            entry["product_name"] = r["product_name"]
+        if not entry["cart_item_id"] and r.get("cart_item_id"):
+            entry["cart_item_id"] = r["cart_item_id"]
+    return merged
 
 
 def _load_db_items(conn, monitor_id, supplier_name) -> dict:
@@ -175,15 +198,27 @@ def _upsert_cart_item(conn, monitor_id, supplier_name, item) -> str:
 
 def _in_savepoint(conn, name, fn):
     """부가 쓰기를 SAVEPOINT 로 감싼다 — 실패해도 본 트랜잭션은 살아남는다."""
-    cur = conn.cursor()
-    cur.execute("SAVEPOINT %s" % name)
+    try:
+        cur = conn.cursor()
+        cur.execute("SAVEPOINT %s" % name)
+    except Exception as e:
+        # 트랜잭션이 이미 aborted 면 SAVEPOINT 자체가 실패한다. 예외를 밖으로 흘리면
+        # fatal 판정 대신 raw 예외가 되어 호출자의 fail-closed 처리가 깨진다.
+        logger.warning("%s SAVEPOINT 실패: %s", name, e)
+        return False
     try:
         fn(cur)
     except Exception as e:
-        cur.execute("ROLLBACK TO SAVEPOINT %s" % name)
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT %s" % name)
+        except Exception:
+            pass
         logger.warning("%s 실패 (본 트랜잭션은 유지): %s", name, e)
         return False
-    cur.execute("RELEASE SAVEPOINT %s" % name)
+    try:
+        cur.execute("RELEASE SAVEPOINT %s" % name)
+    except Exception:
+        pass
     return True
 
 
@@ -224,7 +259,7 @@ def _notify(conn, monitor_id, supplier_name, result):
 
 
 def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
-                   *, in_flight_product_id=None) -> ReconcileResult:
+                   *, in_flight_product_id=None, restore=True) -> ReconcileResult:
     """웹 장바구니와 DB 장바구니를 대조하고 차이를 보정한다.
 
     fatal 이 설정되면 호출자는 **주문을 중단**해야 한다 (설계 3.3).
@@ -301,7 +336,9 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
             return result
 
     # ── 6. DB에만 있는 항목 → 재담기 (개별 실패 허용) ────────
-    for pid in sorted(set(db) - set(web)):
+    # restore=False 는 단건 주문 경로용. 거기서 재담기하면 요청하지도 않은 품목이
+    # 웹 카트에 들어가 전량 전송에 휩쓸린다.
+    for pid in (sorted(set(db) - set(web)) if restore else []):
         row = db[pid]
         want = _qty(row.get("quantity"))
         try:

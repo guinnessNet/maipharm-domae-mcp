@@ -250,6 +250,22 @@ def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_it
     return added
 
 
+def _reject_unreconciled(supplier_name, crawler_cls, where):
+    """대조·락을 거치지 않는 경로에서 cart-sync 공급사 주문을 막는다.
+
+    복산처럼 전량 전송하는 도매상은 웹 카트에 있는 모든 품목이 함께 주문된다.
+    대조 없이 order() 를 부르면 우리가 모르는 품목이 기록 없이 주문된다(설계 §1.2).
+    이 경로들에 락·대조를 배선하기 전까지는 명시적으로 거부한다.
+    반환: 거부 사유 문자열 또는 None
+    """
+    if getattr(crawler_cls, "SUPPORTS_CART_SYNC", False):
+        msg = ("%s 은(는) 장바구니 전량 전송 방식이라 %s 경로에서 주문할 수 없습니다 "
+               "— 장바구니 주문을 이용하세요" % (supplier_name, where))
+        logger.warning("대조 미배선 경로 차단: supplier=%s where=%s", supplier_name, where)
+        return msg
+    return None
+
+
 def _record_order_result(cur, monitor_id, batch_id, supplier_name, item, *,
                          success, message, order_id=None, adjusted_qty=None,
                          avail_stock=None, reason_code=None):
@@ -1120,14 +1136,23 @@ class CloudScheduler:
                     return
             try:
                 if single_token:
+                    # 단건은 재담기를 끈다. 켜두면 요청하지 않은 품목이 웹 카트에 들어가
+                    # 전량 전송에 휩쓸린다(대조가 바로주문을 깨는 회귀).
                     rec = reconcile_cart(conn, self._redis, monitor_id, supplier_name, crawler,
-                                         in_flight_product_id=product_id)
+                                         in_flight_product_id=product_id, restore=False)
                     if rec.fatal:
                         conn.rollback()
                         _finalize(success=False, order_id=None,
                                   message=f"대조 중단: {rec.fatal}")
                         return
                     conn.commit()   # 외부 전송 전 durable
+                    # in_flight 로 요청 제품을 뺐으므로 web_items 는 곧 "요청 외 품목" 이다.
+                    # 복산은 전량 전송이라 이게 남아 있으면 기록 없는 동반 주문이 된다.
+                    if rec.web_items:
+                        _finalize(success=False, order_id=None,
+                                  message="장바구니에 요청 외 품목 %s 존재 — 주문 중단"
+                                          % sorted(w["product_id"] for w in rec.web_items))
+                        return
                     if not _renew_cart_lock(self._redis, monitor_id, supplier_name, single_token):
                         _finalize(success=False, order_id=None,
                                   message="전송 직전 락 상실 — 주문 중단")
@@ -1402,6 +1427,9 @@ class CloudScheduler:
                     results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
                                for _ in group_items]
                 except Exception as e:
+                    # 대조 중 만든 pending 행이 커밋되면 아무도 마감하지 않는 고아가 된다.
+                    # 대조분을 통째로 버린다.
+                    conn.rollback()
                     results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
                                for _ in group_items]
 
@@ -1604,6 +1632,9 @@ class CloudScheduler:
             logger.error("batch_order 실패 [%s]: %s", batch_id, e, exc_info=True)
             try:
                 cur = conn.cursor()
+                # 서버가 만든 pending 주문행을 마감하지 않으면 success=null 로 영구 잔존한다.
+                # crawler.login() 이 공급사 루프의 inner try 밖이라 로그인 실패로도 여기 온다.
+                _fail_pending_rows(cur, batch_id, str(e)[:200])
                 # 중간까지 처리된 집계값 보존하면서 status=failed 로 마킹
                 cur.execute("""
                     UPDATE domae_order_batches
@@ -1886,6 +1917,7 @@ class CloudScheduler:
             logger.error("auto_order 실패 [%s/%s]: %s", batch_id, supplier_name, e, exc_info=True)
             try:
                 cur = conn.cursor()
+                _fail_pending_rows(cur, batch_id, str(e)[:200])
                 cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
                 conn.commit()
             except Exception:
@@ -2181,6 +2213,9 @@ class CloudScheduler:
                 except Exception:
                     pass
 
+            _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
+            if _reject:
+                raise RuntimeError(_reject)
             result = crawler.order(product_id, quantity, product_name=product_name or "")
 
             if result.success:
@@ -2383,6 +2418,9 @@ class CloudScheduler:
 
                     # 주문 실행
                     order_qty = min(need, available)
+                    _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
+                    if _reject:
+                        raise RuntimeError(_reject)
                     result = crawler.order(product_id_val, order_qty)
 
                     if result.success:
@@ -2668,8 +2706,21 @@ class CloudScheduler:
                                 _cur.execute(
                                     'UPDATE domae_cart_deletions SET attempts = attempts + 1 '
                                     'WHERE "monitorId" = %s AND supplier = %s '
-                                    'AND "productId" = %s AND "confirmedAt" IS NULL',
+                                    'AND "productId" = %s AND "confirmedAt" IS NULL '
+                                    'RETURNING attempts',
                                     (monitor_id, supplier_name, product_id))
+                                _row = _cur.fetchone()
+                                _attempts = _row[0] if _row else 0
+                                # 미확정 tombstone 을 방치하면 이후 모든 주문에서 대조가
+                                # 삭제를 재시도하다 fatal 로 떨어져 해당 도매상 주문이
+                                # 무기한 중단된다. 재시도하고, 누적되면 사람에게 알린다.
+                                if _attempts >= 5:
+                                    self._notify_deletion_stuck(conn, monitor_id,
+                                                                supplier_name, product_id)
+                                else:
+                                    _requeue_delayed(self._redis, job,
+                                                     "웹 삭제 실패 재시도 pc=%s (%d회)"
+                                                     % (product_id, _attempts))
                             conn.commit()
                     except Exception as _e:
                         conn.rollback()
@@ -2886,6 +2937,9 @@ class CloudScheduler:
                 except Exception:
                     pass
 
+            _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
+            if _reject:
+                raise RuntimeError(_reject)
             result = crawler.order(product_id, quantity, product_name=product_name or "")
             logger.info(
                 "telegram_order 완료: supplier=%s product=%s(%s) qty=%d success=%s msg=%s",
@@ -3014,6 +3068,9 @@ class CloudScheduler:
                         continue
 
                     order_qty = min(remaining - filled_this_round, available)
+                    _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
+                    if _reject:
+                        raise RuntimeError(_reject)
                     result = crawler.order(product_id_val, order_qty)
 
                     if result.success:
