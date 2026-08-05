@@ -51,6 +51,27 @@ class CrawlerError(Exception):
     pass
 
 
+# (연결, 응답) 초. requests 는 timeout 을 주지 않으면 무한 대기한다.
+# 도매몰이 TCP 는 받아놓고 응답을 안 주면 그 잡이 영원히 끝나지 않고,
+# 워커는 잡을 직렬 처리하므로 전 약국의 검색·주문이 함께 멈춘다.
+# (2026-08-06 커넥션 풀 고갈 장애 조사 중 발견한 잠재 정지 경로)
+DEFAULT_HTTP_TIMEOUT = (10, 30)
+
+
+class _TimeoutSession(requests.Session):
+    """timeout 을 명시하지 않은 호출에 기본값을 채워 넣는 세션.
+
+    get/post/head 등은 모두 Session.request 를 거치므로 여기 한 곳만 덮으면
+    14개 크롤러를 수정하지 않고도 전 HTTP 호출에 상한이 걸린다.
+    호출자가 timeout 을 직접 준 경우에는 그 값을 존중한다.
+    """
+
+    def request(self, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = DEFAULT_HTTP_TIMEOUT
+        return super().request(*args, **kwargs)
+
+
 class BaseCrawler(ABC):
     """도매상 크롤러 기본 클래스.
 
@@ -62,7 +83,7 @@ class BaseCrawler(ABC):
     SUPPORTS_CART_SYNC: bool = False
 
     def __init__(self):
-        self.session = requests.Session()
+        self.session = _TimeoutSession()
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

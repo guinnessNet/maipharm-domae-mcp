@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -31,6 +32,11 @@ def _generate_cuid() -> str:
     return f"c{ts_part}{rand_part}"[:25]
 
 logger = logging.getLogger(__name__)
+
+# 전 도매 검색이 끝나기를 기다리는 상한(초). 정상값은 55품목·5도매 기준 약 13초라
+# 20배 이상 여유. 초과분은 그 도매만 결과에서 빠지고 나머지는 정상 반영된다.
+# 이 시한이 없으면 응답 없는 도매 하나가 워커 전체를 세운다.
+SUPPLIER_SCAN_TIMEOUT = 300
 
 # ─── 장바구니 락 / 지연 재큐잉 (설계: CART_RECONCILE_DESIGN.md 3.4) ───
 CART_LOCK_TTL = 120
@@ -382,22 +388,36 @@ class CloudScheduler:
                 logger.warning("검색 대상 도매업체 없음 [%s] — 건너뜀", monitor_id)
                 return
 
-            with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
+            # with 블록을 쓰지 않는다 — 종료 시 shutdown(wait=True) 가 멈춘 스레드를
+            # 무한정 기다린다. 워커는 잡을 직렬 처리하므로 그동안 전 약국이 함께 멈춘다.
+            # as_completed 에도 시한을 걸어야 한다. 시한 없이 두면 다음 완료를 기다리며
+            # 블록되어 future.result(timeout=...) 까지 도달하지도 못한다.
+            executor = ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8))
+            try:
                 futures = {
                     executor.submit(
                         self._search_supplier, name, cls, cred, products
                     ): name
                     for name, (cls, cred) in target_suppliers.items()
                 }
-                for future in as_completed(futures):
-                    supplier = futures[future]
-                    try:
-                        ret = future.result(timeout=120)
-                        # _search_supplier는 하위 호환 위해 dict 반환
-                        results = ret["results"] if isinstance(ret, dict) else ret
-                        all_results.extend(results)
-                    except Exception as e:
-                        logger.error("도매 검색 실패 [%s]: %s", supplier, e)
+                try:
+                    for future in as_completed(futures, timeout=SUPPLIER_SCAN_TIMEOUT):
+                        supplier = futures[future]
+                        try:
+                            ret = future.result()
+                            # _search_supplier는 하위 호환 위해 dict 반환
+                            results = ret["results"] if isinstance(ret, dict) else ret
+                            all_results.extend(results)
+                        except Exception as e:
+                            logger.error("도매 검색 실패 [%s]: %s", supplier, e)
+                except FuturesTimeoutError:
+                    stalled = [n for f, n in futures.items() if not f.done()]
+                    logger.error(
+                        "도매 검색 시한 초과 [%s] — 미완료 도매 %s (해당 도매 결과만 누락, 나머지는 반영)",
+                        monitor_id, stalled,
+                    )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # 4. 변동 감지 — 저장 BEFORE (prev baseline이 현재 save에 덮이지 않도록)
             # 전 도매 스캔 완료 후 제품별 합산 기준으로 drop 감지 (프론트 "재고모니터링"과 동일 기준)
@@ -958,16 +978,26 @@ class CloudScheduler:
                         "error": str(e),
                     }))
 
-            with ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8)) as executor:
+            # with 미사용 이유는 execute() 와 동일 — 멈춘 스레드를 기다리면 워커 전체가 멈춘다.
+            executor = ThreadPoolExecutor(max_workers=min(len(target_suppliers), 8))
+            try:
                 futures = [
                     executor.submit(_search_and_stream, name, cls, cred)
                     for name, (cls, cred) in target_suppliers.items()
                 ]
-                for future in as_completed(futures):
-                    try:
-                        future.result(timeout=120)
-                    except Exception as e:
-                        logger.error("search_on_demand 스레드 에러: %s", e)
+                try:
+                    for future in as_completed(futures, timeout=SUPPLIER_SCAN_TIMEOUT):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error("search_on_demand 스레드 에러: %s", e)
+                except FuturesTimeoutError:
+                    logger.error(
+                        "search_on_demand 시한 초과 [%s] — 미완료 %d건",
+                        monitor_id, sum(1 for f in futures if not f.done()),
+                    )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # 5. 전체 완료
             self._redis.lpush(stream_key, json.dumps({"type": "done"}))
@@ -2114,15 +2144,25 @@ class CloudScheduler:
                 logger.debug("대체 검색 실패 [%s/%s]: %s", sup, product_name, e)
                 return None
 
-        with ThreadPoolExecutor(max_workers=min(len(available_suppliers), 5)) as executor:
+        # with 미사용 이유는 execute() 와 동일 — 멈춘 스레드를 기다리면 워커 전체가 멈춘다.
+        executor = ThreadPoolExecutor(max_workers=min(len(available_suppliers), 5))
+        try:
             futures = {executor.submit(_search_one, sup): sup for sup in available_suppliers}
-            for future in as_completed(futures):
-                try:
-                    result = future.result(timeout=60)
-                    if result:
-                        results.append(result)
-                except Exception:
-                    pass
+            try:
+                for future in as_completed(futures, timeout=SUPPLIER_SCAN_TIMEOUT):
+                    try:
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                    except Exception:
+                        pass
+            except FuturesTimeoutError:
+                logger.error(
+                    "대체 도매 검색 시한 초과 — 미완료 %d건",
+                    sum(1 for f in futures if not f.done()),
+                )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return results
 
