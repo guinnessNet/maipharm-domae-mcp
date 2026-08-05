@@ -15,6 +15,10 @@ from domae_mcp.cloud.scheduler import CloudScheduler
 
 logger = logging.getLogger(__name__)
 
+# ZSET 제거 + list 삽입을 한 번에 — 중간에 죽어도 잡이 유실되지 않는다.
+_MOVE_DELAYED_LUA = ("if redis.call('zrem', KEYS[1], ARGV[1]) == 1 then "
+                     "redis.call('lpush', KEYS[2], ARGV[1]) return 1 else return 0 end")
+
 
 class CloudWorker:
     def __init__(self):
@@ -52,9 +56,10 @@ class CloudWorker:
             now = time.time()
             due = self._redis.zrangebyscore("domae:jobs:delayed", 0, now, start=0, num=20)
             for member in due:
-                # 다른 워커와 경합해도 한 번만 옮기도록 zrem 성공한 쪽만 처리
-                if self._redis.zrem("domae:jobs:delayed", member):
-                    self._redis.lpush("domae:jobs:urgent", member)
+                # ZREM 과 LPUSH 사이에 죽으면 잡이 사라진다. Lua 로 원자화한다.
+                moved = self._redis.eval(_MOVE_DELAYED_LUA, 2,
+                                         "domae:jobs:delayed", "domae:jobs:urgent", member)
+                if moved:
                     logger.info("지연 잡 재투입")
         except Exception as e:
             logger.warning("지연 큐 처리 실패: %s", e)

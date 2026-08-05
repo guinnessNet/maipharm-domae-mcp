@@ -139,8 +139,12 @@ def _confirm_deletion(conn, redis_client, monitor_id, supplier_name, product_id)
             pass
 
 
-def _upsert_cart_item(conn, monitor_id, supplier_name, item):
-    """고아 항목을 DB 장바구니에 기록. 실패는 호출자가 fatal 로 처리한다."""
+def _upsert_cart_item(conn, monitor_id, supplier_name, item) -> str:
+    """고아 항목을 DB 장바구니에 기록하고 **행 id 를 돌려준다**.
+
+    id 를 돌려주지 않으면 호출자가 주문 성공 후 그 장바구니 행을 지우지 못해,
+    다음 대조가 같은 품목을 "DB에만 있음"으로 보고 웹에 다시 담는 루프가 생긴다.
+    """
     cur = conn.cursor()
     cur.execute(
         'INSERT INTO domae_cart_items '
@@ -161,6 +165,12 @@ def _upsert_cart_item(conn, monitor_id, supplier_name, item):
          item.get("product_name") or item["product_id"],
          item.get("quantity") or 0, item.get("price") or 0),
     )
+    cur.execute(
+        'SELECT id FROM domae_cart_items WHERE "monitorId" = %s AND "productId" = %s '
+        'AND supplier = %s',
+        (monitor_id, item["product_id"], supplier_name))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def _in_savepoint(conn, name, fn):
@@ -282,7 +292,8 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
     # ── 5. 웹에만 있는 항목 → DB 기록 ─────────────────────
     for pid in sorted(set(web) - set(db)):
         try:
-            _upsert_cart_item(conn, monitor_id, supplier_name, web[pid])
+            new_id = _upsert_cart_item(conn, monitor_id, supplier_name, web[pid])
+            web[pid]["cart_item_id"] = new_id
             result.added.append(web[pid])
         except Exception as e:
             result.fatal = "고아 항목 기록 실패 (pc=%s): %s" % (pid, e)
@@ -335,6 +346,15 @@ def reconcile_cart(conn, redis_client, monitor_id, supplier_name, crawler,
         result.fatal = "재검증 조회 실패: %s" % e
         logger.error("reconcile: %s", result.fatal)
         return result
+    # 호출자가 주문 성공 후 DB 장바구니 행을 지울 수 있도록 id 를 실어준다.
+    id_map = {pid: row["id"] for pid, row in db.items()}
+    for a in result.added:
+        if a.get("cart_item_id"):
+            id_map[a["product_id"]] = a["cart_item_id"]
+    for pid, v in final.items():
+        if pid in id_map:
+            v["cart_item_id"] = id_map[pid]
+
     actual = {pid: _qty(v.get("quantity")) for pid, v in final.items()}
     if actual != expected:
         result.fatal = "재검증 불일치 (기대 %s / 실제 %s)" % (
