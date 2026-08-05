@@ -154,12 +154,14 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
         FROM domae_cloud_orders WHERE "batchId" = %s
     """, (batch_id,))
     ok, ng, adj, missing = cur.fetchone()
+    # 정상 완료 경로가 실패 품목이 있어도 'completed' 를 쓰므로 같은 관례를 따른다.
+    # 여기서만 'partial_fail' 같은 신규 상태를 쓰면 조회 API·화면과 어긋난다.
     cur.execute("""
         UPDATE domae_order_batches
         SET status = %s, "completedAt" = now(), "successCount" = %s, "failCount" = %s,
             "adjustedCount" = %s, "missingQuantity" = %s
         WHERE id = %s
-    """, ("partial_fail" if ok else "failed", ok, ng, adj, missing, batch_id))
+    """, ("completed" if ok else "failed", ok, ng, adj, missing, batch_id))
     conn.commit()
     return True
 
@@ -1673,11 +1675,6 @@ class CloudScheduler:
                 return
 
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-            cur.execute(
-                'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
-                ("processing", batch_id, monitor_id)
-            )
-            conn.commit()
 
             # 2. credentials + telegramChatId 조회 (isActive 체크 포함)
             cur.execute("""
@@ -2517,6 +2514,26 @@ class CloudScheduler:
         finally:
             self._db_pool.putconn(conn)
 
+    def _notify_deletion_stuck(self, conn, monitor_id, supplier_name, product_id):
+        """삭제의도 확정이 재시도까지 실패했을 때 사용자에게 알린다.
+
+        조용히 두면 미확인 tombstone 이 남아 나중에 정상 추가한 품목까지 삭제된다.
+        """
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                'INSERT INTO domae_notifications '
+                '(id, "monitorId", type, category, title, body, "isRead", "createdAt") '
+                "VALUES (%s, %s, 'cart_deletion_stuck', 'domae', %s, %s, false, now())",
+                (_generate_cuid(), monitor_id, "%s 장바구니 삭제 확인 실패" % supplier_name,
+                 "제품 %s 의 삭제 확인을 기록하지 못했습니다. 해당 제품을 다시 담으면 "
+                 "정상화됩니다." % product_id))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.warning("삭제 정체 알림 실패: %s", e)
+
+
     def cart_sync(self, job: dict):
         """장바구니 동기화 — PharmSquare 장바구니 변경을 도매몰에 실시간 반영.
         SUPPORTS_CART_SYNC=True인 도매상(복산 등)에서만 동작.
@@ -2653,8 +2670,16 @@ class CloudScheduler:
                     elif not _deletion_recorded:
                         # 웹에서는 지워졌지만 삭제 의도를 확정하지 못했다. 성공으로 응답하면
                         # 미확인 tombstone 이 조용히 남아 나중에 정상 추가분까지 지운다.
+                        # 로그만 남기면 아무도 재시도하지 않으므로 같은 잡을 지연 재큐잉한다.
+                        # remove_from_cart 는 이미 없는 품목에 대해 즉시 반환하므로 재실행이 안전하다.
                         success = False
-                        message = "웹 삭제 완료했으나 삭제의도 확정 실패 — 재시도 필요"
+                        if _requeue_delayed(self._redis, job,
+                                            "삭제의도 확정 실패 pc=%s" % product_id):
+                            message = "웹 삭제 완료 · 삭제의도 확정 실패 — 재시도 예약"
+                        else:
+                            message = "웹 삭제 완료 · 삭제의도 확정 실패 (재시도 소진)"
+                            self._notify_deletion_stuck(conn, monitor_id, supplier_name,
+                                                        product_id)
                     else:
                         success = True
                         message = "삭제 동기화 완료"
