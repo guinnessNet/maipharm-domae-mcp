@@ -132,8 +132,11 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
 
     단순히 completed 로 덮으면 successCount 등 집계가 하위 행과 어긋난다.
     """
+    # 사전검증 실패(pre_fail)는 외부 전송이 일어났다는 증거가 아니다.
+    # 이것까지 세면 락 재큐잉 후 정상 품목이 영구 취소된다.
     cur.execute('SELECT count(*) FROM domae_cloud_orders '
-                'WHERE "batchId" = %s AND success IS NOT NULL', (batch_id,))
+                'WHERE "batchId" = %s AND success IS NOT NULL '
+                'AND ("reasonCode" IS NULL OR "reasonCode" <> %s)', (batch_id, "pre_fail"))
     if not cur.fetchone()[0]:
         return False
 
@@ -177,7 +180,11 @@ def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_it
         pid = w.get("product_id")
         if not pid:
             continue
-        qty = int(w.get("quantity") or 1)
+        qty = int(w.get("quantity") or 0)
+        if qty <= 0:
+            # 파싱 이상이나 비정상 응답을 수량 1 로 둔갑시키면 안 된다.
+            raise RuntimeError("대조 품목 수량 이상 (pc=%s qty=%r) — 주문 중단"
+                               % (pid, w.get("quantity")))
         item = by_pid.get(pid)
         if item is None:
             item = {
@@ -191,9 +198,15 @@ def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_it
             # 새로 INSERT 하면 워커 재실행마다 이력과 totalItems 가 부풀어 오른다.
             cur.execute(
                 'SELECT id FROM domae_cloud_orders WHERE "batchId" = %s AND supplier = %s '
-                'AND "productId" = %s AND success IS NULL LIMIT 1',
+                'AND "productId" = %s AND success IS NULL',
                 (batch_id, supplier_name, pid))
-            _existing = cur.fetchone()
+            _rows = cur.fetchall()
+            if len(_rows) > 1:
+                # 어느 행을 쓸지 정할 수 없다. 임의로 하나를 고르면 나머지가 영원히 pending 으로 남는다.
+                raise RuntimeError(
+                    "차집합 pending 주문행 중복 (batch=%s pc=%s %d건) — 주문 중단"
+                    % (batch_id, pid, len(_rows)))
+            _existing = _rows[0] if _rows else None
             if _existing:
                 item["db_order_id"] = _existing[0]
                 cur.execute('UPDATE domae_cloud_orders SET quantity = %s WHERE id = %s',
@@ -1184,9 +1197,12 @@ class CloudScheduler:
             """, (monitor_id,))
             row = cur.fetchone()
             if not row:
+                _fail_pending_rows(cur, batch_id, "모니터 없음")
                 cur.execute(
-                    'UPDATE domae_order_batches SET status = %s WHERE id = %s',
-                    ("failed", batch_id)
+                    'UPDATE domae_order_batches SET status = %s, "completedAt" = now(), '
+                    '"failCount" = (SELECT count(*) FROM domae_cloud_orders WHERE "batchId" = %s) '
+                    'WHERE id = %s',
+                    ("failed", batch_id, batch_id)
                 )
                 conn.commit()
                 return
@@ -1273,9 +1289,11 @@ class CloudScheduler:
                     f" · [{item.get('supplier', '?')}] {item.get('product_name', '')} ×{item.get('quantity', 1)} — {msg}"
                 )
                 utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                # reasonCode='pre_fail' — 외부 전송과 무관한 사전검증 실패임을 표시한다.
+                # 멱등 게이트가 이것을 "이미 주문됨" 으로 오인하면 정상 품목까지 취소된다.
                 _record_order_result(
                     cur, monitor_id, batch_id, item.get("supplier") or "", item,
-                    success=False, message=msg, reason_code="other")
+                    success=False, message=msg, reason_code="pre_fail")
                 cart_item_id = item.get("cart_item_id")
                 if cart_item_id:
                     cur.execute(
@@ -1638,26 +1656,22 @@ class CloudScheduler:
         try:
             cur = conn.cursor()
 
-            # 1. 멱등 게이트 — 재큐잉·재실행이 이미 확정된 주문을 다시 보내면 안 된다.
-            cur.execute(
-                'SELECT count(*) FROM domae_cloud_orders '
-                'WHERE "batchId" = %s AND success IS NOT NULL', (batch_id,))
-            _confirmed = cur.fetchone()[0]
-            if _confirmed:
-                logger.error("batch_order 중단: batch=%s 에 이미 확정된 주문 %d건 존재 "
-                             "(중복 주문 방지)", batch_id, _confirmed)
-                cur.execute("""
-                    UPDATE domae_order_batches
-                    SET status = %s, "completedAt" = now() WHERE id = %s
-                """, ("completed", batch_id))
-                cur.execute(
-                    'UPDATE domae_cloud_orders SET success = false, message = %s '
-                    'WHERE "batchId" = %s AND success IS NULL',
-                    ("이미 확정된 배치 — 재실행 중단", batch_id))
-                conn.commit()
+            # 1. 배치 소유권 **원자적** 획득 (batch_order 와 동일 계약).
+            # SELECT 후 UPDATE 로 나누면 동시 실행 둘 다 통과해 중복 주문이 된다.
+            cur.execute("""
+                UPDATE domae_order_batches SET status = 'processing'
+                WHERE id = %s AND "monitorId" = %s AND status = 'pending'
+                RETURNING id
+            """, (batch_id, monitor_id))
+            if cur.fetchone() is None:
+                conn.rollback()
+                logger.warning("auto_order 중단: batch=%s 소유권 획득 실패", batch_id)
+                return
+            conn.commit()
+
+            if _finalize_if_confirmed(conn, cur, batch_id, "이미 확정된 배치 — 재실행 중단"):
                 return
 
-            # batch status → processing
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             cur.execute(
                 'UPDATE domae_order_batches SET status = %s WHERE id = %s AND "monitorId" = %s',
@@ -2606,6 +2620,7 @@ class CloudScheduler:
                     still_exists = any(c["pc"] == product_id for c in cart)
                     # 웹에서 사라진 것을 확인했으면 삭제 의도를 확정한다. 확정하지 않으면
                     # 나중에 같은 제품을 정상 추가해도 대조가 삭제 대상으로 취급한다.
+                    _deletion_recorded = True
                     try:
                         _cur = conn.cursor()
                         _cur.execute("SELECT to_regclass('public.domae_cart_deletions')")
@@ -2630,9 +2645,19 @@ class CloudScheduler:
                             conn.commit()
                     except Exception as _e:
                         conn.rollback()
+                        _deletion_recorded = False
                         logger.warning("삭제 의도 갱신 실패 (pc=%s): %s", product_id, _e)
-                    success = not still_exists
-                    message = "삭제 동기화 완료" if success else "삭제 실패 (항목 잔존)"
+                    if still_exists:
+                        success = False
+                        message = "삭제 실패 (항목 잔존)"
+                    elif not _deletion_recorded:
+                        # 웹에서는 지워졌지만 삭제 의도를 확정하지 못했다. 성공으로 응답하면
+                        # 미확인 tombstone 이 조용히 남아 나중에 정상 추가분까지 지운다.
+                        success = False
+                        message = "웹 삭제 완료했으나 삭제의도 확정 실패 — 재시도 필요"
+                    else:
+                        success = True
+                        message = "삭제 동기화 완료"
 
                 # DB 동기화 상태 업데이트
                 status = "synced" if success else "failed"
