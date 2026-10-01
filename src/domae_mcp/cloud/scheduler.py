@@ -1075,10 +1075,14 @@ class CloudScheduler:
         # 결과를 DB 먼저 + response_key 나중에 반영하는 헬퍼
         # — 순서 중요: DB가 먼저 확정돼야 서버 timeout 후에도 최종 상태가 정확함
         # — 모든 내부 예외는 이 함수 안에서 삼키고 절대 밖으로 던지지 않음 (재귀 finalize 방지)
-        def _finalize(success: bool, order_id: str | None, message: str,
+        def _finalize(success: bool | None, order_id: str | None, message: str,
                       adjusted_quantity: int | None = None,
                       available_stock: int | None = None,
                       reason_code: str | None = None):
+            if reason_code == "send_unknown":
+                success = None
+            elif success is False and not may_have_sent:
+                reason_code = reason_code or "not_sent"
             # 1) DB UPDATE 먼저 (quick-order 경로만)
             if db_order_id:
                 try:
@@ -1093,7 +1097,7 @@ class CloudScheduler:
                                 "adjustedQuantity" = %s,
                                 "availableStock" = %s,
                                 "reasonCode" = %s
-                            WHERE id = %s
+                            WHERE id = %s AND success IS NULL
                         """, (success, order_id, message,
                               adjusted_quantity, available_stock, reason_code,
                               db_order_id))
@@ -1119,11 +1123,18 @@ class CloudScheduler:
                                     "missingQuantity" = %s,
                                     "completedAt" = %s
                                 WHERE id = %s
-                            """, ("completed", 1 if success else 0, 0 if success else 1,
-                                  _adj_count, _missing, utc_now, db_batch_id))
+                            """, ("processing" if success is None else "completed", 1 if success else 0, 1 if success is False else 0,
+                                  _adj_count, _missing, None if success is None else utc_now, db_batch_id))
+                        if success is None and job.get("cart_item_id"):
+                            upd_cur.execute('UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                                            (datetime.now(timezone.utc).replace(tzinfo=None),
+                                             "전송 결과 확인 필요 — 도매몰 주문내역을 확인하세요", job["cart_item_id"]))
                         upd_conn.commit()
                         logger.info("order DB finalize: dbOrderId=%s dbBatchId=%s success=%s reason=%s adj=%s",
                                     db_order_id, db_batch_id, success, reason_code, adjusted_quantity)
+                    except Exception:
+                        upd_conn.rollback()
+                        raise
                     finally:
                         try:
                             self._db_pool.putconn(upd_conn)
@@ -1131,6 +1142,9 @@ class CloudScheduler:
                             pass
                 except Exception as e:
                     logger.error("order DB finalize 실패 [dbOrderId=%s]: %s", db_order_id, e, exc_info=True)
+                    if may_have_sent:
+                        success, reason_code = None, "send_unknown"
+                        message = "결과 기록 실패 — 도매몰 주문내역 확인 필요"
 
             # 2) response_key lpush + TTL 설정 (서버 BRPOP용)
             payload = {
@@ -1146,11 +1160,30 @@ class CloudScheduler:
                 self._redis.expire(response_key, response_key_ttl)
             except Exception as e:
                 logger.warning("order response_key lpush/expire 실패: %s", e)
+            return payload
 
         conn = self._get_conn()
+        may_have_sent = False
         try:
             # 1. credentials + telegramChatId 조회
             cur = conn.cursor()
+            if db_batch_id:
+                cur.execute('UPDATE domae_order_batches SET status = \'processing\' '
+                            'WHERE id = %s AND "monitorId" = %s AND status = \'pending\' RETURNING id',
+                            (db_batch_id, monitor_id))
+                if cur.fetchone() is None:
+                    conn.rollback()
+                    logger.warning("order 재실행 중단: batch=%s 소유권 없음", db_batch_id)
+                    return
+                conn.commit()
+                if _finalize_if_confirmed(conn, cur, db_batch_id, "단건 주문 재실행 중단"):
+                    return
+            elif db_order_id:
+                cur.execute('SELECT success, "reasonCode" FROM domae_cloud_orders WHERE id = %s', (db_order_id,))
+                existing = cur.fetchone()
+                if existing is None or existing[0] is not None or existing[1] in UNCONFIRMED_REASONS:
+                    conn.rollback()
+                    return
             cur.execute("""
                 SELECT m.credentials, m."telegramChatId"
                 FROM domae_cloud_monitors m
@@ -1181,7 +1214,8 @@ class CloudScheduler:
 
             # 3. 주문 실행
             crawler = crawler_cls()
-            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            if not crawler.login(cred.get("login_id", ""), cred.get("login_pw", "")):
+                raise CrawlerError("로그인 실패")
             # 주문마다 새 크롤러 인스턴스라 토큰/단가 캐시가 비어 있다.
             # job 에 싣려온 product_name 으로 선행 search 를 1회 수행해
             # 캐시를 채운다. search 결과는 버리며 캐시를 쓰는 크롤러(TJ팜 등)만
@@ -1232,12 +1266,23 @@ class CloudScheduler:
                         _finalize(success=False, order_id=None,
                                   message="전송 직전 락 상실 — 주문 중단")
                         return
+                may_have_sent = True  # 커밋 응답 유실도 보수적으로 미확정 처리한다.
+                if db_batch_id:
+                    _mark_sending(conn, cur, db_batch_id, supplier_name)
+                elif db_order_id:
+                    cur.execute('UPDATE domae_cloud_orders SET "reasonCode" = %s, message = %s '
+                                'WHERE id = %s AND success IS NULL ' + _KEEP_UNCONFIRMED,
+                                ('send_unknown', '전송 결과 확인 필요 — 주문 실행 중', db_order_id))
+                    if not cur.rowcount:
+                        conn.rollback()
+                        return
+                    conn.commit()
                 result = crawler.order(product_id, quantity, product_name=product_name_hint)
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, single_token)
 
-            _finalize(
-                success=bool(result.success),
+            finalized = _finalize(
+                success=_db_success(result),
                 order_id=getattr(result, "order_id", None),
                 message=getattr(result, "message", "") or "",
                 adjusted_quantity=getattr(result, "adjusted_quantity", None),
@@ -1250,7 +1295,9 @@ class CloudScheduler:
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     product_name = job.get("product_name", product_id)
-                    if result.success:
+                    if finalized["success"] is None:
+                        msg = f"⚠ [{supplier_name}] {product_name} 전송 결과 확인 필요 — 도매몰 주문내역을 확인하세요"
+                    elif finalized["success"]:
                         msg = f"✅ [{supplier_name}] {product_name} {quantity}개 주문 완료"
                     else:
                         msg = f"❌ [{supplier_name}] {product_name} 주문 실패: {getattr(result, 'message', '')}"
@@ -1258,11 +1305,12 @@ class CloudScheduler:
                 except Exception as e:
                     logger.warning("주문 텔레그램 알림 실패: %s", e)
 
-            logger.info("order 완료: monitor=%s supplier=%s success=%s", monitor_id, supplier_name, result.success)
+            logger.info("order 완료: monitor=%s supplier=%s success=%s", monitor_id, supplier_name, finalized["success"])
 
         except Exception as e:
             logger.error("order 실패 [%s]: %s", monitor_id, e, exc_info=True)
-            _finalize(False, None, str(e))
+            conn.rollback()
+            _finalize(None if may_have_sent else False, None, str(e), reason_code="send_unknown" if may_have_sent else "not_sent")
         finally:
             self._db_pool.putconn(conn)
 

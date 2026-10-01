@@ -299,3 +299,93 @@ def test_pre_send_marker_commit_failure_sends_nothing_and_keeps_safe_db_state(da
     assert not calls
     c.execute("SELECT status,\"completedAt\" FROM domae_order_batches WHERE id='b'")
     assert c.fetchone()==('processing',None)
+
+
+@pytest.mark.parametrize('scenario',['unknown','exception','crash','marker_commit_failure','result_sql_failure','accepted','not_sent'])
+def test_quick_order_keeps_unknown_and_never_resends(database,scenario):
+    import json
+    origin,secondary=database
+    cur=origin.cursor()
+    cur.execute('ALTER TABLE domae_order_batches ADD COLUMN "monitorId" text')
+    cur.execute("UPDATE domae_order_batches SET status='pending',\"monitorId\"='m'")
+    cur.execute('CREATE TABLE domae_cloud_monitors (id text, credentials jsonb, "telegramChatId" text, "isActive" boolean)')
+    cur.execute('CREATE TABLE domae_cart_items (id text, quantity integer, "failedAt" timestamp, "failReason" text)')
+    cur.execute('INSERT INTO domae_cloud_monitors VALUES (%s,%s,NULL,true)',('m',json.dumps({'인천':{'login_id':'test'}})))
+    cur.execute("INSERT INTO domae_cart_items VALUES ('c',15,NULL,NULL)")
+    cur.execute('''INSERT INTO domae_cloud_orders (id,"monitorId","batchId",supplier,
+                   "productName",quantity,success) VALUES ('o','m','b','인천','베아놀',15,NULL)''')
+    origin.commit()
+    class Connection:
+        def __init__(self,raw): self.raw=raw;self.fail_commit=False;self.failed=False;self.rollbacks=0
+        def cursor(self): return Cursor(self)
+        def commit(self):
+            if self.fail_commit and not self.failed:
+                self.failed=True
+                raise psycopg2.OperationalError('pre-send commit failure')
+            self.raw.commit()
+        def rollback(self): self.rollbacks+=1;self.raw.rollback()
+    class Cursor:
+        def __init__(self,connection): self.conn=connection;self.raw=connection.raw.cursor()
+        def execute(self,sql,params=None):
+            if scenario=='result_sql_failure' and self.conn.raw is secondary and 'SET success = %s' in sql:
+                self.raw.execute('SELECT 1/0')
+            self.raw.execute(sql,params)
+            if scenario=='marker_commit_failure' and 'SET "reasonCode" = %s' in sql:
+                self.conn.fail_commit=True
+        def __getattr__(self,name): return getattr(self.raw,name)
+    wrapped_origin,wrapped_secondary=Connection(origin),Connection(secondary)
+    class Pool:
+        def __init__(self): self.available=[wrapped_origin,wrapped_secondary]
+        def getconn(self): return self.available.pop(0)
+        def putconn(self,conn): pass
+    class Redis:
+        def __init__(self): self.responses=[]
+        def lpush(self,key,data): self.responses.append(json.loads(data))
+        def expire(self,*a): pass
+    calls=[]
+    class Crawler:
+        def login(self,*a): return True
+        def search(self,*a): return []
+        def order(self,*a,**kw):
+            calls.append(a)
+            if scenario=='exception': raise TimeoutError('lost')
+            if scenario=='crash': raise SystemExit('killed')
+            if scenario in ('result_sql_failure','accepted'): return OrderResult(success=True,reason_code='ok')
+            if scenario=='not_sent': return OrderResult(success=False,reason_code='not_sent')
+            return OrderResult(success=False,reason_code='send_unknown',message='접수 불명')
+    pool,redis=Pool(),Redis()
+    scheduler=sch.CloudScheduler(pool,redis)
+    scheduler._crawlers_loaded=True
+    scheduler._crawlers={'인천':Crawler}
+    job={'monitor_id':'m','response_key':'response','supplier':'인천','product_id':'p',
+         'quantity':15,'db_order_id':'o','db_batch_id':'b','cart_item_id':'c'}
+    if scenario=='crash':
+        with pytest.raises(SystemExit): scheduler.order(job)
+    else:
+        scheduler.order(job)
+    assert len(calls)==(0 if scenario=='marker_commit_failure' else 1)
+    if scenario in ('accepted','not_sent'):
+        cur.execute("SELECT success FROM domae_cloud_orders WHERE id='o'")
+        assert cur.fetchone()==(scenario=='accepted',)
+        cur.execute("SELECT status,\"failCount\",\"completedAt\" IS NOT NULL FROM domae_order_batches WHERE id='b'")
+        assert cur.fetchone()==('completed',0 if scenario=='accepted' else 1,True)
+        pool.available=[wrapped_origin,wrapped_secondary]
+        scheduler.order(job)
+        assert len(calls)==1
+        return
+    cur.execute("SELECT success,\"reasonCode\" FROM domae_cloud_orders WHERE id='o'")
+    assert cur.fetchone()==(None,'send_unknown')
+    cur.execute("SELECT status,\"failCount\",\"completedAt\" FROM domae_order_batches WHERE id='b'")
+    status,count,completed=cur.fetchone()
+    assert status=='processing' and (count or 0)==0 and completed is None
+    if scenario not in ('crash','result_sql_failure'):
+        assert redis.responses[-1]['success'] is None
+        cur.execute("SELECT \"failedAt\" IS NOT NULL FROM domae_cart_items WHERE id='c'")
+        assert cur.fetchone()==(True,)
+    if scenario=='result_sql_failure':
+        assert wrapped_secondary.rollbacks==1
+    # 같은 잡을 다시 넣어도 요청을 반복하지 않는다.
+    before=len(calls)
+    pool.available=[wrapped_origin,wrapped_secondary]
+    scheduler.order(job)
+    assert len(calls)==before
