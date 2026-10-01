@@ -38,6 +38,17 @@ class CloudWorker:
         self._executor = ThreadPoolExecutor(max_workers=3)
         self._scheduler = CloudScheduler(self._db_pool, self._redis)
 
+        from domae_mcp.cloud.notifier import Notifier
+        _broken = "domae:telegram:broken:"
+        Notifier.set_delivery_sinks(
+            on_dead_chat=lambda cid, reason: self._redis.set(
+                _broken + cid, json.dumps({"reason": reason[:200], "at": int(time.time())})),
+            on_delivered=lambda cid: self._redis.delete(_broken + cid),
+            on_bot_rejected=lambda reason: self._redis.set(
+                "domae:telegram:bot_status",
+                json.dumps({"ok": False, "reason": reason[:200], "at": int(time.time())}), ex=1800),
+        )
+
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
 

@@ -13,8 +13,42 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
 
 
+# 이 사용자에게는 보낼 수 없다는 뜻의 응답 — 봇 문제가 아니라 그 대화방 문제다.
+# (봇이 동결돼도 대화방마다 "can't initiate conversation" 이 온다. 봇 전체 상태는 백엔드
+#  크론이 getMyName 으로 따로 판정한다.)
+_DEAD_CHAT_MARKERS = (
+    "can't initiate conversation",
+    "bot was blocked by the user",
+    "user is deactivated",
+    "chat not found",
+)
+
 class Notifier:
     """텔레그램 알림 발송 — 인라인 버튼 및 메시지 편집 지원."""
+
+    _on_dead_chat = None      # callable(chat_id, reason)
+    _on_delivered = None      # callable(chat_id)
+    _on_bot_rejected = None   # callable(reason)
+
+    @classmethod
+    def set_delivery_sinks(cls, on_dead_chat=None, on_delivered=None, on_bot_rejected=None) -> None:
+        """발송 결과를 바깥(Redis 등)에 알리는 콜백. 콜백 예외는 발송에 영향을 주지 않는다."""
+        cls._on_dead_chat = on_dead_chat
+        cls._on_delivered = on_delivered
+        cls._on_bot_rejected = on_bot_rejected
+
+    @staticmethod
+    def _tail(chat_id) -> str:
+        return f"…{str(chat_id)[-4:]}"
+
+    @classmethod
+    def _emit(cls, fn, *args) -> None:
+        if not fn:
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.warning("텔레그램 발송 결과 기록 실패: %s", e)
 
     # ── 기본 전송 ──────────────────────────────────────
 
@@ -50,11 +84,26 @@ class Notifier:
                 json=payload,
                 timeout=10,
             )
-            if resp.status_code != 200:
-                logger.warning("텔레그램 API 응답 오류: %d %s", resp.status_code, resp.text[:200])
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code != 200 or data.get("ok") is not True:
+                desc = str(data.get("description") or resp.text)[:200]
+                if resp.status_code in (200, 400, 403) and any(m in desc for m in _DEAD_CHAT_MARKERS):
+                    logger.warning("텔레그램 수신 불가 chat=%s: %s", Notifier._tail(chat_id), desc)
+                    Notifier._emit(Notifier._on_dead_chat, str(chat_id), desc)
+                elif resp.status_code == 401:
+                    logger.error("텔레그램 봇 토큰 거부(401) — 봇 상태 확인 필요")
+                    Notifier._emit(Notifier._on_bot_rejected, desc)
+                else:
+                    logger.warning("텔레그램 API 응답 오류: %d %s chat=%s",
+                                   resp.status_code, desc, Notifier._tail(chat_id))
                 return None
 
             data = resp.json()
+            logger.info("텔레그램 발송 성공 chat=%s", Notifier._tail(chat_id))
+            Notifier._emit(Notifier._on_delivered, str(chat_id))
             return data.get("result", {}).get("message_id")
         except Exception as e:
             logger.warning("텔레그램 발송 실패: %s", e)
