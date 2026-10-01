@@ -310,3 +310,22 @@ def test_cart_index_gap_cannot_look_empty_after_send():
 def test_changed_price_after_send_is_unknown():
     c = probe([Resp(200, page(A1)), Resp(200, page([("A", 1, 2000)]))])
     assert c._submit_order_status(EXP_A1) == "unknown"
+
+
+def test_orphan_cart_fields_block_send_and_success():
+    """제품 코드 없이 남은 행 필드는 빈 장바구니의 증거가 아니다."""
+    for field in ("bagQty", "price", "stock"):
+        malformed = ('<form name="frmBag"><input name="intArray" value="">'
+                     f'<input name="{field}_0" value="1"></form>')
+        before = probe([Resp(200, malformed)])
+        assert before._submit_order_status(EXP_A1) == "not_sent"
+        assert before.session.posts == 0
+        after = probe([Resp(200, page(A1)), Resp(200, malformed)])
+        assert after._submit_order_status(EXP_A1) == "unknown"
+        assert after.session.posts == 1
+
+
+def test_renamed_product_code_is_not_empty_cart():
+    malformed = page(A1).replace('name="pc_0"', 'name="missing_0"')
+    c = probe([Resp(200, page(A1)), Resp(200, malformed)])
+    assert c._submit_order_status(EXP_A1) == "unknown"
