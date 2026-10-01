@@ -216,3 +216,86 @@ def test_auto_order_to_real_fallback_recorder_and_cart(database,monkeypatch,fall
     assert cur.fetchone()==(None if remaining is None else (remaining,True))
     assert '요청 15개' in sent[0]['text'] and not sent[0].get('reply_markup')
     assert redis.events[0]['fallbackOrdered']==(0 if unknown else 1)
+
+
+@pytest.mark.parametrize('method',['auto_order','batch_order'])
+def test_pre_send_marker_commit_failure_sends_nothing_and_keeps_safe_db_state(database,method):
+    import json
+    origin,observer=database
+    cur=origin.cursor()
+    cur.execute('ALTER TABLE domae_order_batches ADD COLUMN "monitorId" text')
+    cur.execute("UPDATE domae_order_batches SET status='pending',\"monitorId\"='m'")
+    cur.execute('''CREATE TABLE domae_cloud_monitors (
+        id text, credentials jsonb, "telegramChatId" text, "supplierOrder" jsonb,
+        "autoFallbackOrder" boolean, "isActive" boolean)''')
+    cur.execute('''CREATE TABLE domae_cart_items (
+        id text, quantity integer, "failedAt" timestamp, "failReason" text)''')
+    cur.execute('''CREATE TABLE domae_auto_order_logs (
+        "monitorId" text, "batchId" text, status text, message text)''')
+    cur.execute('INSERT INTO domae_cloud_monitors VALUES (%s,%s,NULL,%s,false,true)',
+                ('m',json.dumps({'인천':{'login_id':'test'}}),json.dumps(['인천'])))
+    cur.execute("INSERT INTO domae_cart_items VALUES ('c',15,NULL,NULL)")
+    cur.execute("INSERT INTO domae_auto_order_logs VALUES ('m','b','pending',NULL)")
+    cur.execute('''INSERT INTO domae_cloud_orders (id,"monitorId","batchId",supplier,
+                   "productName",quantity,success) VALUES ('o','m','b','인천','베아놀',15,NULL)''')
+    origin.commit()
+
+    class FailMarkerCursor:
+        def __init__(self,connection): self.connection=connection;self.raw=origin.cursor()
+        def execute(self,sql,params=None):
+            self.raw.execute(sql,params)
+            if 'SET "reasonCode" = %s, message = %s' in sql and params[0]=='send_unknown':
+                self.connection.marker_executed=True
+                self.connection.fail_next_commit=True
+        def __getattr__(self,name): return getattr(self.raw,name)
+    class FailMarkerConnection:
+        marker_executed=False
+        failed=False
+        fail_next_commit=False
+        rollback_count=0
+        def cursor(self): return FailMarkerCursor(self)
+        def commit(self):
+            if self.fail_next_commit and not self.failed:
+                self.failed=True
+                self.fail_next_commit=False
+                raise psycopg2.OperationalError('injected pre-send commit failure')
+            return origin.commit()
+        def rollback(self): self.rollback_count+=1;return origin.rollback()
+    conn=FailMarkerConnection()
+    class Pool:
+        def __init__(self): self.returned=[]
+        def getconn(self): return conn
+        def putconn(self,c): self.returned.append(c)
+    calls=[]
+    class Crawler:
+        def login(self,*a): return True
+        def search(self,*a): return []
+        def order_batch(self,*a): calls.append('order_batch');return [OrderResult(success=True)]
+        def order(self,*a,**kw): calls.append('order');return OrderResult(success=True)
+    class Redis:
+        def publish(self,*a): pass
+    pool=Pool()
+    scheduler=sch.CloudScheduler(pool,Redis())
+    scheduler._crawlers_loaded=True
+    scheduler._crawlers={'인천':Crawler}
+    item={'supplier':'인천','product_id':'p','product_name':'베아놀','quantity':15,
+          'insurance_code':'694003321','unit':'12EA','db_order_id':'o','cart_item_id':'c'}
+    job={'monitor_id':'m','batch_id':'b','supplier':'인천','items':[item]}
+    getattr(scheduler,method)(job)
+    assert conn.marker_executed and conn.failed and conn.rollback_count==1
+    assert not calls and pool.returned==[conn]
+    # 마커 트랜잭션 rollback 뒤에도 결과 기록은 미확정으로 커밋되고 원 수량은 보존된다.
+    c=observer.cursor()
+    c.execute("SELECT success,\"reasonCode\" FROM domae_cloud_orders WHERE id='o'")
+    assert c.fetchone()==(None,'send_unknown')
+    c.execute("SELECT quantity,\"failedAt\" IS NOT NULL FROM domae_cart_items WHERE id='c'")
+    assert c.fetchone()==(15,True)
+    cur.execute('SELECT 1')
+    assert cur.fetchone()==(1,)
+    # pending 상태로 재수신해도 보호된 행 때문에 실제 메서드의 멱등 게이트에서 중단한다.
+    cur.execute("UPDATE domae_order_batches SET status='pending' WHERE id='b'")
+    origin.commit()
+    getattr(scheduler,method)(job)
+    assert not calls
+    c.execute("SELECT status,\"completedAt\" FROM domae_order_batches WHERE id='b'")
+    assert c.fetchone()==('processing',None)

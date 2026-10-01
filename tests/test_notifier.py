@@ -57,3 +57,14 @@ def test_200_api_failure_does_not_clear_broken(monkeypatch):
     dead,ok,bot=_setup(monkeypatch,Resp(200,{'ok':False,'description':'chat not found'}))
     assert Notifier.send_telegram('chat','hi') is None
     assert not ok and dead
+
+
+def test_transport_exception_does_not_log_bot_token(monkeypatch,caplog):
+    secret='synthetic-secret'
+    monkeypatch.setenv('DOMAE_TELEGRAM_BOT_TOKEN','1:'+secret)
+    def failed_send(*a,**kw):
+        raise nmod.requests.ConnectionError('HTTPSConnectionPool failed for /bot1:'+secret+'/sendMessage')
+    monkeypatch.setattr(nmod.requests,'post',failed_send)
+    assert Notifier.send_telegram('chat','hi') is None
+    assert secret not in caplog.text
+    assert 'ConnectionError' in caplog.text

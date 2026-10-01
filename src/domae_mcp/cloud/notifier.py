@@ -106,7 +106,7 @@ class Notifier:
             Notifier._emit(Notifier._on_delivered, str(chat_id))
             return data.get("result", {}).get("message_id")
         except Exception as e:
-            logger.warning("텔레그램 발송 실패: %s", e)
+            logger.warning("텔레그램 발송 실패: %s", type(e).__name__)
             return None
 
     @staticmethod
