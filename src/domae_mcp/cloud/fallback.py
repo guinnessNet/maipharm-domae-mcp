@@ -261,4 +261,6 @@ def format_ordered_line(item: dict) -> str:
     line = f"• {item.get('product_name', '')} — {qty}개 — {total:,}원"
     if req > qty:
         line += f" (요청 {req}개, 부족 {req - qty}개는 장바구니에 남김)"
+    if item.get("retried"):
+        line += " (재시도 후 주문)"
     return line

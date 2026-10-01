@@ -148,6 +148,26 @@ def _db_success(result):
     return bool(result.success)
 
 
+def _retry_tag(result) -> str:
+    return " (재시도 후 주문)" if getattr(result, "retried", False) else ""
+
+
+def _quick_order_message(supplier, product_name, quantity, result, db_success) -> str:
+    """바로주문 텔레그램 문구. 수량 조정으로 덜 주문됐으면 실제 주문 수량을 적는다."""
+    if db_success is None:
+        return f"⚠ [{supplier}] {product_name} 전송 결과 확인 필요 — 도매몰 주문내역을 확인하세요"
+    if db_success:
+        got = getattr(result, "adjusted_quantity", None) or quantity
+        short = f" (요청 {quantity}개, 재고 부족)" if got < quantity else ""
+        return f"✅ [{supplier}] {product_name} {got}개 주문 완료{short}{_retry_tag(result)}"
+    return f"❌ [{supplier}] {product_name} 주문 실패: {getattr(result, 'message', '')}"
+
+
+def _batch_success_line(supplier, item, result) -> str:
+    """일괄주문 성공 품목 한 줄 (수량 조정 제외)."""
+    return f" · [{supplier}] {item.get('product_name', '')} ×{int(item.get('quantity', 1))}{_retry_tag(result)}"
+
+
 def _is_item_retryable(result) -> bool:
     """batch_order 의 품목별 1회 재시도 대상인가. send_unknown 을 다시 보내면 이중 주문이 된다."""
     if getattr(result, "reason_code", None) in NO_RETRY_REASONS:
@@ -1342,12 +1362,8 @@ class CloudScheduler:
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     product_name = job.get("product_name", product_id)
-                    if finalized["success"] is None:
-                        msg = f"⚠ [{supplier_name}] {product_name} 전송 결과 확인 필요 — 도매몰 주문내역을 확인하세요"
-                    elif finalized["success"]:
-                        msg = f"✅ [{supplier_name}] {product_name} {quantity}개 주문 완료"
-                    else:
-                        msg = f"❌ [{supplier_name}] {product_name} 주문 실패: {getattr(result, 'message', '')}"
+                    msg = _quick_order_message(supplier_name, product_name, int(quantity), result,
+                                               finalized["success"])
                     Notifier.send_telegram(telegram_chat_id, msg)
                 except Exception as e:
                     logger.warning("주문 텔레그램 알림 실패: %s", e)
@@ -1667,6 +1683,7 @@ class CloudScheduler:
                             retry_result = crawler.order(pid, qty, product_name=_retry_name)
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
+                                retry_result.retried = True
                                 succeeded.append((idx, item, retry_result))
                             else:
                                 still_failed.append((idx, item, retry_result))
@@ -1695,11 +1712,11 @@ class CloudScheduler:
                         missing_qty_total += max(0, original_qty - int(adjusted_qty))
                         adjusted_count += 1
                         _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
-                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} (재고 {avail_stock})")
+                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} (재고 {avail_stock})"
+                                    f"{_retry_tag(result)}")
                         adjusted_lines.append(_tg_line)
                     else:
-                        _tg_line = f" · [{supplier_name}] {item.get('product_name', '')} ×{original_qty}"
-                        success_lines.append(_tg_line)
+                        success_lines.append(_batch_success_line(supplier_name, item, result))
                     cart_item_id = item.get("cart_item_id")
                     if cart_item_id:
                         # 부분 성공(stock_adjusted)은 부족분을 실패 상태로 남긴다 (auto_order 와 같은 규칙)
@@ -2060,7 +2077,8 @@ class CloudScheduler:
                     success_count += 1
                     req = int(item.get("quantity", 1))
                     got = getattr(result, "adjusted_quantity", None) or req
-                    success_items.append({**item, "quantity": got, "requested_quantity": req})
+                    success_items.append({**item, "quantity": got, "requested_quantity": req,
+                                          "retried": bool(getattr(result, "retried", False))})
                 elif unconfirmed:
                     unconfirmed_items.append(item)
                 else:
@@ -2267,6 +2285,8 @@ class CloudScheduler:
             if success_items:
                 lines.append("✅ 성공:")
                 lines.extend(format_ordered_line(it) for it in success_items[:10])
+                if len(success_items) > 10:
+                    lines.append(f"... 외 {len(success_items) - 10}건")
                 total = sum((it.get("price") or 0) * int(it.get("quantity", 0)) for it in success_items)
                 lines.append(f"총 {len(success_items)}건, {total:,}원 주문 완료")
             if button_items:

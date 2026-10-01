@@ -48,6 +48,8 @@ class OrderResult:
     adjusted_quantity: Optional[int] = None
     available_stock: Optional[int] = None
     reason_code: Optional[str] = None
+    # 첫 전송이 아니라 재전송(Phase 2·3, 수량 조정, 품목별 재시도)으로 나온 결과인가 — 알림 표시용
+    retried: bool = False
 
 
 class CrawlerError(Exception):
@@ -150,6 +152,7 @@ class BaseCrawler(ABC):
                 r2.adjusted_quantity = stock
                 r2.available_stock = stock
                 r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
+                r2.retried = True
                 if r2.success and not r2.message:
                     r2.message = f"재고 부족으로 {qty}→{stock}개 조정 주문"
                 results.append(r2)
@@ -461,6 +464,7 @@ class PartialStockFallbackMixin:
         r2.adjusted_quantity = stock
         r2.available_stock = stock
         r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
+        r2.retried = True
         if r2.success:
             # Mixin 이 수량 조정을 감지했음을 명시적으로 메시지에 반영 (bare 가 채운 "주문 전송 완료" 덮어씀)
             r2.message = f"재고 부족으로 {original_qty}→{stock}개 조정 주문"
@@ -555,4 +559,8 @@ class PartialStockFallbackMixin:
                     available_stock=stock,
                     reason_code="ok",
                 ))
+        # 이 함수는 Phase 1 전송이 실패한 뒤에만 불린다 — 여기서 나온 성공은 모두 재전송 결과다
+        for r in results:
+            if r.success:
+                r.retried = True
         return results
