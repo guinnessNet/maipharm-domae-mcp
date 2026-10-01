@@ -137,7 +137,8 @@ NO_RETRY_KEYWORDS = [
     "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
 ]
 # 크롤러가 이미 판정을 끝냈거나(재고), 다시 보내면 안 되는(접수 불명) 사유
-NO_RETRY_REASONS = ("stock_zero", "stock_adjusted", "send_unknown", "isolated_fail", "not_sent", "rejected")
+NO_RETRY_REASONS = ("stock_zero", "stock_adjusted", "send_unknown", "isolated_fail", "not_sent", "rejected",
+                    "cart_dirty")
 
 
 def _db_success(result):
