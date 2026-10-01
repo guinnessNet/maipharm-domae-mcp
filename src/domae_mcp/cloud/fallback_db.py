@@ -64,6 +64,18 @@ class FallbackRecorder:
             'WHERE id = %s AND success IS NULL',
             (message, "send_unknown", row_id)))
 
+    def check_unconfirmed(self, sup, product_id):
+        """같은 약국·도매의 결과 미확정(success IS NULL) 주문. None | same_product | other_product."""
+        def _do(cur):
+            cur.execute('SELECT "productId" FROM domae_cloud_orders '
+                        'WHERE "monitorId" = %s AND supplier = %s AND success IS NULL',
+                        (self.monitor_id, sup))
+            return [r[0] for r in cur.fetchall()]
+        pids = self._tx(_do)
+        if not pids:
+            return None
+        return "same_product" if product_id in pids else "other_product"
+
     def apply_cart(self, cart_item_id, action, qty, why) -> None:
         if not cart_item_id or action == "none":
             return

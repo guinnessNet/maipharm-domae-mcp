@@ -284,10 +284,10 @@ def test_pre_send_marker_commit_failure_sends_nothing_and_keeps_safe_db_state(da
     getattr(scheduler,method)(job)
     assert conn.marker_executed and conn.failed and conn.rollback_count==1
     assert not calls and pool.returned==[conn]
-    # 마커 트랜잭션 rollback 뒤에도 결과 기록은 미확정으로 커밋되고 원 수량은 보존된다.
+    # 보호 커밋이 실패하면 전송하지 않았으므로 not_sent 로 확정한다(A4). 원 수량은 보존된다.
     c=observer.cursor()
     c.execute("SELECT success,\"reasonCode\" FROM domae_cloud_orders WHERE id='o'")
-    assert c.fetchone()==(None,'send_unknown')
+    assert c.fetchone()==(False,'not_sent')
     c.execute("SELECT quantity,\"failedAt\" IS NOT NULL FROM domae_cart_items WHERE id='c'")
     assert c.fetchone()==(15,True)
     cur.execute('SELECT 1')
@@ -297,8 +297,8 @@ def test_pre_send_marker_commit_failure_sends_nothing_and_keeps_safe_db_state(da
     origin.commit()
     getattr(scheduler,method)(job)
     assert not calls
-    c.execute("SELECT status,\"completedAt\" FROM domae_order_batches WHERE id='b'")
-    assert c.fetchone()==('processing',None)
+    c.execute("SELECT status,\"completedAt\" IS NOT NULL FROM domae_order_batches WHERE id='b'")
+    assert c.fetchone()==('failed',True)
 
 
 @pytest.mark.parametrize('scenario',['unknown','exception','crash','marker_commit_failure','result_sql_failure','accepted','not_sent'])

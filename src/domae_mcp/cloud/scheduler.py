@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult
-from domae_mcp.cloud.fallback import (cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
+from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 
@@ -156,12 +156,58 @@ def _is_item_retryable(result) -> bool:
     return not any(kw in msg for kw in NO_RETRY_KEYWORDS)
 
 
-def _mark_sending(conn, cur, batch_id, supplier):
-    """외부 전송 전 보호 표식을 커밋한다. 결과 기록 실패/죽음에도 재전송하지 않는다."""
+CART_SENDING_REASON = '전송 결과 확인 중'
+
+
+def _mark_sending(conn, cur, batch_id, supplier, cart_item_ids=()):
+    """외부 전송 전 보호 표식을 커밋한다. 결과 기록 실패/죽음에도 재전송하지 않는다.
+
+    이번에 실제로 전송하는 장바구니 행(cart_item_ids)도 **같은 트랜잭션**에서 실패 상태로
+    묶는다. 서버 자동주문 크론은 failedAt IS NULL 만 다시 주문하므로, 전송 뒤 결과 기록 전에
+    죽어도 다음 슬롯이 같은 품목을 재주문하지 않는다. 약국·도매 단위로 묶지 않는다
+    (이번 요청 밖 품목까지 막힌다). 결과 루프가 이후 삭제·잔량·실패로 덮어쓴다.
+    커밋이 실패하면 예외가 나가고 호출자는 전송하지 않는다.
+    """
     cur.execute('UPDATE domae_cloud_orders SET "reasonCode" = %s, message = %s '
                 'WHERE "batchId" = %s AND supplier = %s AND success IS NULL',
                 ('send_unknown', '전송 결과 확인 필요 — 주문 실행 중', batch_id, supplier))
+    ids = [i for i in dict.fromkeys(cart_item_ids or ()) if i]
+    if ids:
+        cur.execute('UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = ANY(%s)',
+                    (datetime.now(timezone.utc).replace(tzinfo=None), CART_SENDING_REASON, ids))
     conn.commit()
+
+
+def _cart_ids(items):
+    return [it.get("cart_item_id") for it in items if it.get("cart_item_id")]
+
+
+def _close_batch(cur, batch_id, done_status="completed", adjusted=None, missing=None):
+    """원 주문·대체주문이 모두 끝난 뒤 배치를 **DB 행 기준**으로 마감한다. 커밋은 호출자가 한다.
+
+    미확정(success IS NULL + send_unknown/fallback_pending)은 실패로 세지 않는다. 남아 있으면
+    배치를 processing, completedAt=NULL 로 둔다 — 서버 리퍼가 보호 행을 열어 둔 채 관찰한다.
+    반환: (성공, 확정 실패, 미확정) 행 수
+    """
+    cur.execute("""
+        SELECT count(*) FILTER (WHERE success),
+               count(*) FILTER (WHERE success = false),
+               count(*) FILTER (WHERE success IS NULL
+                                AND "reasonCode" IN ('send_unknown', 'fallback_pending'))
+        FROM domae_cloud_orders WHERE "batchId" = %s
+    """, (batch_id,))
+    ok, ng, unconfirmed = cur.fetchone()
+    status = "processing" if unconfirmed else done_status
+    sets = ['status = %s', '"completedAt" = ' + ('NULL' if unconfirmed else 'now()'),
+            '"successCount" = %s', '"failCount" = %s']
+    params = [status, ok, ng]
+    if adjusted is not None:
+        sets.append('"adjustedCount" = %s'); params.append(adjusted)
+    if missing is not None:
+        sets.append('"missingQuantity" = %s'); params.append(missing)
+    cur.execute('UPDATE domae_order_batches SET ' + ', '.join(sets) + ' WHERE id = %s',
+                (*params, batch_id))
+    return ok, ng, unconfirmed
 
 
 def _fail_pending_rows(cur, batch_id, message):
@@ -1381,6 +1427,7 @@ class CloudScheduler:
             adjusted_lines = []         # 수량 조정 성공 (⚠️ 섹션)
             missing_lines = []          # 재고 0 누락 (❌ 섹션)
             fail_lines = []             # 기타 실패
+            unconfirmed_lines = []      # 전송 결과 확인 필요 (실패 아님)
             logged_in_crawlers = {}     # 도매상별 로그인 캐시
 
             # 4-1. 사전 검증 + 도매상별 그룹핑
@@ -1468,6 +1515,9 @@ class CloudScheduler:
               for supplier_name, group_items in _ordered:
                 cred = credentials[supplier_name]
                 crawler_cls = self._crawlers[supplier_name]
+                # 보호 커밋(_mark_sending)이 성공한 뒤에만 True — 그 전 예외는 전송 전이다.
+                # _sent_any 는 커밋 전에 True 가 되므로 전송 여부 판정에 쓰면 안 된다.
+                _send_committed = False
 
                 if supplier_name not in logged_in_crawlers:
                     crawler = crawler_cls()
@@ -1526,11 +1576,15 @@ class CloudScheduler:
                                 raise _LockUnavailable(supplier_name)
 
                             _sent_any = True
-                        _mark_sending(conn, cur, batch_id, supplier_name)
+                        _mark_sending(conn, cur, batch_id, supplier_name,
+                                      _cart_ids(it for _, it in group_items))
+                        _send_committed = True
                         results = crawler.order_batch(batch_items)
                     else:
                         _sent_any = True
-                        _mark_sending(conn, cur, batch_id, supplier_name)
+                        _mark_sending(conn, cur, batch_id, supplier_name,
+                                      _cart_ids(it for _, it in group_items))
+                        _send_committed = True
                         results = crawler.order_batch(batch_items)
                 except _LockUnavailable as e:
                     # lease 만료 등으로 전송 직전 락을 잃은 경우. 이 공급사는 전송하지 않았다.
@@ -1555,9 +1609,10 @@ class CloudScheduler:
                     results = [OrderResult(success=False, message=f"대조 중단: {e}", reason_code="not_sent") for _ in group_items]
                 except Exception as e:
                     # 대조 중 만든 pending 행이 커밋되면 아무도 마감하지 않는 고아가 된다.
-                    # 대조분을 통째로 버린다.
+                    # 대조분을 통째로 버린다. 보호 커밋 전 예외는 전송 전이므로 not_sent.
                     conn.rollback()
-                    results = [OrderResult(success=False, message=str(e), reason_code="send_unknown") for _ in group_items]
+                    _rc = "send_unknown" if _send_committed else "not_sent"
+                    results = [OrderResult(success=False, message=str(e), reason_code=_rc) for _ in group_items]
 
                 # 길이 불일치 방어
                 if len(results) != len(group_items):
@@ -1647,7 +1702,14 @@ class CloudScheduler:
                         success_lines.append(_tg_line)
                     cart_item_id = item.get("cart_item_id")
                     if cart_item_id:
-                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                        # 부분 성공(stock_adjusted)은 부족분을 실패 상태로 남긴다 (auto_order 와 같은 규칙)
+                        _act, _keep, _why = cart_action_after_order(item, result)
+                        if _act == "keep_failed":
+                            cur.execute(
+                                'UPDATE domae_cart_items SET quantity = %s, "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                                (_keep, utc_now, _why, cart_item_id))
+                        else:
+                            cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
 
                 for idx, item, result in failed:
                     order_message = getattr(result, "message", "")
@@ -1661,9 +1723,11 @@ class CloudScheduler:
                         cur, monitor_id, batch_id, supplier_name, item,
                         success=_db_success(result), message=order_message,
                         adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
-                    fail_count += 1
+                    if rcode != "send_unknown":
+                        fail_count += 1   # 미확정은 실패로 세지 않는다
                     if rcode == "send_unknown":
-                        fail_lines.append(f"⚠ {item.get('product_name', '')} — 전송 결과 확인 필요")
+                        unconfirmed_lines.append(
+                            f" · [{supplier_name}] {item.get('product_name', '')} ×{original_qty}")
                     elif rcode == "stock_zero":
                         missing_qty_total += original_qty
                         _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
@@ -1695,17 +1759,8 @@ class CloudScheduler:
                 except Exception as _e:
                     logger.error("장바구니 락 해제 실패(루프) [%s]: %s", monitor_id, _e)
 
-            # 5. batch 완료 — 집계값 + status 를 한 번에 업데이트
-            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-            cur.execute("""
-                UPDATE domae_order_batches
-                SET status = %s, "completedAt" = %s,
-                    "successCount" = %s, "failCount" = %s,
-                    "adjustedCount" = %s, "missingQuantity" = %s
-                WHERE id = %s
-            """, ("completed", utc_now,
-                  success_count, fail_count, adjusted_count, missing_qty_total,
-                  batch_id))
+            # 5. batch 마감 — DB 행 기준 재집계. 미확정이 남으면 processing 유지.
+            _close_batch(cur, batch_id, "completed", adjusted_count, missing_qty_total)
             conn.commit()
 
             # 6. 텔레그램 알림
@@ -1742,6 +1797,11 @@ class CloudScheduler:
                         parts.extend(fail_lines[:10])
                         if len(fail_lines) > 10:
                             parts.append(f" ... 외 {len(fail_lines) - 10}건")
+                    if unconfirmed_lines:
+                        parts.append("")
+                        parts.append(f"⚠ 전송 결과 확인 필요 {len(unconfirmed_lines)}건 "
+                                     "(실패 아님 — 도매몰 주문내역을 확인해 주세요)")
+                        parts.extend(unconfirmed_lines[:10])
                     msg = "\n".join(parts)
                     Notifier.send_telegram(telegram_chat_id, msg)
                 except Exception as e:
@@ -1757,21 +1817,14 @@ class CloudScheduler:
                 # 서버가 만든 pending 주문행을 마감하지 않으면 success=null 로 영구 잔존한다.
                 # crawler.login() 이 공급사 루프의 inner try 밖이라 로그인 실패로도 여기 온다.
                 _fail_pending_rows(cur, batch_id, str(e)[:200])
-                # 중간까지 처리된 집계값 보존하면서 status=failed 로 마킹
-                cur.execute("""
-                    UPDATE domae_order_batches
-                    SET status = %s,
-                        "successCount" = %s, "failCount" = %s,
-                        "adjustedCount" = %s, "missingQuantity" = %s
-                    WHERE id = %s
-                """, ("failed",
-                      success_count, fail_count, adjusted_count, missing_qty_total,
-                      batch_id))
+                # DB 행 기준으로 마감. 미확정이 남았으면 failed 가 아니라 processing 유지.
+                _close_batch(cur, batch_id, "failed", adjusted_count, missing_qty_total)
                 conn.commit()
             except Exception:
                 pass
             # 부분 성공이라도 텔레그램 알림 발송
-            if telegram_chat_id and (success_lines or adjusted_lines or missing_lines or fail_lines):
+            if telegram_chat_id and (success_lines or adjusted_lines or missing_lines or fail_lines
+                                     or unconfirmed_lines):
                 try:
                     from domae_mcp.cloud.notifier import Notifier
                     parts = [f"📦 도매 일괄주문 오류 (일부 처리됨)\n"]
@@ -1795,6 +1848,10 @@ class CloudScheduler:
                             parts.append("")
                         parts.append(f"❌ 실패 {len(fail_lines)}건")
                         parts.extend(fail_lines[:10])
+                    if unconfirmed_lines:
+                        parts.append("")
+                        parts.append(f"⚠ 전송 결과 확인 필요 {len(unconfirmed_lines)}건 (실패 아님)")
+                        parts.extend(unconfirmed_lines[:10])
                     parts.append(f"\n⚠️ 오류: {str(e)[:100]}")
                     Notifier.send_telegram(telegram_chat_id, "\n".join(parts))
                 except Exception:
@@ -1921,6 +1978,7 @@ class CloudScheduler:
             # SUPPORTS_CART_SYNC 도매상은 동시 cart_sync 작업과 경합 방지를 위해 락 획득
             ao_token = None
             is_cart_sync = getattr(crawler_cls, "SUPPORTS_CART_SYNC", False)
+            send_committed = False   # 보호 커밋 성공 후에만 True (그 전 예외는 전송 전)
             try:
                 if is_cart_sync:
                     ao_token = _acquire_cart_lock(self._redis, monitor_id, supplier_name)
@@ -1946,7 +2004,8 @@ class CloudScheduler:
                     if not _renew_cart_lock(self._redis, monitor_id, supplier_name, ao_token):
                         raise _LockUnavailable(supplier_name)
 
-                _mark_sending(conn, cur, batch_id, supplier_name)
+                _mark_sending(conn, cur, batch_id, supplier_name, _cart_ids(items))
+                send_committed = True
                 results = crawler.order_batch(batch_items)
             except _LockUnavailable as e:
                 conn.rollback()
@@ -1965,7 +2024,8 @@ class CloudScheduler:
             except Exception as e:
                 # 대조 중 만든 pending 행이 커밋되면 고아가 된다 (batch_order 와 동일 처리)
                 conn.rollback()
-                results = [OrderResult(success=False, message=str(e), reason_code="send_unknown") for _ in items]
+                _rc = "send_unknown" if send_committed else "not_sent"
+                results = [OrderResult(success=False, message=str(e), reason_code=_rc) for _ in items]
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, ao_token)
 
@@ -2026,13 +2086,7 @@ class CloudScheduler:
                 if need > 0:
                     fallback_needs.append((item, need))
 
-            # 6. batch 완료
-            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-            cur.execute("""
-                UPDATE domae_order_batches
-                SET status = %s, "successCount" = %s, "failCount" = %s, "completedAt" = %s
-                WHERE id = %s
-            """, ("completed", success_count, fail_count, utc_now, batch_id))
+            # 6. 원 주문 결과·장바구니 반영을 먼저 확정한다 (배치 마감은 대체주문 뒤)
             conn.commit()
 
             fallback_outcomes = []
@@ -2051,7 +2105,9 @@ class CloudScheduler:
                     def _open(sup):
                         if sup not in opened:
                             c = self._crawlers[sup]()
-                            c.login(credentials[sup].get("login_id", ""), credentials[sup].get("login_pw", ""))
+                            # 로그인 실패는 전송 전이다 — 예외로 다음 순번에 넘기고 캐시하지 않는다
+                            if not c.login(credentials[sup].get("login_id", ""), credentials[sup].get("login_pw", "")):
+                                raise CrawlerError(f"{sup} 로그인 실패")
                             opened[sup] = c
                         return opened[sup]
 
@@ -2070,7 +2126,8 @@ class CloudScheduler:
 
                     fallback_outcomes = run_fallback(
                         fallback_needs, candidates, _open, _lock, _renew, _unlock,
-                        rec.pending, rec.result, rec.unconfirmed)
+                        rec.pending, rec.result, rec.unconfirmed,
+                        check_unconfirmed=rec.check_unconfirmed)
                     for o in fallback_outcomes:
                         action, keep_qty, why = cart_action_after_fallback(o)
                         try:
@@ -2084,10 +2141,16 @@ class CloudScheduler:
                     if fconn is not None:
                         self._db_pool.putconn(fconn)
 
-            # 7. DomaeAutoOrderLog 상태 업데이트
+            # 6-1. 배치 마감 — 원 주문·대체주문 행 기준 재집계. 미확정이 남으면 processing.
+            _close_batch(cur, batch_id, "completed")
+            conn.commit()
+
+            # 7. DomaeAutoOrderLog 상태 업데이트. 미확정은 실패가 아니라 '확인 필요'다.
             has_shortfall = any(i["requested_quantity"] > i["quantity"] for i in success_items)
-            if fail_count == 0 and not unconfirmed_items and not has_shortfall:
-                log_status = "success"
+            needs_check = bool(unconfirmed_items) or any(
+                o.state in NEEDS_CHECK_STATES for o in fallback_outcomes)
+            if fail_count == 0 and not has_shortfall:
+                log_status = "unconfirmed" if needs_check else "success"
             elif success_count > 0:
                 log_status = "partial_fail"
             else:
@@ -2107,7 +2170,7 @@ class CloudScheduler:
                 self._redis.publish(f"domae:notifications:{monitor_id}", json.dumps({
                     "type": "auto_order_result",
                     "supplier": supplier_name,
-                    "status": "success" if not failed_items and not unconfirmed_items and not has_shortfall else "partial_fail",
+                    "status": log_status,
                     "count": len(success_items),
                     "totalPrice": sum((i.get("price") or 0) * int(i.get("quantity", 0)) for i in success_items),
                     "shortfall": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
@@ -2127,7 +2190,8 @@ class CloudScheduler:
             try:
                 cur = conn.cursor()
                 _fail_pending_rows(cur, batch_id, str(e)[:200])
-                cur.execute('UPDATE domae_order_batches SET status = %s WHERE id = %s', ("failed", batch_id))
+                # 미확정이 남았으면 failed 가 아니라 processing 유지 (DB 행 기준)
+                _close_batch(cur, batch_id, "failed")
                 conn.commit()
             except Exception:
                 pass
@@ -2173,7 +2237,7 @@ class CloudScheduler:
             if global_error:
                 Notifier.send_telegram(chat_id, f"❌ 자동주문 실패 ({supplier}, {now_str})\n\n{global_error}\n\n수동으로 확인해주세요.")
                 return
-            handled = {id(o.item) for o in fallback_outcomes if o.state in ("ordered", "unconfirmed")}
+            handled = {id(o.item) for o in fallback_outcomes if o.state in ("ordered", *NEEDS_CHECK_STATES)}
             button_items = [it for it in failed_items if id(it.get("_src", it)) not in handled]
             keyboard = []
             if button_items and credentials and monitor_id:
@@ -2190,8 +2254,15 @@ class CloudScheduler:
                             row.append({"text": f"{alt['supplier']}{price}", "callback_data": cb})
                     if row:
                         keyboard.append(row)
-            partial = bool(failed_items or unconfirmed_items or any(i.get("requested_quantity", i.get("quantity", 0)) > i.get("quantity", 0) for i in success_items))
-            title = "⚠️ 자동주문 부분 완료" if partial and success_items else "❌ 자동주문 실패" if partial else "✅ 자동주문 완료"
+            # 미확정은 실패가 아니다 — 확정 실패·부족분이 없으면 '확인 필요'로만 알린다
+            partial = bool(failed_items or any(i.get("requested_quantity", i.get("quantity", 0)) > i.get("quantity", 0) for i in success_items))
+            needs_check = bool(unconfirmed_items) or any(o.state in NEEDS_CHECK_STATES for o in fallback_outcomes)
+            if partial:
+                title = "⚠️ 자동주문 부분 완료" if success_items else "❌ 자동주문 실패"
+            elif needs_check:
+                title = "⚠️ 자동주문 결과 확인 필요"
+            else:
+                title = "✅ 자동주문 완료"
             lines = [f"{title} ({supplier}, {now_str})\n"]
             if success_items:
                 lines.append("✅ 성공:")
@@ -2207,7 +2278,7 @@ class CloudScheduler:
             if fallback_outcomes:
                 lines.append("\n대체 주문:")
                 for o in fallback_outcomes:
-                    mark = {"ordered": "↪", "unconfirmed": "⚠"}.get(o.state, "✗")
+                    mark = {"ordered": "↪", "unconfirmed": "⚠", "blocked": "⚠"}.get(o.state, "✗")
                     text = f"{o.supplier} {o.ordered_qty}개 주문 완료" if o.state == "ordered" else o.message
                     lines.append(f"{mark} {o.item.get('product_name', '')} — {text}")
             if keyboard:

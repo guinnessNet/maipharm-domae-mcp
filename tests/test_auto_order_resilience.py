@@ -25,6 +25,7 @@ class Conn:
             raise RuntimeError('record failed')
     def fetchone(self):
         if 'RETURNING id' in self.last: return ('b',)
+        if 'FILTER' in self.last: return (0, 0, 0)
         if 'SELECT count(*)' in self.last: return (0,)
         if 'SELECT m.credentials' in self.last: return ({'인천': {'login_id':'x'}, '복산': {'login_id':'x'}}, 'chat', ['인천','복산'], self.fallback)
         return None
@@ -91,7 +92,7 @@ def test_sql_failure_preserves_pre_send_marker(monkeypatch):
 
 def test_fallback_uses_dedicated_connection_and_does_not_poison_origin(monkeypatch):
     seen=[]
-    def fallback(needs,candidates,opened,lock,renew,unlock,pending,result,unknown):
+    def fallback(needs,candidates,opened,lock,renew,unlock,pending,result,unknown,**kw):
         seen.append(pending.__self__.conn)
         raise RuntimeError('fallback db failed')
     monkeypatch.setattr(sch,'run_fallback',fallback)

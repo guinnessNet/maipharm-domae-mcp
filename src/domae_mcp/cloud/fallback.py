@@ -20,6 +20,9 @@ from domae_mcp.core.crawlers.base import OrderResult
 logger = logging.getLogger(__name__)
 
 SAFE_TO_CONTINUE = ("not_sent", "rejected")
+# 장바구니 처리·알림에서 '확인 필요'로 다루는 결과 (재주문 버튼을 주지 않는다)
+NEEDS_CHECK_STATES = ("unconfirmed", "blocked")
+BLOCKED_MESSAGE = "이전 주문 결과 확인 전 — 대체 주문 중단"
 _INS_CODE = re.compile(r"^[0-9]{9}$")
 _UNIT_WORDS = (("캡슐", "c"), ("캅셀", "c"), ("포", "p"), ("정", "t"), ("개", "ea"))
 _PACK_TOKEN = re.compile(r"(\d+(?:\.\d+)?)(mg|ml|ea|g|t|c|p|l)")
@@ -101,7 +104,7 @@ class FallbackOutcome:
     need_qty: int
     supplier: Optional[str]
     ordered_qty: int
-    state: str          # ordered | failed | unconfirmed | skipped
+    state: str          # ordered | failed | unconfirmed | blocked | skipped
     message: str
 
     @property
@@ -163,7 +166,14 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
 
 
 def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, release_lock,
-                 record_pending, record_result, record_unconfirmed) -> list:
+                 record_pending, record_result, record_unconfirmed, check_unconfirmed=None) -> list:
+    """check_unconfirmed(supplier, product_id) → None | "same_product" | "other_product".
+
+    같은 약국·도매에 결과 미확정 주문이 있는지 전송(pending 생성) 전에 확인한다.
+      same_product   그 품목의 대체주문을 멈춘다(blocked). 다음 순번으로도 넘기지 않는다.
+      other_product  장바구니 전체를 보내는 도매(SUPPORTS_CART_SYNC)면 그 도매만 건너뛴다.
+      확인 실패      그 도매는 건너뛴다(아무것도 보내지 않았으므로 안전).
+    """
     outcomes = []
     for item, need in needs:
         code = (item.get("insurance_code") or "").strip()
@@ -186,6 +196,19 @@ def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, rele
                 logger.warning("대체주문 락 획득 실패 — %s 건너뜀", sup)
                 continue
             try:
+                if check_unconfirmed is not None:
+                    try:
+                        prior = check_unconfirmed(sup, pick.product_id)
+                    except Exception as e:
+                        logger.warning("대체주문 미확정 조회 실패 [%s] — 건너뜀: %s", sup, e)
+                        continue
+                    if prior == "same_product":
+                        logger.warning("대체주문 중단 [%s/%s]: 같은 제품 미확정 주문 존재", sup, pick.product_id)
+                        outcome = FallbackOutcome(item, need, sup, 0, "blocked", BLOCKED_MESSAGE)
+                        break
+                    if prior and getattr(crawler, "SUPPORTS_CART_SYNC", False):
+                        logger.warning("대체주문 [%s] 건너뜀: 장바구니 전체 전송 도매에 미확정 주문 존재", sup)
+                        continue
                 outcome = _attempt(item, need, sup, pick, crawler, token, renew_lock,
                                    record_pending, record_result, record_unconfirmed)
             finally:
@@ -225,6 +248,8 @@ def cart_action_after_fallback(outcome: FallbackOutcome):
         return ("keep_failed", left, f"{outcome.supplier}에 {outcome.ordered_qty}개 대체주문 — 남은 {left}개")
     if outcome.state == "unconfirmed":
         return ("note", 0, f"대체주문 결과 확인 필요({outcome.supplier}) — 도매몰 주문내역을 확인하세요")
+    if outcome.state == "blocked":
+        return ("note", 0, f"{outcome.supplier} {BLOCKED_MESSAGE} — 도매몰 주문내역을 확인하세요")
     return ("none", 0, "")
 
 
