@@ -256,6 +256,9 @@ class PartialStockFallbackMixin:
       - available_stock: int | None
     """
 
+    # True 면 bare 단건 주문이 매 호출마다 장바구니를 저장·비우기·복원한다.
+    # 그러면 수량 조정 재시도 전에 래퍼가 장바구니를 비우지 않는다.
+    BARE_ORDER_MANAGES_CART: bool = False
     # 재고 이상치 가드 (파싱 버그 방지)
     _MAX_SANE_STOCK = 9999
 
@@ -432,7 +435,10 @@ class PartialStockFallbackMixin:
 
         # Phase 1 실패로 남은 장바구니 잔존을 정리 → bare 가 saved=[] 를 캡처하도록
         # 크롤러별로 clear 메서드 이름이 다르므로 duck typing 으로 시도
-        for _method_name in ("_clear_cart", "_clear_basket", "_clear_temp"):
+        # 단건 주문이 장바구니를 스스로 저장·비우기·복원하는 크롤러(인천)는 건너뛴다 —
+        # 여기서 비우면 첫 시도가 복원한 약국 품목이 지워지고 두 번째 시도가 빈 장바구니를 저장한다.
+        for _method_name in (() if self.BARE_ORDER_MANAGES_CART
+                             else ("_clear_cart", "_clear_basket", "_clear_temp")):
             clear = getattr(self, _method_name, None)
             if not callable(clear):
                 continue
