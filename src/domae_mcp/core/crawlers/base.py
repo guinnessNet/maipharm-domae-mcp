@@ -39,7 +39,11 @@ class OrderResult:
     # - original_quantity: 최초 요청 수량
     # - adjusted_quantity: 실제 주문된 수량 (재고 부족으로 축소된 경우)
     # - available_stock: 재조회된 재고
-    # - reason_code: 'ok' | 'stock_adjusted' | 'stock_zero' | 'other'
+    # - reason_code: 'ok' | 'stock_adjusted' | 'stock_zero' | 'isolated_fail' | 'rejected'
+    #                | 'not_sent' | 'send_unknown' | 'other'
+    #   not_sent     = 아무것도 전송하지 않았다 (다른 도매로 넘겨도 안전)
+    #   rejected     = 전송했고 도매가 받지 않았음이 확인됐다 (다른 도매로 넘겨도 안전)
+    #   send_unknown = 전송했으나 접수 여부를 모른다 (어디서도 다시 보내면 안 됨)
     original_quantity: Optional[int] = None
     adjusted_quantity: Optional[int] = None
     available_stock: Optional[int] = None
@@ -70,6 +74,15 @@ class _TimeoutSession(requests.Session):
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = DEFAULT_HTTP_TIMEOUT
         return super().request(*args, **kwargs)
+
+
+# 크롤러가 판정한 전송 결과는 상위 단계에서 덮지 않는다.
+# 특히 send_unknown(접수 여부 불명)을 other 로 바꾸면 DB 에 확정 실패로 남고 상위 재시도가 다시 주문한다.
+PRESERVED_REASONS = ("send_unknown", "not_sent", "rejected")
+
+
+def _keep_or_other(reason):
+    return reason if reason in PRESERVED_REASONS else "other"
 
 
 class BaseCrawler(ABC):
@@ -125,14 +138,18 @@ class BaseCrawler(ABC):
                     r.reason_code = "ok"
                 results.append(r)
                 continue
+            if r.reason_code == "send_unknown":
+                # 접수됐을 수 있다 — 수량을 줄여 다시 보내면 이중 주문이 된다
+                results.append(r)
+                continue
             # 실패 — 재고 재조회 후 수량 조정 재시도
-            stock = self.refetch_stock(pid, name)
+            stock = self._refetch_stock_for_item(item)
             if stock is not None and 0 < stock < qty:
                 r2 = self.order(pid, stock)
                 r2.original_quantity = qty
                 r2.adjusted_quantity = stock
                 r2.available_stock = stock
-                r2.reason_code = "stock_adjusted" if r2.success else "other"
+                r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
                 if r2.success and not r2.message:
                     r2.message = f"재고 부족으로 {qty}→{stock}개 조정 주문"
                 results.append(r2)
@@ -146,7 +163,7 @@ class BaseCrawler(ABC):
                     reason_code="stock_zero",
                 ))
             else:
-                r.reason_code = "other"
+                r.reason_code = _keep_or_other(r.reason_code)
                 results.append(r)
         return results
 
@@ -181,6 +198,14 @@ class BaseCrawler(ABC):
                     return max(0, local + other)
                 return max(0, qty)
         return None
+
+    def _refetch_stock_for_item(self, item: dict) -> Optional[int]:
+        """Phase 2 재고 재조회 진입점.
+
+        기본은 refetch_stock(pid, name) 그대로다. 보험코드처럼 item 의 다른 필드로
+        더 정확히 찾을 수 있는 크롤러는 이 메서드를 오버라이드한다.
+        """
+        return self.refetch_stock(item.get("product_id") or "", item.get("product_name", ""))
 
     def get_cart(self) -> list[dict]:
         """장바구니 조회. 미구현 크롤러는 빈 리스트 반환."""
@@ -234,6 +259,61 @@ class PartialStockFallbackMixin:
     # 재고 이상치 가드 (파싱 버그 방지)
     _MAX_SANE_STOCK = 9999
 
+    def _isolate_unknown_and_resubmit(self, plans, add_fn, submit_fn, clear_fn) -> None:
+        """Phase 2 전송이 거부됐을 때 재고를 확인하지 못한 품목(unknown)을 분리해 다시 보낸다.
+
+        all-or-nothing 도매는 품절 품목 하나가 장바구니 전체를 거부한다.
+          1) 재고가 확인된 품목(ok/stock_adjusted)만 담아 1회 전송
+          2) unknown 품목은 하나씩 단독 전송
+        각 묶음의 결과를 plan["final"] 에 남긴다 (accepted / rejected / not_sent / unknown).
+        비우기·담기가 실패하면 그 묶음은 보내지 않는다(이전 품목이 섞일 수 있다).
+        unknown 이 나오면 접수됐을 수 있으므로 이후 묶음은 보내지 않는다.
+        """
+        import logging
+        _log = logging.getLogger(f"domae.{self.SUPPLIER_NAME or type(self).__name__}")
+
+        unknown = [p for p in plans if p["submit_qty"] > 0 and p["reason_code"] == "unknown"]
+        if not unknown:
+            return
+        known = [p for p in plans
+                 if p["submit_qty"] > 0 and p["reason_code"] in ("ok", "stock_adjusted")]
+
+        def _send(group) -> str:
+            try:
+                clear_fn()
+            except Exception as e:
+                _log.warning("Phase 3 장바구니 비우기 실패 — 전송 생략: %s", e)
+                return "not_sent"
+            try:
+                for p in group:
+                    add_fn(p["item"]["product_id"], p["submit_qty"])
+            except Exception as e:
+                _log.warning("Phase 3 담기 실패 — 전송 생략: %s", e)
+                return "not_sent"
+            expected = {}
+            for p in group:
+                pid = p["item"]["product_id"]
+                expected[pid] = expected.get(pid, 0) + p["submit_qty"]
+            try:
+                r = submit_fn(expected)   # 전송 직전 장바구니 대조 기준 {pid: qty}
+            except Exception as e:
+                _log.error("Phase 3 전송 예외 — 접수 여부 불명, 이후 전송 중단: %s", e)
+                return "unknown"
+            if isinstance(r, str):
+                return r if r in ("accepted", "rejected", "not_sent", "unknown") else "unknown"
+            # bool 만 돌려주는 전송 함수의 False 는 거부인지 결과 불명인지 알 수 없다
+            return "accepted" if r else "unknown"
+
+        groups = ([known] if known else []) + [[p] for p in unknown]
+        stopped = False
+        for group in groups:
+            status = "not_sent" if stopped else _send(group)
+            stopped = stopped or status == "unknown"
+            _log.warning("[Phase 3] %s → %s",
+                         ",".join(str(p["item"].get("product_id")) for p in group), status)
+            for p in group:
+                p["final"] = status
+
     def _compute_adjusted_plan(self, items: list[dict]) -> list[dict]:
         """각 품목 재고 재조회 후 조정 계획 생성.
 
@@ -256,7 +336,7 @@ class PartialStockFallbackMixin:
 
             stock = None
             try:
-                stock = self.refetch_stock(pid, name)
+                stock = self._refetch_stock_for_item(item)
             except Exception:
                 stock = None
 
@@ -309,6 +389,10 @@ class PartialStockFallbackMixin:
                 r.reason_code = "ok"
             return r
 
+        if r.reason_code == "send_unknown":
+            # 접수됐을 수 있다. 수량을 줄여 다시 보내면 이중 주문이 된다.
+            return r
+
         # Phase 2 — 재고 재조회
         import logging
         _logger = logging.getLogger(f"domae.{self.SUPPLIER_NAME or type(self).__name__}")
@@ -316,7 +400,7 @@ class PartialStockFallbackMixin:
 
         stock = None
         try:
-            stock = self.refetch_stock(product_id, product_name)
+            stock = self._refetch_stock_for_item({"product_id": product_id, "product_name": product_name})
         except Exception:
             stock = None
         if stock is not None and (stock < 0 or stock > self._MAX_SANE_STOCK):
@@ -324,7 +408,7 @@ class PartialStockFallbackMixin:
 
         if stock is None:
             _logger.warning("Phase 2 재고 조회 불가 — 원래 실패 결과 유지")
-            r.reason_code = "other"
+            r.reason_code = _keep_or_other(r.reason_code)
             return r
         if stock == 0:
             _logger.warning("Phase 2 재고 0 — stock_zero")
@@ -339,7 +423,7 @@ class PartialStockFallbackMixin:
         if stock >= original_qty:
             # 재고 충분한데 실패 → 재고 외 원인. 그대로 실패 반환.
             _logger.warning("Phase 2 재고 %d ≥ 요청 %d — 재고 원인 아님, 재시도 스킵", stock, original_qty)
-            r.reason_code = "other"
+            r.reason_code = _keep_or_other(r.reason_code)
             r.available_stock = stock
             return r
 
@@ -349,28 +433,28 @@ class PartialStockFallbackMixin:
         # Phase 1 실패로 남은 장바구니 잔존을 정리 → bare 가 saved=[] 를 캡처하도록
         # 크롤러별로 clear 메서드 이름이 다르므로 duck typing 으로 시도
         for _method_name in ("_clear_cart", "_clear_basket", "_clear_temp"):
-            _m = getattr(self, _method_name, None)
-            if callable(_m):
-                try:
-                    _m()
-                    break
-                except TypeError:
-                    # familypharm 처럼 items 인자를 요구하는 경우
-                    try:
-                        _items_fn = getattr(self, "_get_cart_items", None)
-                        if callable(_items_fn):
-                            _m(_items_fn())
-                            break
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            clear = getattr(self, _method_name, None)
+            if not callable(clear):
+                continue
+            try:
+                import inspect
+                if len(inspect.signature(clear).parameters):
+                    get_items = getattr(self, "_get_cart_items", None)
+                    if not callable(get_items):
+                        raise RuntimeError("장바구니 조회 함수 없음")
+                    clear(get_items())
+                else:
+                    clear()
+            except Exception:
+                return OrderResult(success=False, message="장바구니 비우기 실패 — 전송하지 않음",
+                                   original_quantity=original_qty, reason_code="not_sent")
+            break
 
         r2 = bare_order_fn(product_id, stock)
         r2.original_quantity = original_qty
         r2.adjusted_quantity = stock
         r2.available_stock = stock
-        r2.reason_code = "stock_adjusted" if r2.success else "other"
+        r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
         if r2.success:
             # Mixin 이 수량 조정을 감지했음을 명시적으로 메시지에 반영 (bare 가 채운 "주문 전송 완료" 덮어씀)
             r2.message = f"재고 부족으로 {original_qty}→{stock}개 조정 주문"
@@ -414,8 +498,31 @@ class PartialStockFallbackMixin:
                     ))
                 continue
 
-            # 장바구니에 담긴 품목 — submit 결과에 따라 성패 분기
-            if not submit_success:
+            final = p.get("final")
+            if final == "not_sent":
+                results.append(OrderResult(
+                    success=False, message="장바구니 정리 실패로 전송하지 않음",
+                    original_quantity=qty, reason_code="not_sent"))
+                continue
+            if final == "unknown":
+                results.append(OrderResult(
+                    success=False, message="전송 결과 확인 불가 — 도매몰 주문내역 확인 필요",
+                    original_quantity=qty, reason_code="send_unknown"))
+                continue
+            if final == "rejected" and rcode == "unknown":
+                results.append(OrderResult(
+                    success=False, message="단독 전송도 거부됨 — 품절 또는 재고 부족 추정(재고 미확인)",
+                    original_quantity=qty, reason_code="isolated_fail"))
+                continue
+
+            if final == "rejected":
+                results.append(OrderResult(
+                    success=False, message="주문 전송 실패 (도매 거부)",
+                    original_quantity=qty, reason_code="rejected"))
+                continue
+
+            ok = final == "accepted" if final is not None else submit_success
+            if not ok:
                 results.append(OrderResult(
                     success=False,
                     message="주문 전송 실패 (수량 조정 후 재시도)",
