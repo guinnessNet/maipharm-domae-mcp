@@ -16,6 +16,9 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 
+from domae_mcp.core.crawlers.base import CrawlerError, OrderResult
+from domae_mcp.cloud.fallback import (cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
+from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 
 
@@ -123,6 +126,43 @@ def _requeue_delayed(redis_client, job: dict, reason: str) -> bool:
         return False
 
 
+# 전송했을 수 있는 미확정 행. 배치 일괄 실패 처리가 이 행을 false 로 덮으면
+# "주문 안 됨"으로 보이고 대조(reconcile)의 재담기 차단도 풀려 이중 주문으로 이어진다.
+UNCONFIRMED_REASONS = ("send_unknown", "fallback_pending")
+_KEEP_UNCONFIRMED = ('AND ("reasonCode" IS NULL OR "reasonCode" NOT IN '
+                     "('send_unknown', 'fallback_pending'))")
+
+NO_RETRY_KEYWORDS = [
+    "재고 0", "재고 부족", "수량 조정 후 재시도",
+    "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
+]
+# 크롤러가 이미 판정을 끝냈거나(재고), 다시 보내면 안 되는(접수 불명) 사유
+NO_RETRY_REASONS = ("stock_zero", "stock_adjusted", "send_unknown", "isolated_fail", "not_sent", "rejected")
+
+
+def _db_success(result):
+    """domae_cloud_orders.success 에 넣을 값. 접수 여부 불명(send_unknown)은 확정 실패가 아니므로 NULL."""
+    if getattr(result, "reason_code", None) == "send_unknown":
+        return None
+    return bool(result.success)
+
+
+def _is_item_retryable(result) -> bool:
+    """batch_order 의 품목별 1회 재시도 대상인가. send_unknown 을 다시 보내면 이중 주문이 된다."""
+    if getattr(result, "reason_code", None) in NO_RETRY_REASONS:
+        return False
+    msg = getattr(result, "message", "") or ""
+    return not any(kw in msg for kw in NO_RETRY_KEYWORDS)
+
+
+def _mark_sending(conn, cur, batch_id, supplier):
+    """외부 전송 전 보호 표식을 커밋한다. 결과 기록 실패/죽음에도 재전송하지 않는다."""
+    cur.execute('UPDATE domae_cloud_orders SET "reasonCode" = %s, message = %s '
+                'WHERE "batchId" = %s AND supplier = %s AND success IS NULL',
+                ('send_unknown', '전송 결과 확인 필요 — 주문 실행 중', batch_id, supplier))
+    conn.commit()
+
+
 def _fail_pending_rows(cur, batch_id, message):
     """배치를 조기 실패시킬 때 서버가 만든 pending 주문행도 함께 마감한다.
 
@@ -130,7 +170,7 @@ def _fail_pending_rows(cur, batch_id, message):
     """
     cur.execute(
         'UPDATE domae_cloud_orders SET success = false, message = %s '
-        'WHERE "batchId" = %s AND success IS NULL', (message, batch_id))
+        'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED, (message, batch_id))
 
 
 def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
@@ -141,15 +181,16 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
     # 사전검증 실패(pre_fail)는 외부 전송이 일어났다는 증거가 아니다.
     # 이것까지 세면 락 재큐잉 후 정상 품목이 영구 취소된다.
     cur.execute('SELECT count(*) FROM domae_cloud_orders '
-                'WHERE "batchId" = %s AND success IS NOT NULL '
-                'AND ("reasonCode" IS NULL OR "reasonCode" <> %s)', (batch_id, "pre_fail"))
+                'WHERE "batchId" = %s AND (success IS NOT NULL '
+                'AND ("reasonCode" IS NULL OR "reasonCode" <> %s) '
+                'OR success IS NULL AND "reasonCode" IN (\'send_unknown\', \'fallback_pending\'))', (batch_id, "pre_fail"))
     if not cur.fetchone()[0]:
         return False
 
     logger.error("batch 재실행 중단: batch=%s (%s)", batch_id, reason)
     cur.execute(
         'UPDATE domae_cloud_orders SET success = false, message = %s '
-        'WHERE "batchId" = %s AND success IS NULL', (reason, batch_id))
+        'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED, (reason, batch_id))
     cur.execute("""
         SELECT count(*) FILTER (WHERE success), count(*) FILTER (WHERE NOT success),
                coalesce(sum(CASE WHEN "reasonCode" = 'stock_adjusted' THEN 1 ELSE 0 END), 0),
@@ -1340,7 +1381,7 @@ class CloudScheduler:
                 """, ("failed", batch_id))
                 cur.execute(
                     'UPDATE domae_cloud_orders SET success = false, message = %s '
-                    'WHERE "batchId" = %s AND success IS NULL',
+                    'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED,
                     ("장바구니 락 획득 실패 (재시도 소진)", batch_id))
                 conn.commit()
                 return
@@ -1395,7 +1436,7 @@ class CloudScheduler:
                             logger.warning("batch_order 선행 search 실패 [%s / %s]: %s", supplier_name, _name, _e)
 
                 batch_items = [
-                    {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", "")}
+                    {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", ""), "insurance_code": item.get("insurance_code"), "unit": item.get("unit")}
                     for _, item in group_items
                 ]
 
@@ -1435,9 +1476,11 @@ class CloudScheduler:
                                 raise _LockUnavailable(supplier_name)
 
                             _sent_any = True
+                        _mark_sending(conn, cur, batch_id, supplier_name)
                         results = crawler.order_batch(batch_items)
                     else:
                         _sent_any = True
+                        _mark_sending(conn, cur, batch_id, supplier_name)
                         results = crawler.order_batch(batch_items)
                 except _LockUnavailable as e:
                     # lease 만료 등으로 전송 직전 락을 잃은 경우. 이 공급사는 전송하지 않았다.
@@ -1455,19 +1498,16 @@ class CloudScheduler:
                     # 이미 전송한 공급사가 있으면 재큐잉이 중복 주문을 만든다 → 이 공급사만 실패.
                     logger.error("batch_order 락 상실 [%s] (전송분 존재로 재큐잉 안 함): %s",
                                  supplier_name, e)
-                    results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
-                               for _ in group_items]
+                    results = [OrderResult(success=False, message=str(e), reason_code="not_sent") for _ in group_items]
                 except _ReconcileFatal as e:
                     conn.rollback()
                     logger.error("batch_order 대조 중단 [%s]: %s", supplier_name, e)
-                    results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
-                               for _ in group_items]
+                    results = [OrderResult(success=False, message=f"대조 중단: {e}", reason_code="not_sent") for _ in group_items]
                 except Exception as e:
                     # 대조 중 만든 pending 행이 커밋되면 아무도 마감하지 않는 고아가 된다.
                     # 대조분을 통째로 버린다.
                     conn.rollback()
-                    results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
-                               for _ in group_items]
+                    results = [OrderResult(success=False, message=str(e), reason_code="send_unknown") for _ in group_items]
 
                 # 길이 불일치 방어
                 if len(results) != len(group_items):
@@ -1475,7 +1515,7 @@ class CloudScheduler:
                                    supplier_name, len(group_items), len(results))
                     from domae_mcp.core.crawlers.base import OrderResult as _OR
                     while len(results) < len(group_items):
-                        results.append(_OR(success=False, message="결과 누락"))
+                        results.append(_OR(success=False, message="결과 누락", reason_code="send_unknown"))
 
                 # ── 1차 결과 분류 (성공/실패 분리) ──
                 succeeded = []  # [(idx, item, result)]
@@ -1492,24 +1532,14 @@ class CloudScheduler:
                 #       재시도를 이미 수행했으므로 워커 레벨 재시도는 무의미.
                 #       "수량 조정 후 재시도 실패" 는 Phase 2 submit 도 실패한 것이므로
                 #       원래 수량으로 다시 재시도하면 카트 오염 위험만 있음.
-                NO_RETRY_KEYWORDS = [
-                    "재고 0", "재고 부족", "수량 조정 후 재시도",
-                    "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
-                ]
                 retryable = []
                 # 복산 등 SUPPORTS_CART_SYNC 도매상은 전송 단위가 품목이 아니라 장바구니 전체다.
                 # 품목별 order() 재시도는 (a) 요청 외 품목 가드에 걸려 항상 거부되고
                 # (b) 통과하더라도 카트 전체를 다시 전송해 중복 주문이 된다.
                 _skip_item_retry = getattr(crawler_cls, "SUPPORTS_CART_SYNC", False)
                 for entry in ([] if _skip_item_retry else failed):
-                    msg = getattr(entry[2], "message", "")
-                    rcode = getattr(entry[2], "reason_code", None)
-                    # reason_code 가 stock_zero/stock_adjusted 는 크롤러가 이미 판정한 확정 결과
-                    if rcode in ("stock_zero", "stock_adjusted"):
-                        continue
-                    if any(kw in msg for kw in NO_RETRY_KEYWORDS):
-                        continue
-                    retryable.append(entry)
+                    if _is_item_retryable(entry[2]):
+                        retryable.append(entry)
 
                 if retryable:
                     logger.info("batch_order 재시도: %s 실패 %d건 중 %d건 재시도",
@@ -1537,9 +1567,9 @@ class CloudScheduler:
                                 still_failed.append((idx, item, retry_result))
                         except Exception as e:
                             logger.warning("batch_order 재시도 실패: %s pid=%s err=%s", supplier_name, pid, e)
-                            still_failed.append((idx, item, orig_result))
+                            still_failed.append((idx, item, OrderResult(success=False, message=str(e), reason_code="send_unknown")))
                     # failed를 재시도 불가 + 재시도 실패로 재구성
-                    failed = [e for e in failed if any(kw in getattr(e[2], "message", "") for kw in NO_RETRY_KEYWORDS)] + still_failed
+                    failed = [e for e in failed if not _is_item_retryable(e[2])] + still_failed
 
                 # ── 결과 DB 기록 ──
                 for idx, item, result in succeeded:
@@ -1579,10 +1609,12 @@ class CloudScheduler:
                     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     _record_order_result(
                         cur, monitor_id, batch_id, supplier_name, item,
-                        success=False, message=order_message,
+                        success=_db_success(result), message=order_message,
                         adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
                     fail_count += 1
-                    if rcode == "stock_zero":
+                    if rcode == "send_unknown":
+                        fail_lines.append(f"⚠ {item.get('product_name', '')} — 전송 결과 확인 필요")
+                    elif rcode == "stock_zero":
                         missing_qty_total += original_qty
                         _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
                                     f" — 요청 {original_qty} (재고 0)")
@@ -1594,7 +1626,7 @@ class CloudScheduler:
                     if cart_item_id:
                         cur.execute(
                             'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
-                            (utc_now, order_message, cart_item_id)
+                            (utc_now, "전송 결과 확인 필요 — 도매몰 주문내역 확인" if rcode == "send_unknown" else order_message, cart_item_id)
                         )
 
                 # 각 supplier 처리 후 부분 커밋 (row 기록만 확정)
@@ -1741,6 +1773,8 @@ class CloudScheduler:
         telegram_chat_id = None
         success_items = []
         failed_items = []
+        unconfirmed_items = []
+        fallback_outcomes = []
 
         try:
             cur = conn.cursor()
@@ -1765,7 +1799,7 @@ class CloudScheduler:
 
             # 2. credentials + telegramChatId 조회 (isActive 체크 포함)
             cur.execute("""
-                SELECT m.credentials, m."telegramChatId"
+                SELECT m.credentials, m."telegramChatId", m."supplierOrder", m."autoFallbackOrder"
                 FROM domae_cloud_monitors m
                 WHERE m.id = %s AND m."isActive" = true
             """, (monitor_id,))
@@ -1783,6 +1817,8 @@ class CloudScheduler:
             raw_creds = row[0]
             credentials = self._decrypt_creds(raw_creds)
             telegram_chat_id = row[1]
+            supplier_order = row[2] if isinstance(row[2], list) else []
+            auto_fallback = bool(row[3])
 
             # 3. 크롤러 로드
             if not self._crawlers_loaded:
@@ -1815,7 +1851,8 @@ class CloudScheduler:
 
             # 5. 로그인 + 주문 실행
             crawler = crawler_cls()
-            crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+            if not crawler.login(cred.get("login_id", ""), cred.get("login_pw", "")):
+                raise CrawlerError("로그인 실패")
 
             # 토큰 캐시 준비용 선행 search (TJ팜 등)
             for _it in items:
@@ -1827,7 +1864,7 @@ class CloudScheduler:
                         logger.warning("auto_order 선행 search 실패 [%s / %s]: %s", supplier_name, _name, _e)
 
             batch_items = [
-                {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", "")}
+                {"product_id": item.get("product_id"), "quantity": item.get("quantity", 1), "product_name": item.get("product_name", ""), "insurance_code": item.get("insurance_code"), "unit": item.get("unit")}
                 for item in items
             ]
 
@@ -1859,6 +1896,7 @@ class CloudScheduler:
                     if not _renew_cart_lock(self._redis, monitor_id, supplier_name, ao_token):
                         raise _LockUnavailable(supplier_name)
 
+                _mark_sending(conn, cur, batch_id, supplier_name)
                 results = crawler.order_batch(batch_items)
             except _LockUnavailable as e:
                 conn.rollback()
@@ -1869,18 +1907,15 @@ class CloudScheduler:
                     logger.warning("auto_order 락 미획득 → 재큐잉: %s", supplier_name)
                     _release_cart_lock(self._redis, monitor_id, supplier_name, ao_token)
                     return
-                results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
-                           for _ in items]
+                results = [OrderResult(success=False, message=str(e), reason_code="not_sent") for _ in items]
             except _ReconcileFatal as e:
                 conn.rollback()
                 logger.error("auto_order 대조 중단 [%s]: %s", supplier_name, e)
-                results = [type('R', (), {'success': False, 'message': f"대조 중단: {e}", 'order_id': ''})()
-                           for _ in items]
+                results = [OrderResult(success=False, message=f"대조 중단: {e}", reason_code="not_sent") for _ in items]
             except Exception as e:
                 # 대조 중 만든 pending 행이 커밋되면 고아가 된다 (batch_order 와 동일 처리)
                 conn.rollback()
-                results = [type('R', (), {'success': False, 'message': str(e), 'order_id': ''})()
-                           for _ in items]
+                results = [OrderResult(success=False, message=str(e), reason_code="send_unknown") for _ in items]
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, ao_token)
 
@@ -1890,37 +1925,56 @@ class CloudScheduler:
                                supplier_name, len(items), len(results))
                 from domae_mcp.core.crawlers.base import OrderResult as _OR
                 while len(results) < len(items):
-                    results.append(_OR(success=False, message="결과 누락"))
+                    results.append(_OR(success=False, message="결과 누락", reason_code="send_unknown"))
 
             success_count = 0
             fail_count = 0
+            fallback_needs = []
 
             for item, result in zip(items, results):
-                order_success = result.success
-                order_id_val = getattr(result, "order_id", None)
+                rcode = getattr(result, "reason_code", None)
                 order_message = getattr(result, "message", "")
-                order_price = item.get("price")
-
+                unconfirmed = (not result.success) and rcode == "send_unknown"
                 utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                # 접수 여부 불명은 확정 실패가 아니다 — success 를 NULL 로 남긴다
                 _record_order_result(
                     cur, monitor_id, batch_id, supplier_name, item,
-                    success=order_success, message=order_message, order_id=order_id_val)
+                    success=_db_success(result),
+                    message=order_message, order_id=getattr(result, "order_id", None),
+                    adjusted_qty=getattr(result, "adjusted_quantity", None),
+                    avail_stock=getattr(result, "available_stock", None),
+                    reason_code=rcode)
 
-                if order_success:
+                if result.success:
                     success_count += 1
-                    success_items.append(item)
-                    cart_item_id = item.get("cart_item_id")
-                    if cart_item_id:
-                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                    req = int(item.get("quantity", 1))
+                    got = getattr(result, "adjusted_quantity", None) or req
+                    success_items.append({**item, "quantity": got, "requested_quantity": req})
+                elif unconfirmed:
+                    unconfirmed_items.append(item)
                 else:
                     fail_count += 1
-                    failed_items.append({**item, "message": order_message})
-                    cart_item_id = item.get("cart_item_id")
-                    if cart_item_id:
+                    failed_items.append({**item, "message": order_message, "_src": item})
+
+                cart_item_id = item.get("cart_item_id")
+                action, keep_qty, why = cart_action_after_order(item, result)
+                if cart_item_id:
+                    if action == "delete":
+                        cur.execute('DELETE FROM domae_cart_items WHERE id = %s', (cart_item_id,))
+                    elif action == "keep_failed":
+                        # 일부만 주문됐다. 남은 수량을 지우면 약국이 모르는 사이 사라진다.
+                        cur.execute(
+                            'UPDATE domae_cart_items SET quantity = %s, "failedAt" = %s, "failReason" = %s WHERE id = %s',
+                            (keep_qty, utc_now, why, cart_item_id))
+                    else:  # fail, hold — 실패 상태로 묶어 다음 자동주문에서 빠지게 한다
                         cur.execute(
                             'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
-                            (utc_now, order_message, cart_item_id)
-                        )
+                            (utc_now, why, cart_item_id))
+
+                need = fallback_need_qty(item, result) if auto_fallback else 0
+                if need > 0:
+                    fallback_needs.append((item, need))
 
             # 6. batch 완료
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1931,8 +1985,58 @@ class CloudScheduler:
             """, ("completed", success_count, fail_count, utc_now, batch_id))
             conn.commit()
 
+            fallback_outcomes = []
+            if fallback_needs:
+                fconn = None
+                try:
+                    fconn = self._get_conn()
+                    rec = FallbackRecorder(
+                        fconn, monitor_id, batch_id, supplier_name, _record_order_result,
+                        id_fn=_generate_cuid,
+                        now_fn=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+                    available = {s for s in credentials if self._crawlers.get(s)}
+                    candidates = next_suppliers(supplier_order, supplier_name, available)
+                    opened = {}
+
+                    def _open(sup):
+                        if sup not in opened:
+                            c = self._crawlers[sup]()
+                            c.login(credentials[sup].get("login_id", ""), credentials[sup].get("login_pw", ""))
+                            opened[sup] = c
+                        return opened[sup]
+
+                    def _is_sync(sup):
+                        return getattr(self._crawlers[sup], "SUPPORTS_CART_SYNC", False)
+
+                    def _lock(sup):
+                        return _acquire_cart_lock(self._redis, monitor_id, sup) if _is_sync(sup) else "nolock"
+
+                    def _renew(sup, token):
+                        return True if token == "nolock" else _renew_cart_lock(self._redis, monitor_id, sup, token)
+
+                    def _unlock(sup, token):
+                        if token and token != "nolock":
+                            _release_cart_lock(self._redis, monitor_id, sup, token)
+
+                    fallback_outcomes = run_fallback(
+                        fallback_needs, candidates, _open, _lock, _renew, _unlock,
+                        rec.pending, rec.result, rec.unconfirmed)
+                    for o in fallback_outcomes:
+                        action, keep_qty, why = cart_action_after_fallback(o)
+                        try:
+                            rec.apply_cart(o.item.get("cart_item_id"), action, keep_qty, why)
+                        except Exception as e:
+                            logger.error("대체주문 장바구니 반영 실패 cart=%s: %s", o.item.get("cart_item_id"), e)
+                        logger.info("대체주문 %s: %s → %s (%s)", o.state, supplier_name, o.supplier or "-", o.message)
+                except Exception as e:
+                    logger.error("대체주문 처리 실패 — 원 주문 결과에는 영향 없음: %s", e, exc_info=True)
+                finally:
+                    if fconn is not None:
+                        self._db_pool.putconn(fconn)
+
             # 7. DomaeAutoOrderLog 상태 업데이트
-            if fail_count == 0:
+            has_shortfall = any(i["requested_quantity"] > i["quantity"] for i in success_items)
+            if fail_count == 0 and not unconfirmed_items and not has_shortfall:
                 log_status = "success"
             elif success_count > 0:
                 log_status = "partial_fail"
@@ -1945,7 +2049,7 @@ class CloudScheduler:
                 self._send_auto_order_telegram(
                     telegram_chat_id, supplier_name, success_items, failed_items,
                     conn=conn, monitor_id=monitor_id, credentials=credentials,
-                    scheduled_at=scheduled_at,
+                    scheduled_at=scheduled_at, unconfirmed_items=unconfirmed_items, fallback_outcomes=fallback_outcomes,
                 )
 
             # 9. SSE 결과 알림 (Redis publish)
@@ -1953,9 +2057,13 @@ class CloudScheduler:
                 self._redis.publish(f"domae:notifications:{monitor_id}", json.dumps({
                     "type": "auto_order_result",
                     "supplier": supplier_name,
-                    "status": "success" if not failed_items else "partial_fail",
+                    "status": "success" if not failed_items and not unconfirmed_items and not has_shortfall else "partial_fail",
                     "count": len(success_items),
-                    "totalPrice": sum(i.get("price", 0) * i.get("quantity", 0) for i in success_items if i.get("price")),
+                    "totalPrice": sum((i.get("price") or 0) * int(i.get("quantity", 0)) for i in success_items),
+                    "shortfall": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
+                                     for i in success_items),
+                    "unconfirmed": len(unconfirmed_items),
+                    "fallbackOrdered": sum(1 for o in fallback_outcomes if o.state == "ordered"),
                 }))
             except Exception as e:
                 logger.warning("auto_order SSE publish 실패: %s", e)
@@ -1975,11 +2083,11 @@ class CloudScheduler:
                 pass
             self._update_auto_order_log(conn, monitor_id, batch_id, "failed", str(e)[:200])
             # 부분 성공이라도 텔레그램 알림
-            if telegram_chat_id and (success_items or failed_items):
+            if telegram_chat_id and (success_items or failed_items or unconfirmed_items):
                 self._send_auto_order_telegram(
                     telegram_chat_id, supplier_name, success_items, failed_items,
                     conn=conn, monitor_id=monitor_id, credentials=credentials,
-                    scheduled_at=scheduled_at,
+                    scheduled_at=scheduled_at, unconfirmed_items=unconfirmed_items, fallback_outcomes=fallback_outcomes,
                 )
         finally:
             self._db_pool.putconn(conn)
@@ -2005,113 +2113,56 @@ class CloudScheduler:
     def _send_auto_order_telegram(self, chat_id: str, supplier: str, success_items: list,
                                   failed_items: list, global_error: str = None,
                                   conn=None, monitor_id: str = None, credentials: dict = None,
-                                  scheduled_at: str = ""):
-        """자동주문 결과 텔레그램 알림 전송.
-
-        실패 품목이 있으면 다른 도매에서 대체 검색 후 인라인 버튼으로 표시.
-        """
+                                  scheduled_at: str = "", unconfirmed_items=None, fallback_outcomes=None):
+        """실제 주문 수량과 미확정 결과를 알린다. 미확정 품목에는 재주문 버튼을 제공하지 않는다."""
         try:
             from domae_mcp.cloud.notifier import Notifier
-            # scheduled_at은 이미 KST 기준 마감시간 (예: "14:00")
-            if scheduled_at:
-                now_str = scheduled_at
-            else:
-                KST = timezone(timedelta(hours=9))
-                now_str = datetime.now(KST).strftime("%H:%M")
-
+            unconfirmed_items = unconfirmed_items or []
+            fallback_outcomes = fallback_outcomes or []
+            now_str = scheduled_at or datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
             if global_error:
-                # 전체 실패 (계정 미등록, 크롤러 없음 등)
-                msg = f"❌ 자동주문 실패 ({supplier}, {now_str})\n\n{global_error}\n\n수동으로 확인해주세요."
-                Notifier.send_telegram(chat_id, msg)
+                Notifier.send_telegram(chat_id, f"❌ 자동주문 실패 ({supplier}, {now_str})\n\n{global_error}\n\n수동으로 확인해주세요.")
                 return
-
-            if success_items and not failed_items:
-                # 전체 성공
-                lines = [f"✅ 자동주문 완료 ({supplier}, {now_str})\n", "주문 내역:"]
-                total_price = 0
-                for item in success_items:
-                    qty = item.get("quantity", 1)
-                    price = item.get("price", 0) or 0
-                    line_total = price * qty
-                    total_price += line_total
-                    lines.append(f"• {item.get('product_name', '')} — {qty}개 — {line_total:,}원")
-                lines.append(f"\n총 {len(success_items)}건, {total_price:,}원 주문 완료")
-                Notifier.send_telegram(chat_id, "\n".join(lines))
-                return
-
-            # 실패 품목 있음 → 대체 도매 검색
-            inline_keyboard = []
-            if failed_items and credentials and monitor_id:
-                available_suppliers = [
-                    s for s in credentials.keys()
-                    if s != supplier and self._crawlers.get(s)
-                ]
-                for item in failed_items[:5]:  # 최대 5개 품목만 대체 검색
-                    alt_results = self._search_alternatives(
-                        item.get("product_name", ""), available_suppliers, credentials
-                    )
-                    if alt_results:
-                        row = []
-                        for alt in alt_results[:3]:  # 도매당 최대 3개
-                            price_str = f" {alt['price']:,}원" if alt.get("price") else ""
-                            mid = Notifier._sanitize_cb_field(monitor_id, 8)
-                            sup = Notifier._sanitize_cb_field(alt["supplier"], 10)
-                            pid = Notifier._sanitize_cb_field(alt["product_id"], 16)
-                            qty = item.get("quantity", 1)
-                            cb_data = f"AO:{mid}:{sup}:{pid}:{qty}"
-                            if len(cb_data.encode("utf-8")) <= 64:
-                                row.append({
-                                    "text": f"{alt['supplier']}{price_str}",
-                                    "callback_data": cb_data,
-                                })
-                        if row:
-                            inline_keyboard.append(row)
-
-            reply_markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
-
-            if not success_items and failed_items:
-                # 전체 실패
-                lines = [f"❌ 자동주문 실패 ({supplier}, {now_str})\n"]
-                for item in failed_items[:10]:
-                    qty = item.get("quantity", 1)
-                    reason = item.get("message", "주문 실패")
-                    lines.append(f"• {item.get('product_name', '')} {qty}개 — {reason}")
-                if len(failed_items) > 10:
-                    lines.append(f" ... 외 {len(failed_items) - 10}건")
-                if inline_keyboard:
-                    lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
-                else:
-                    lines.append("\n수동으로 확인해주세요.")
-                Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup=reply_markup)
-
-            else:
-                # 부분 실패
-                lines = [f"⚠️ 자동주문 부분 완료 ({supplier}, {now_str})\n"]
+            handled = {id(o.item) for o in fallback_outcomes if o.state in ("ordered", "unconfirmed")}
+            button_items = [it for it in failed_items if id(it.get("_src", it)) not in handled]
+            keyboard = []
+            if button_items and credentials and monitor_id:
+                available = [s for s in credentials if s != supplier and self._crawlers.get(s)]
+                for item in button_items[:5]:
+                    row = []
+                    for alt in self._search_alternatives(item.get("product_name", ""), available, credentials)[:3]:
+                        mid = Notifier._sanitize_cb_field(monitor_id, 8)
+                        sup = Notifier._sanitize_cb_field(alt["supplier"], 10)
+                        pid = Notifier._sanitize_cb_field(alt["product_id"], 16)
+                        cb = f"AO:{mid}:{sup}:{pid}:{item.get('quantity', 1)}"
+                        if len(cb.encode("utf-8")) <= 64:
+                            price = f" {alt['price']:,}원" if alt.get("price") else ""
+                            row.append({"text": f"{alt['supplier']}{price}", "callback_data": cb})
+                    if row:
+                        keyboard.append(row)
+            partial = bool(failed_items or unconfirmed_items or any(i.get("requested_quantity", i.get("quantity", 0)) > i.get("quantity", 0) for i in success_items))
+            title = "⚠️ 자동주문 부분 완료" if partial and success_items else "❌ 자동주문 실패" if partial else "✅ 자동주문 완료"
+            lines = [f"{title} ({supplier}, {now_str})\n"]
+            if success_items:
                 lines.append("✅ 성공:")
-                total_price = 0
-                for item in success_items[:10]:
-                    qty = item.get("quantity", 1)
-                    price = item.get("price", 0) or 0
-                    line_total = price * qty
-                    total_price += line_total
-                    lines.append(f"• {item.get('product_name', '')} — {qty}개 — {line_total:,}원")
-                if len(success_items) > 10:
-                    lines.append(f" ... 외 {len(success_items) - 10}건")
-
+                lines.extend(format_ordered_line(it) for it in success_items[:10])
+                total = sum((it.get("price") or 0) * int(it.get("quantity", 0)) for it in success_items)
+                lines.append(f"총 {len(success_items)}건, {total:,}원 주문 완료")
+            if button_items:
                 lines.append("\n❌ 실패:")
-                for item in failed_items[:10]:
-                    qty = item.get("quantity", 1)
-                    reason = item.get("message", "주문 실패")
-                    lines.append(f"• {item.get('product_name', '')} — {reason}")
-                if len(failed_items) > 10:
-                    lines.append(f" ... 외 {len(failed_items) - 10}건")
-
-                if inline_keyboard:
-                    lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
-                else:
-                    lines.append("\n수동으로 확인해주세요.")
-                Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup=reply_markup)
-
+                lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개 — {it.get('message', '주문 실패')}" for it in button_items[:10])
+            if unconfirmed_items:
+                lines.append("\n⚠ 전송 결과 확인 필요 (도매몰 주문내역을 확인해 주세요):")
+                lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개" for it in unconfirmed_items)
+            if fallback_outcomes:
+                lines.append("\n대체 주문:")
+                for o in fallback_outcomes:
+                    mark = {"ordered": "↪", "unconfirmed": "⚠"}.get(o.state, "✗")
+                    text = f"{o.supplier} {o.ordered_qty}개 주문 완료" if o.state == "ordered" else o.message
+                    lines.append(f"{mark} {o.item.get('product_name', '')} — {text}")
+            if keyboard:
+                lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
+            Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard} if keyboard else None)
         except Exception as e:
             logger.warning("자동주문 텔레그램 알림 실패: %s", e)
 
