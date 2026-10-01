@@ -193,6 +193,7 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
         'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED, (reason, batch_id))
     cur.execute("""
         SELECT count(*) FILTER (WHERE success), count(*) FILTER (WHERE NOT success),
+               count(*) FILTER (WHERE success IS NULL AND "reasonCode" IN ('send_unknown', 'fallback_pending')),
                coalesce(sum(CASE WHEN "reasonCode" = 'stock_adjusted' THEN 1 ELSE 0 END), 0),
                coalesce(sum(CASE WHEN "reasonCode" = 'stock_zero' THEN quantity
                                  WHEN "adjustedQuantity" IS NOT NULL
@@ -200,15 +201,15 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
                                  ELSE 0 END), 0)
         FROM domae_cloud_orders WHERE "batchId" = %s
     """, (batch_id,))
-    ok, ng, adj, missing = cur.fetchone()
-    # 정상 완료 경로가 실패 품목이 있어도 'completed' 를 쓰므로 같은 관례를 따른다.
-    # 여기서만 'partial_fail' 같은 신규 상태를 쓰면 조회 API·화면과 어긋난다.
+    ok, ng, unconfirmed, adj, missing = cur.fetchone()
+    # 보호된 미확정 행은 사람이 확인할 때까지 processing 상태를 유지한다.
+    # 확정 실패·완료 시각으로 표시하면 접수 불명을 확정 실패로 오인하게 된다.
     cur.execute("""
         UPDATE domae_order_batches
-        SET status = %s, "completedAt" = now(), "successCount" = %s, "failCount" = %s,
+        SET status = %s, "completedAt" = CASE WHEN %s THEN NULL ELSE now() END, "successCount" = %s, "failCount" = %s,
             "adjustedCount" = %s, "missingQuantity" = %s
         WHERE id = %s
-    """, ("completed" if ok else "failed", ok, ng, adj, missing, batch_id))
+    """, ("processing" if unconfirmed else "completed" if ok else "failed", bool(unconfirmed), ok, ng, adj, missing, batch_id))
     conn.commit()
     return True
 

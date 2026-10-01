@@ -27,7 +27,7 @@ def test_fail_pending_rows_protects_unconfirmed():
 
 
 def test_finalize_protects_unconfirmed():
-    cur = Cur(rows=[(1,), (0, 0, 0, 0)])
+    cur = Cur(rows=[(1,), (0, 0, 0, 0, 0)])
     class Conn:
         def commit(self): pass
     sch._finalize_if_confirmed(Conn(), cur, "b1", "재실행 중단")
@@ -50,7 +50,7 @@ def test_db_success_keeps_unknown_null():
 
 
 def test_finalize_stops_when_only_unconfirmed_rows_exist():
-    cur=Cur(rows=[(1,), (0,0,0,0)])
+    cur=Cur(rows=[(1,), (0,0,0,0,0)])
     class Conn:
         def commit(self): pass
     assert sch._finalize_if_confirmed(Conn(),cur,'b','retry')
