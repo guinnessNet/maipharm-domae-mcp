@@ -445,6 +445,10 @@ def _utcnow():
 class ClaimLost(Exception):
     """회수 또는 상태 변경으로 실행 소유권을 잃음 — 이후 전송 금지."""
 
+    def __init__(self, message="실행 소유권을 잃음", *, discard_conn=False):
+        super().__init__(message)
+        self.discard_conn = discard_conn
+
 
 def _urgent_claim(conn, cur, uo_id, expected_filled):
     token = uuid.uuid4().hex
@@ -463,7 +467,14 @@ def _owned_update(conn, cur, uo_id, token, set_sql, params=()):
     cur.execute(f'UPDATE domae_urgent_orders SET {set_sql} WHERE id=%s AND "sendingToken"=%s',
                 (*params, uo_id, token))
     owned = cur.rowcount == 1
-    conn.commit()
+    try:
+        conn.commit()
+    except Exception as error:
+        if not owned:
+            # UPDATE0은 이미 확정된 소유권 실패다. commit 응답 불명이 이 증거를 지우지 않는다.
+            raise ClaimLost("실행 소유권을 잃음 — DB 정리 결과 불명", discard_conn=isinstance(
+                error, (psycopg2.OperationalError, psycopg2.InterfaceError))) from error
+        raise
     if not owned:
         raise ClaimLost("실행 소유권을 잃음")
 
@@ -3533,7 +3544,8 @@ class CloudScheduler:
             except DeadlineExpired:
                 run.deadline_expired = True
                 break
-            except ClaimLost:
+            except ClaimLost as error:
+                run.discard_conn |= error.discard_conn
                 run.lost = run.claimed
                 confirmed = (step.qty if step.state == "filled" else step.fulfilled) if step else 0
                 if step is not None and (confirmed or step.state == "halt") and not committed:
@@ -3558,7 +3570,8 @@ class CloudScheduler:
                     "completedAt"=CASE WHEN "filledQuantity">="totalQuantity" THEN %s ELSE "completedAt" END,
                     "sendingAt"=NULL,"sendingToken"=NULL''', (_utcnow(),))
                 run.completed = run.total_filled >= run.total_qty
-            except ClaimLost:
+            except ClaimLost as error:
+                run.discard_conn |= error.discard_conn
                 run.lost = True
         # 정상 누적 로그·체결/중단/재고 알림은 완료 처리(C4)가 run을 사용해 작성한다.
         return run

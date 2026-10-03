@@ -207,6 +207,7 @@ def inject_connection_fault(env, monkeypatch, fault):
             if self.phase == 'receipt':
                 trace['receipt_commits'] += 1
                 if fault == 'receipt_commit_ack': raise RuntimeError('local receipt commit ACK lost')
+                if fault == 'receipt_commit_operational': raise psycopg2.OperationalError('local receipt commit ACK lost')
             if self.phase == 'audit' and fault in ('audit_commit_ack', 'audit_commit_rollback'):
                 raise psycopg2.OperationalError('local audit commit ACK lost')
         def rollback(self):
@@ -249,6 +250,42 @@ def test_receipt_actual_commit_response_loss_keeps_evidence_and_protects_token(e
     assert runs[0].unsettled[0]['quantity'] == 4
     assert any('DB 반영 불명' in str(alert) and '4개' in str(alert) for alert in alerts)
     if payload: assert payload['filled_quantity'] == 0 and payload['total_filled'] == 4
+
+
+@pytest.mark.parametrize('wrapper', ['periodic', 'immediate'])
+@pytest.mark.parametrize('fault', ['receipt_commit_ack', 'receipt_commit_operational'])
+@pytest.mark.parametrize('quantity,unknown', [(4, False), (0, True), (3, True)])
+def test_update_zero_owner_loss_survives_commit_ack_failure_and_retention(
+        env, monkeypatch, wrapper, fault, quantity, unknown):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env, suppliers=(('인천', 'P1'), ('백제', 'P1')))
+    receipt = (OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=quantity)
+               if unknown else OrderResult(success=True, adjusted_quantity=quantity))
+    sc._crawlers = {'인천': make_crawler(9, [receipt], on_order=lambda _: update(
+        db, uo, '"sendingToken"=NULL,"checkRequired"=true,"checkRevision"=7')),
+        '백제': make_crawler()}
+    trace = inject_connection_fault(env, monkeypatch, fault)
+    payload = immediate(env, uo, mid) if wrapper == 'immediate' else periodic(env, mid, creds)
+    records = logs(db, uo)
+    prefix = ('⚠ 실행 소유권 상실 뒤 전송 결과 불명:' if unknown
+              else '⚠ 확인 처리 이후 도착한 체결:')
+    assert len(records) == 1 and records[0][:3] == ('인천', quantity, quantity > 0)
+    assert records[0][3].startswith(prefix)
+    assert len(alerts) == 1 and trace['receipt_commits'] == 1
+    assert read_urgent(db, uo) == (0, False, True, None, False)
+    assert sc._crawlers['백제'].orders == []
+    if fault == 'receipt_commit_operational': assert 'receipt' in trace['discarded']
+    if payload: assert payload['filled_quantity'] == 0 and payload['state'] == 'check_required'
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute('SELECT "checkRevision" FROM domae_urgent_orders WHERE id=%s', (uo,))
+        assert cur.fetchone() == (7,)
+        for i in range(25):
+            cur.execute('INSERT INTO domae_urgent_logs (id,"urgentOrderId",supplier,"orderedQuantity",success,message) '
+                        'VALUES (%s,%s,%s,0,false,%s)', (uo+f'_ordinary{i:02}', uo, '백제', 'ordinary'))
+    sc._finish_urgent_run(None, None, mid, uo, sch.UrgentRun(supplier_results={'백제': {'quantity': 0}}))
+    assert len(logs(db, uo)) == 21
+    assert any(s == '인천' and q == quantity and msg.startswith(prefix) for s,q,ok,msg in logs(db, uo))
+    assert not pool._used
 
 
 @pytest.mark.parametrize('fault', ['audit_commit_ack', 'audit_insert_rollback', 'audit_commit_rollback'])
