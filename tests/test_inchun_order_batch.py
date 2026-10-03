@@ -8,6 +8,7 @@
 import importlib.util
 import os
 import sys
+from pathlib import Path
 sys.path.insert(0, "src")
 
 from bs4 import BeautifulSoup as bs
@@ -22,6 +23,10 @@ spec = importlib.util.spec_from_file_location("inchun_under_test", PATH)
 inchun = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inchun)
 Crawler = inchun.InchunCrawler
+HMP_PATH = Path(PATH).parent / "hmpmall.py"
+hmp_spec = importlib.util.spec_from_file_location("hmpmall_under_test", HMP_PATH)
+hmpmall = importlib.util.module_from_spec(hmp_spec)
+hmp_spec.loader.exec_module(hmpmall)
 
 
 def sr(pid, qty, name="x"):
@@ -50,10 +55,14 @@ class Resp:
 
 class Sess:
     """GET 은 준비된 페이지를 순서대로 돌려준다."""
-    def __init__(self, pages, post_raises=False, post_status=200):
+    def __init__(self, pages, post_raises=False, post_status=200, on_get=None):
         self.pages, self.post_raises, self.post_status, self.posts = list(pages), post_raises, post_status, 0
+        self.gets, self.on_get = 0, on_get
 
     def get(self, url, **k):
+        self.gets += 1
+        if self.on_get:
+            self.on_get(self.gets)
         return self.pages.pop(0) if self.pages else Resp(200, ERROR_PAGE)
 
     def post(self, url, data=None, **k):
@@ -141,6 +150,27 @@ def test_submit_refuses_on_qty_or_price_mismatch():
 def test_submit_refuses_foreign_item():
     c = probe([Resp(200, page([("A", 1, 1000), ("Z", 3, 500)]))])
     assert c._submit_order_status(EXP_A1) == "not_sent" and c.session.posts == 0
+
+
+def test_inchun_send_guard_blocks_post():
+    c = probe([Resp(200, page(A1))])
+    c.send_guard = lambda: (_ for _ in ()).throw(RuntimeError("소유권 상실"))
+    assert c._submit_order_status(EXP_A1) == "not_sent"
+    assert c.session.posts == 0
+
+
+def test_inchun_send_guard_rechecked_after_final_cart_read():
+    invalidated = []
+    c = probe([Resp(200, page(A1))])
+    c.session.on_get = lambda count: invalidated.append(True)
+
+    def guard():
+        if invalidated:
+            raise RuntimeError("최종 조회 중 소유권 상실")
+
+    c.send_guard = guard
+    assert c._submit_order_status(EXP_A1) == "not_sent"
+    assert c.session.posts == 0
 
 
 # ── 2) order_batch() 흐름 — _read_cart/_post_order 만 메모리로 대신한다 ─────
@@ -291,6 +321,37 @@ def test_single_order_adjusted_resend_unknown_end_to_end():
     assert r.success is False and r.reason_code == "send_unknown"
     assert sch._db_success(r) is None
     assert sch._is_item_retryable(r) is False
+
+
+def test_inchun_guard_loss_after_first_post_blocks_phase2_resend():
+    c = FakeInchun({"A": 2}, {"정로환에프정": [sr("A", 2)]})
+    c.send_guard = lambda: (_ for _ in ()).throw(RuntimeError("소유권 상실")) if c.submits else None
+    result = c.order_batch([{"product_id": "A", "quantity": 5,
+                             "product_name": "동성 정로환에프정/36T"}])
+    assert len(c.submits) == 1
+    assert result[0].reason_code == "not_sent"
+
+
+def test_inchun_is_urgent_safe_and_forwards_all_order_kwargs():
+    c = Crawler.__new__(Crawler)
+    captured = {}
+    expected = object()
+
+    def fallback(bare, pid, quantity, **kwargs):
+        captured.update(bare=bare, pid=pid, quantity=quantity, kwargs=kwargs)
+        return expected
+
+    c._order_with_stock_fallback = fallback
+    result = c.order("A", 3, product_name="제품", insurance_code="123456789")
+    assert Crawler.URGENT_ORDER_SAFE is True and Crawler.send_guard is None
+    assert result is expected
+    assert captured["kwargs"] == {"product_name": "제품", "insurance_code": "123456789"}
+
+
+def test_hmp_unimplemented_order_is_not_sent_without_retry():
+    c = hmpmall.HmpMallCrawler.__new__(hmpmall.HmpMallCrawler)
+    result = c.order("A", 1)
+    assert result.reason_code == "not_sent" and result.no_retry is True
 
 
 def test_incomplete_cart_row_is_not_sent():
