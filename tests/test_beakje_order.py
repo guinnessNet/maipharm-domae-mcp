@@ -431,3 +431,47 @@ def test_postresponse_untrusted_cart_freezes_restoration(failure):
     r = c._order_bare('A|01', 2)
     assert r.success and len(site.sends) == 1
     assert site.basket == {} and c.cart_snapshot.load() is not None
+
+
+@pytest.mark.parametrize('race', ['none', 'cart', 'replace', 'expire', 'owned_error'])
+def test_second_guard_timeout_restores_only_verified_owned_cart(race):
+    site = Site({'A|01': 9}, {'Z|01': 3})
+    c = crawler(site)
+    checks, mutations = [], []
+    post, delete = site.post, site.delete
+    def tracking_post(url, **kw):
+        mutations.append(url)
+        return post(url, **kw)
+    def tracking_delete(url, **kw):
+        mutations.append(url)
+        return delete(url, **kw)
+    site.post, site.delete = tracking_post, tracking_delete
+    count_at_timeout = []
+    def guard():
+        checks.append(1)
+        if len(checks) != 2:
+            return
+        if race == 'cart':
+            site.basket['NEW|01'] = 8
+        elif race == 'replace':
+            c.cart_snapshot._r.set(c.cart_snapshot.lock_key, 'new-owner')
+        elif race == 'expire':
+            c.cart_snapshot._r.delete(c.cart_snapshot.lock_key)
+        elif race == 'owned_error':
+            def failed():
+                raise RuntimeError('ownership unavailable')
+            c.cart_snapshot.owned = failed
+        count_at_timeout.append(len(mutations))
+        raise TimeoutError('deadline')
+    c.send_guard = guard
+    r = c._order_bare('A|01', 2)
+    assert r.reason_code == 'not_sent' and r.no_retry and not site.sends
+    if race == 'none':
+        assert site.basket == {'Z|01': 3}
+        assert c.cart_snapshot.load() is None and not c._cart_frozen
+    else:
+        assert len(mutations) == count_at_timeout[0]
+        assert site.basket == ({'A|01': 2, 'NEW|01': 8} if race == 'cart' else {'A|01': 2})
+        assert c.cart_snapshot.load() is not None
+        if race == 'replace':
+            assert c.cart_snapshot._r.get(c.cart_snapshot.lock_key) == b'new-owner'
