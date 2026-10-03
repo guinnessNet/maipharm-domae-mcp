@@ -28,9 +28,21 @@ SUPPLIERS = {'beakje': '백제', 'tjpharm': '티제이팜', 'geoweb': '지오영
 CART_MODULE = 'domae_mcp.core.crawlers.cart_snapshot'
 
 
+def historical_repo():
+    """Only Git fixture provenance may come from outside the selected archive."""
+    repo = Path(os.environ.get('DOMAE_TEST_HISTORIC_WORKER_REPO', ROOT)).expanduser().resolve()
+    if not repo.is_dir():
+        raise RuntimeError('historical Git provenance repository does not exist')
+    for args in (['rev-parse', '--git-dir'], ['cat-file', '-e', f'{HISTORIC_SHA}^{{commit}}']):
+        if subprocess.run(['git', *args], cwd=repo, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            raise RuntimeError('historical Git provenance must contain the exact historic commit pin')
+    return repo
+
+
 def historical_module(monkeypatch, name):
     full_name = 'domae_mcp.core.crawlers.' + name
-    code = subprocess.check_output(['git', 'show', f'{HISTORIC_SHA}:src/domae_mcp/core/crawlers/{name}.py'], cwd=ROOT).decode()
+    code = subprocess.check_output(['git', 'show', f'{HISTORIC_SHA}:src/domae_mcp/core/crawlers/{name}.py'], cwd=historical_repo()).decode()
     module = types.ModuleType(full_name)
     monkeypatch.setitem(sys.modules, full_name, module)
     exec(compile(code, f'<git:{HISTORIC_SHA}:{name}>', 'exec'), module.__dict__)
@@ -41,7 +53,7 @@ def historical_module(monkeypatch, name):
 def runtime(monkeypatch, tmp_path):
     def load(mode):
         if mode in ('historic_absent', 'historic_present'):
-            assert subprocess.run(['git', 'cat-file', '-e', f'{HISTORIC_SHA}:src/domae_mcp/core/crawlers/cart_snapshot.py'], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
+            assert subprocess.run(['git', 'cat-file', '-e', f'{HISTORIC_SHA}:src/domae_mcp/core/crawlers/cart_snapshot.py'], cwd=historical_repo(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
             old = historical_module(monkeypatch, 'base')
             assert 'no_retry' not in old.OrderResult.__dataclass_fields__
         else:
@@ -182,3 +194,30 @@ def test_cart_module_internal_import_errors_are_not_hidden(monkeypatch, runtime,
         return original(name, *a, **kw)
     monkeypatch.setattr(builtins, '__import__', broken)
     assert runtime('latest') == {}
+
+
+def test_archive_root_uses_explicit_historic_git_provenance(monkeypatch, tmp_path, runtime):
+    selected_runtime_base = base
+    assert Path(base.__file__).resolve().is_relative_to(ROOT / 'src')
+    historic_repo = Path(os.environ.get('DOMAE_TEST_HISTORIC_WORKER_REPO', ROOT))
+    archive_root = tmp_path / 'extracted-worker'
+    archive_root.mkdir()
+    assert not (archive_root / '.git').exists()
+    monkeypatch.setitem(globals(), 'ROOT', archive_root)
+    monkeypatch.setenv('DOMAE_TEST_HISTORIC_WORKER_REPO', str(historic_repo))
+    # Same real old base/result + loader exec + repeated order wire-zero test.
+    test_legacy_loader_login_search_and_all_order_entries_blocked(runtime, 'historic_absent')
+    test_latest_loader_keeps_cartguard_and_capability(runtime)
+    # Only historical Git fixtures use the override; selected runtime stays bound.
+    assert base is selected_runtime_base
+
+
+@pytest.mark.parametrize('invalid', ['not_git', 'missing_pin'])
+def test_historic_git_provenance_must_contain_exact_pin(monkeypatch, tmp_path, invalid):
+    if invalid == 'not_git':
+        monkeypatch.setenv('DOMAE_TEST_HISTORIC_WORKER_REPO', str(tmp_path))
+    else:
+        monkeypatch.setenv('DOMAE_TEST_HISTORIC_WORKER_REPO', str(historical_repo()))
+        monkeypatch.setitem(globals(), 'HISTORIC_SHA', '0' * 40)
+    with pytest.raises(RuntimeError, match='historical Git provenance'):
+        historical_module(monkeypatch, 'base')
