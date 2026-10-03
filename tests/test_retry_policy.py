@@ -126,3 +126,15 @@ def test_scheduler_retry_requires_safe_reason(reason):
 def test_default_guard_and_no_retry():
     assert Crawler([]).send_guard is None
     assert OrderResult().no_retry is False
+
+
+def test_send_guard_default_survives_legacy_initializer():
+    class LegacyCrawler(Crawler):
+        def __init__(self): pass
+    assert LegacyCrawler().send_guard is None
+
+
+def test_invalid_resend_quantity_has_confirmation_message():
+    c = Crawler([OrderResult(reason_code="not_sent"), OrderResult(success=True, adjusted_quantity=9)])
+    r = execute(c)
+    assert "주문내역 확인" in r.message

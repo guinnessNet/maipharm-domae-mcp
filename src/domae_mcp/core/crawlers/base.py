@@ -112,7 +112,9 @@ def _settle_resend(result, original_qty, resend_qty):
     actual = resend_qty if result.adjusted_quantity is None else checked_qty(result.adjusted_quantity, resend_qty)
     if actual is None or actual == 0:
         import logging
-        logging.getLogger(__name__).warning("재전송 접수 수량 검증 실패 — 주문내역 확인 필요")
+        warning = "재전송 접수 수량 검증 실패 — 도매몰 주문내역 확인 필요"
+        logging.getLogger(__name__).warning(warning)
+        result.message = f"{result.message} — {warning}" if result.message else warning
         result.success = False
         result.reason_code = "send_unknown"
         return result
@@ -131,6 +133,7 @@ class BaseCrawler(ABC):
 
     SUPPLIER_NAME: str = ""
     SUPPORTS_CART_SYNC: bool = False
+    send_guard = None
 
     def __init__(self):
         self.session = _TimeoutSession()
@@ -142,7 +145,6 @@ class BaseCrawler(ABC):
             ),
         })
         self._logged_in = False
-        self.send_guard = None
 
     @abstractmethod
     def login(self, login_id: str, login_pw: str) -> bool:
