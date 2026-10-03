@@ -112,3 +112,26 @@ def seed_monitor(database, suppliers=('티제이팜', '백제')):
             (id,"apiKeyId",credentials,"supplierOrder","telegramChatId") VALUES (%s,%s,%s,%s,'c')''',
             (mid, 'api_' + mid, json.dumps(credentials), json.dumps(list(suppliers))))
     return mid
+
+
+def seed_urgent(database, mid, total=10, filled=0, suppliers=(('인천', 'P1'),), **cols):
+    uo = 'uo_' + uuid.uuid4().hex
+    with database.connection() as conn, conn.cursor() as cur:
+        cur.execute('''INSERT INTO domae_urgent_orders
+            (id,"monitorId","productName","insuranceCode","totalQuantity","filledQuantity",active,
+             "checkRequired","sendingAt","sendingToken","checkRevision")
+            VALUES (%s,%s,'씨투스건조시럽/100g','645702221',%s,%s,%s,%s,%s,%s,%s)''',
+            (uo, mid, total, filled, cols.get('active', True), cols.get('checkRequired', False),
+             cols.get('sendingAt'), cols.get('sendingToken'), cols.get('checkRevision', 0)))
+        for i, (supplier, pid) in enumerate(suppliers):
+            cur.execute('''INSERT INTO domae_urgent_suppliers
+                (id,"urgentOrderId",supplier,"productId",position) VALUES (%s,%s,%s,%s,%s)''',
+                ('us_' + uuid.uuid4().hex, uo, supplier, pid, i))
+    return uo
+
+
+def read_urgent(database, uo):
+    with database.connection() as conn, conn.cursor() as cur:
+        cur.execute('''SELECT "filledQuantity",active,"checkRequired","sendingToken",
+            "completedAt" IS NOT NULL FROM domae_urgent_orders WHERE id=%s''', (uo,))
+        return cur.fetchone()

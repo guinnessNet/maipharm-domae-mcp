@@ -12,6 +12,8 @@ import string
 import sys
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
@@ -23,6 +25,8 @@ from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_
 from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
+from domae_mcp.cloud.notifier import Notifier
+from domae_mcp.cloud.urgent import urgent_keywords, find_listing, urgent_supplier_step, _integer_quantity
 
 
 def _generate_cuid() -> str:
@@ -426,6 +430,57 @@ def _record_order_result(cur, monitor_id, batch_id, supplier_name, item, *,
         item.get("product_id"), order_id, message, utc_now,
         adjusted_qty, avail_stock, reason_code, confirmed_qty,
     ))
+
+
+URGENT_DEADLINE_SEC = 600
+URGENT_STALE_SEC = 1800
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class ClaimLost(Exception):
+    """회수 또는 상태 변경으로 실행 소유권을 잃음 — 이후 전송 금지."""
+
+
+def _urgent_claim(conn, cur, uo_id, expected_filled):
+    token = uuid.uuid4().hex
+    cur.execute('''UPDATE domae_urgent_orders SET active=false,"sendingAt"=%s,"sendingToken"=%s
+        WHERE id=%s AND active=true AND "checkRequired"=false AND "sendingToken" IS NULL
+        AND "filledQuantity"=%s AND "filledQuantity" < "totalQuantity"''',
+        (_utcnow(), token, uo_id, expected_filled))
+    owned = cur.rowcount == 1
+    conn.commit()
+    if not owned:
+        raise ClaimLost("긴급주문 상태가 바뀜 — 전송 안 함")
+    return token
+
+
+def _owned_update(conn, cur, uo_id, token, set_sql, params=()):
+    cur.execute(f'UPDATE domae_urgent_orders SET {set_sql} WHERE id=%s AND "sendingToken"=%s',
+                (*params, uo_id, token))
+    owned = cur.rowcount == 1
+    conn.commit()
+    if not owned:
+        raise ClaimLost("실행 소유권을 잃음")
+
+
+@dataclass
+class UrgentRun:
+    filled: int = 0
+    details: list[str] = field(default_factory=list)
+    supplier_results: dict = field(default_factory=dict)
+    any_success: bool = False
+    first_scanned_at: datetime | None = None
+    halted: bool = False
+    successes: list = field(default_factory=list)
+    stock_alerts: list = field(default_factory=list)
+    total_filled: int = 0
+    total_qty: int = 0
+    completed: bool = False
+    claimed: bool = False
+    lost: bool = False
 
 
 class CloudScheduler:
@@ -3388,6 +3443,190 @@ class CloudScheduler:
                 self._db_pool.putconn(conn, close=True)
             else:
                 self._db_pool.putconn(conn)
+
+    def _urgent_fill(self, conn, cur, uo_id, credentials):
+        """DB 잔량을 실행 토큰 아래서 채운다. 전송 전에 claim, 확정 수량은 즉시 커밋."""
+        run = UrgentRun()
+        started = time.monotonic()
+        cur.execute('''SELECT "monitorId","productName","insuranceCode","totalQuantity",
+            "filledQuantity",active,"checkRequired","sendingToken"
+            FROM domae_urgent_orders WHERE id=%s''', (uo_id,))
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            return run
+        monitor_id, product_name, insurance_code, total, initial_filled, active, check, existing_token = row
+        run.total_qty, run.total_filled = total, initial_filled
+        if not active or check or existing_token is not None or initial_filled >= total:
+            conn.commit()
+            return run
+        cur.execute('''SELECT supplier,"productId" FROM domae_urgent_suppliers
+            WHERE "urgentOrderId"=%s ORDER BY position,id''', (uo_id,))
+        suppliers = cur.fetchall()
+        cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id=%s', (monitor_id,))
+        chat_row = cur.fetchone()
+        chat_id = chat_row[0] if chat_row else None
+        conn.commit()  # 검색·네트워크를 기다리는 동안 DB 트랜잭션을 열어 두지 않는다.
+        keywords = urgent_keywords(product_name, insurance_code)
+        auto_order = os.environ.get("DOMAE_URGENT_AUTO_ORDER") != "0"
+        token = None
+
+        def notify(message):
+            if chat_id:
+                try:
+                    Notifier.send_telegram(chat_id, message)
+                except Exception:
+                    logger.warning("긴급주문 알림 실패 urgent=%s", uo_id)
+
+        def before_send():
+            nonlocal token
+            if time.monotonic() - started >= URGENT_DEADLINE_SEC:
+                raise ClaimLost("실행 시간 초과 — 전송 안 함")
+            if token is None:
+                token = _urgent_claim(conn, cur, uo_id, initial_filled)
+                run.claimed = True
+
+        def guard():
+            # 검색에는 토큰이 없다. claim 이후 실제 전송 직전에만 DB 소유권을 확인한다.
+            if token is None:
+                return
+            if time.monotonic() - started >= URGENT_DEADLINE_SEC:
+                raise ClaimLost("실행 시간 초과 — 전송 안 함")
+            guard_conn = self._db_pool.getconn()
+            try:
+                with guard_conn.cursor() as guard_cur:
+                    guard_cur.execute('''SELECT 1 FROM domae_urgent_orders
+                        WHERE id=%s AND "sendingToken"=%s''', (uo_id, token))
+                    owned = guard_cur.fetchone() is not None
+                # DB 조회 자체가 길어졌다면 조회 전 시한 검사만으로는 부족하다.
+                if time.monotonic() - started >= URGENT_DEADLINE_SEC:
+                    raise ClaimLost("실행 시간 초과 — 전송 안 함")
+                if not owned:
+                    raise ClaimLost("실행 소유권을 잃음 — 전송 안 함")
+            finally:
+                cleanup_failed = False
+                try:
+                    guard_conn.rollback()
+                except Exception:
+                    cleanup_failed = True
+                finally:
+                    self._db_pool.putconn(guard_conn, close=cleanup_failed)
+                if cleanup_failed:
+                    raise ClaimLost("전송 소유권 확인 연결 실패 — 전송 안 함")
+
+        def late_receipt_log(supplier, quantity, success, message):
+            cur.execute('''INSERT INTO domae_urgent_logs
+                (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+                (_generate_cuid(), uo_id, supplier, quantity, success, message,
+                 run.first_scanned_at or _utcnow(), _utcnow()))
+            conn.commit()
+
+        for supplier, product_id in suppliers:
+            if run.total_filled >= run.total_qty:
+                break
+            run.supplier_results.setdefault(supplier, {"quantity": 0})
+            cred, crawler_cls = credentials.get(supplier), self._crawlers.get(supplier)
+            if not cred or not crawler_cls:
+                run.details.append(f"{supplier}: 계정·크롤러 없음")
+                continue
+            try:
+                crawler = crawler_cls()
+                crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier,
+                                                      account=cred.get("login_id", ""))
+                crawler.send_guard = guard
+                if not crawler.login(cred.get("login_id", ""), cred.get("login_pw", "")):
+                    run.details.append(f"{supplier}: 로그인 실패")
+                    continue
+            except Exception:
+                run.details.append(f"{supplier}: 로그인 확인 불가")
+                continue
+            if run.first_scanned_at is None:
+                run.first_scanned_at = _utcnow()
+            reject = _reject_unreconciled(supplier, crawler_cls, "긴급주문")
+            if not auto_order or not getattr(crawler_cls, "URGENT_ORDER_SAFE", False):
+                listing = find_listing(crawler, product_id, keywords)
+                stock = _integer_quantity(getattr(listing, "quantity", None)) if listing is not None else None
+                if stock is not None and stock > 0:
+                    key = f"domae:urgent:stockalert:{uo_id}:{supplier}"
+                    if self._redis.set(key, "1", nx=True, ex=21600):
+                        run.stock_alerts.append({"supplier": supplier, "quantity": stock,
+                                                "price": getattr(listing, "price", 0)})
+                continue
+            step = None
+            committed = False
+            try:
+                step = urgent_supplier_step(crawler, product_id, keywords,
+                    run.total_qty - run.total_filled, before_send=before_send, reject_reason=reject)
+                run.details.append(f"{supplier}: {step.message}")
+                confirmed = step.qty if step.state == "filled" else step.fulfilled
+                if step.state == "filled":
+                    _owned_update(conn, cur, uo_id, token,
+                        '"filledQuantity"=LEAST("filledQuantity"+%s,"totalQuantity")', (confirmed,))
+                    committed = True
+                elif step.state == "halt":
+                    # 가산과 확인 필요 전환은 하나의 소유권 조건부 커밋으로 확정한다.
+                    _owned_update(conn, cur, uo_id, token,
+                        '''"filledQuantity"=LEAST("filledQuantity"+%s,"totalQuantity"),
+                        "checkRequired"=true,"checkReason"=%s,"checkRevision"="checkRevision"+1,
+                        "sendingAt"=NULL,"sendingToken"=NULL''', (confirmed, step.message))
+                    committed = True
+                    run.halted = True
+                if confirmed:
+                    run.filled += confirmed
+                    run.total_filled += confirmed
+                    run.supplier_results[supplier]["quantity"] += confirmed
+                    run.any_success = True
+                    run.successes.append({"supplier": supplier, "quantity": confirmed, "price": step.price})
+                if run.halted:
+                    break
+            except ClaimLost:
+                run.lost = run.claimed
+                confirmed = (step.qty if step.state == "filled" else step.fulfilled) if step else 0
+                if confirmed and not committed:
+                    message = f"⚠ 확인 처리 이후 도착한 체결: {supplier} {confirmed}개 — 수동 정산 필요"
+                    try:
+                        late_receipt_log(supplier, confirmed, True, message)
+                    except Exception:
+                        conn.rollback()
+                        logger.error("늦은 체결 감사 기록 실패 urgent=%s supplier=%s quantity=%s — 수동 정산 필요",
+                                     uo_id, supplier, confirmed)
+                    finally:
+                        notify(message)
+                break
+        if run.claimed and not run.halted and not run.lost:
+            try:
+                _owned_update(conn, cur, uo_id, token,
+                    '''active=("filledQuantity" < "totalQuantity"),
+                    "completedAt"=CASE WHEN "filledQuantity">="totalQuantity" THEN %s ELSE "completedAt" END,
+                    "sendingAt"=NULL,"sendingToken"=NULL''', (_utcnow(),))
+                run.completed = run.total_filled >= run.total_qty
+            except ClaimLost:
+                run.lost = True
+        # 정상 누적 로그·체결/중단/재고 알림은 완료 처리(C4)가 run을 사용해 작성한다.
+        return run
+
+    def _recover_stale_urgent(self, conn, cur, monitor_id):
+        """회수는 접수 실패 판정이 아니다. 오래된 실행 종료 확인 후에만 수동 재개한다."""
+        reason = "전송 중 실행이 끝나지 않음 — 접수 여부 확인 필요"
+        cur.execute('''UPDATE domae_urgent_orders SET active=false,"checkRequired"=true,"checkReason"=%s,
+            "checkRevision"="checkRevision"+1,"sendingAt"=NULL,"sendingToken"=NULL
+            WHERE "monitorId"=%s AND "sendingAt" < %s RETURNING id''',
+            (reason, monitor_id, _utcnow() - timedelta(seconds=URGENT_STALE_SEC)))
+        recovered = [r[0] for r in cur.fetchall()]
+        conn.commit()
+        if recovered:
+            cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id=%s', (monitor_id,))
+            row = cur.fetchone()
+            conn.commit()
+            if row and row[0]:
+                try:
+                    Notifier.send_telegram(row[0], f"⚠ 긴급주문 {len(recovered)}건: {reason}\n"
+                        "수동 확인 처리·재개 전에 기존 실행을 종료하거나 워커를 재시작해 주세요. "
+                        "전송 직전 검사와 외부 접수는 원자적이지 않습니다.")
+                except Exception:
+                    logger.warning("긴급주문 회수 알림 실패 monitor=%s", monitor_id)
+        return recovered
 
     def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
         """모니터링 주기 내 활성 긴급주문 처리"""
