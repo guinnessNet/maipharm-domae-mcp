@@ -514,3 +514,110 @@ def test_tj_history_rejects_malformed_date_identity(identity):
     result = crawler(site).order('A', 2)
     assert result.reason_code == 'not_sent' and result.no_retry
     assert site.sends == []
+
+
+def metadata_site(row, basket=None):
+    """실제 POST 경계에서 카탈로그만 교체하고 모든 장바구니 조작을 기록한다."""
+    site = Site({'A': 9, 'Z': 9}, basket=basket)
+    original = site.post
+    mutations = []
+    def post(url, **kwargs):
+        if url.endswith(('basket_post_api.php', 'basket_del_api.php')):
+            mutations.append(kwargs['data'])
+        if url.endswith('item_api.php'):
+            code = kwargs['data']['name']
+            if code == row.get('ItemCode'):
+                return Resp(json.dumps({'ResultSet': [row]}))
+        return original(url, **kwargs)
+    site.post = post
+    return site, mutations
+
+
+@pytest.mark.parametrize('prices', [{}, {'Cst': True}, {'Cst': 12.75}, {'Cst': '12.75'},
+                                    {'Cst': None}, {'Cst': ''}, {'HiCst': False}])
+@pytest.mark.parametrize('public', [True, False])
+def test_tj_unavailable_original_price_never_touches_cart(prices, public):
+    site, mutations = metadata_site({'ItemCode': 'Z', 'InvQty': 9, 'ItemToken': 'tZ', **prices}, {'Z': 2})
+    c = crawler(site)
+    result = c.order('A', 2) if public else c._order_bare('A', 2)
+    assert result.reason_code == 'not_sent' and result.no_retry
+    assert site.basket == {'Z': 2} and mutations == [] and site.sends == []
+
+
+@pytest.mark.parametrize('token,price', [('tZ', None), ('tZ', True), ('tZ', 12.75),
+                                       ('', 1000), ('   ', 1000), ({'token': 'tZ'}, 1000)])
+def test_tj_invalid_cached_restoration_metadata_is_not_trusted(token, price):
+    site, mutations = metadata_site({'ItemCode': 'Z', 'InvQty': 9}, {'Z': 2})
+    c = crawler(site)
+    c._item_tokens['Z'], c._item_prices['Z'] = token, price
+    result = c.order('A', 2)
+    assert result.reason_code == 'not_sent' and result.no_retry
+    assert site.basket == {'Z': 2} and mutations == [] and site.sends == []
+
+
+@pytest.mark.parametrize('replacement', [
+    {'ItemToken': {'token': 'bad'}, 'Cst': 1000}, {'ItemToken': ' ', 'Cst': 1000},
+    {'ItemToken': 'tA'}, {'ItemToken': 'tA', 'Cst': 12.75}, {'ItemToken': 'tA', 'Cst': True}])
+def test_tj_presend_search_cannot_overwrite_valid_original_metadata(replacement):
+    site = Site({'A': 9}, basket={'A': 2})
+    original = site.post
+    catalog_reads = []
+    def post(url, **kwargs):
+        if url.endswith('item_api.php'):
+            catalog_reads.append(kwargs['data']['name'])
+            if len(catalog_reads) > 1:
+                return Resp(json.dumps({'ResultSet': [{'ItemCode': 'A', 'InvQty': 9, **replacement}]}))
+        return original(url, **kwargs)
+    site.post = post
+    c = crawler(site)
+    result = c.order('A', 2)
+    assert result.reason_code == 'not_sent' and result.no_retry
+    assert site.sends == [] and site.basket == {'A': 2}
+    assert c._item_tokens['A'] == 'tA' and c._item_prices['A'] == 1000
+    assert c.cart_snapshot.load() is None
+
+
+@pytest.mark.parametrize('prices,expected', [({'Cst': 0}, 0), ({'Cst': '0'}, 0),
+    ({'Cst': 0, 'HiCst': 1234}, 1234), ({'Cst': None, 'HiCst': '1234'}, 1234),
+    ({'Cst': '', 'HiCst': 1234}, 1234), ({'HiCst': 1234}, 1234)])
+def test_tj_explicit_zero_and_known_insurance_price_restore(prices, expected):
+    site, mutations = metadata_site({'ItemCode': 'Z', 'InvQty': 9, 'ItemToken': 'tZ', **prices}, {'Z': 2})
+    result = crawler(site).order('A', 2)
+    assert result.success and site.basket == {'Z': 2}
+    restore = [request for request in mutations if request.get('ItemCode') == 'Z']
+    assert restore[-1]['Cst'] == str(expected)
+
+
+@pytest.mark.parametrize('token,price', [({}, 1000), (' ', 1000), ('tA', None), ('tA', True), ('tA', 12.75)])
+def test_tj_add_boundary_rejects_invalid_metadata_without_post(token, price):
+    site, mutations = metadata_site({'ItemCode': 'A', 'InvQty': 9, 'ItemToken': 'tA', 'Cst': 1000})
+    c = crawler(site)
+    c._item_tokens['A'], c._item_prices['A'] = token, price
+    with pytest.raises(tj.BasketReadError):
+        c._cart_add_raw('A', 2)
+    assert mutations == []
+
+
+@pytest.mark.parametrize('prices,expected', [({'Cst': 1000.0}, 1000),
+    ({'Cst': 0.0, 'HiCst': 1234.0}, 1234), ({'Cst': '   ', 'HiCst': 1234.0}, 1234)])
+def test_tj_whole_numeric_prices_preserve_existing_contract(prices, expected):
+    site, mutations = metadata_site({'ItemCode': 'Z', 'InvQty': 9, 'ItemToken': 'tZ', **prices}, {'Z': 2})
+    result = crawler(site).order('A', 2)
+    assert result.success and site.basket == {'Z': 2}
+    assert [request for request in mutations if request.get('ItemCode') == 'Z'][-1]['Cst'] == str(expected)
+
+
+def test_tj_invalid_cached_metadata_can_be_repaired_from_known_catalog():
+    site = Site({'A': 9, 'Z': 9}, basket={'Z': 2})
+    c = crawler(site)
+    c._item_tokens['Z'], c._item_prices['Z'] = {'bad': 'token'}, None
+    assert c.order('A', 2).success and site.basket == {'Z': 2}
+    assert c._item_tokens['Z'] == 'tZ' and c._item_prices['Z'] == 1000
+
+
+@pytest.mark.parametrize('token,price', [({}, 1000), (' ', 1000), ('tA', None), ('tA', True), ('tA', 12.75)])
+def test_tj_direct_add_boundary_rejects_invalid_metadata_without_post(token, price):
+    site, mutations = metadata_site({'ItemCode': 'A', 'InvQty': 9, 'ItemToken': 'tA', 'Cst': 1000})
+    with pytest.raises(tj.BasketReadError):
+        crawler(site)._add_to_basket('A', price, 2, token)
+    assert mutations == []
