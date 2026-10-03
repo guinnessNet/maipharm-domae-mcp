@@ -138,3 +138,21 @@ def test_explicit_safe_policy_is_unchanged(env, reason, fulfilled, no_retry, ret
     env.run('batch_order')
     assert len(env.calls) == (2 if retries else 1)
     assert env.read()[0][1] == ('ok' if retries else reason)
+
+
+@pytest.mark.parametrize('path', ['batch_order', 'auto_order', 'order'])
+@pytest.mark.parametrize('reason', ['not_sent', 'rejected'])
+@pytest.mark.parametrize('fulfilled', [False, 0.0, None, '0', -1, 16])
+def test_invalid_fulfillment_is_protected_without_any_resend(env, path, reason, fulfilled):
+    env.state.update(first=OrderResult(success=False, reason_code=reason,
+        fulfilled_quantity=fulfilled), retrying=path == 'batch_order')
+    env.run(path)
+    order, cart, batch = env.read()
+    assert env.calls == [('order' if path == 'order' else 'batch', 15)]
+    assert not env.alternatives
+    assert order[:3] == (None, 'send_unknown', None)
+    assert cart[0] == 15 and '전송 결과 확인 필요' in cart[1]
+    assert batch == ('processing', 0)
+    assert any('확인 필요' in str(n) for n in env.notices)
+    assert env.state['first'].fulfilled_quantity is fulfilled
+    assert not env.pool._used

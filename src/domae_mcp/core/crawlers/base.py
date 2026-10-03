@@ -97,8 +97,10 @@ def checked_qty(value, upper):
     return value if type(value) is int and 0 <= value <= upper else None
 
 
-def _as_unknown_if_unspecified(result):
-    if not result.success and result.reason_code in (None, "other"):
+def _as_unknown_if_unspecified(result, requested=None):
+    """불명확한 실패 또는 검증 불가 접수 수량은 확인 필요로 보존한다."""
+    if not result.success and (result.reason_code in (None, "other")
+            or (requested is not None and checked_qty(result.fulfilled_quantity, requested) is None)):
         result.reason_code = "send_unknown"
     return result
 
@@ -108,7 +110,7 @@ def _settle_resend(result, original_qty, resend_qty):
     result.available_stock = resend_qty
     result.retried = True
     if not result.success:
-        return _as_unknown_if_unspecified(result)
+        return _as_unknown_if_unspecified(result, resend_qty)
     actual = resend_qty if result.adjusted_quantity is None else checked_qty(result.adjusted_quantity, resend_qty)
     if actual is None or actual == 0:
         import logging
@@ -172,6 +174,7 @@ class BaseCrawler(ABC):
             qty = item["quantity"]
             metadata = {k: v for k, v in item.items() if k not in ("product_id", "quantity")}
             r = self.order(pid, qty, **metadata)
+            _as_unknown_if_unspecified(r, qty)
             r.original_quantity = qty
             if r.success:
                 if r.reason_code is None:
@@ -179,7 +182,7 @@ class BaseCrawler(ABC):
                 results.append(r)
                 continue
             if (r.reason_code not in SAFE_RESEND_REASONS
-                    or r.fulfilled_quantity != 0 or r.no_retry):
+                    or checked_qty(r.fulfilled_quantity, qty) != 0 or r.no_retry):
                 _as_unknown_if_unspecified(r)
                 # 접수됐을 수 있다 — 수량을 줄여 다시 보내면 이중 주문이 된다
                 results.append(r)
@@ -448,6 +451,7 @@ class PartialStockFallbackMixin:
         original_qty = int(quantity)
         metadata = dict(item, product_name=product_name)
         r = bare_order_fn(product_id, original_qty, **metadata)
+        _as_unknown_if_unspecified(r, original_qty)
         r.original_quantity = original_qty
         if r.success:
             if r.reason_code is None:
@@ -455,7 +459,7 @@ class PartialStockFallbackMixin:
             return r
 
         if (r.reason_code not in SAFE_RESEND_REASONS
-                or r.fulfilled_quantity != 0 or r.no_retry):
+                or checked_qty(r.fulfilled_quantity, original_qty) != 0 or r.no_retry):
             _as_unknown_if_unspecified(r)
             # 접수됐을 수 있다. 수량을 줄여 다시 보내면 이중 주문이 된다.
             return r

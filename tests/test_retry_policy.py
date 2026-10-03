@@ -138,3 +138,35 @@ def test_invalid_resend_quantity_has_confirmation_message():
     c = Crawler([OrderResult(reason_code="not_sent"), OrderResult(success=True, adjusted_quantity=9)])
     r = execute(c)
     assert "주문내역 확인" in r.message
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("reason", ["not_sent", "rejected"])
+@pytest.mark.parametrize("fulfilled", [False, 0.0, None, "0", -1, 6])
+def test_invalid_initial_fulfillment_never_authorizes_base_resend(batch, reason, fulfilled):
+    r = OrderResult(reason_code=reason, fulfilled_quantity=fulfilled)
+    c = Crawler([r, OrderResult(success=True)])
+    try:
+        assert execute(c, batch) is r
+        assert len(c.calls) == 1 and not c.refetches
+        assert r.reason_code == "send_unknown" and not r.success
+        assert r.fulfilled_quantity is fulfilled
+        assert base.confirmed_quantity(r, 5) is None
+    finally:
+        c.session.close()
+
+
+@pytest.mark.parametrize("fulfilled", [False, 0.0, None, "0", -1, 6])
+def test_retry_predicate_rejects_unvalidated_zero(fulfilled):
+    assert not _is_item_retryable(OrderResult(reason_code="not_sent", fulfilled_quantity=fulfilled))
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("reason", ["not_sent", "rejected"])
+def test_valid_integer_zero_still_authorizes_base_resend(batch, reason):
+    c = Crawler([OrderResult(reason_code=reason, fulfilled_quantity=0), OrderResult(success=True)])
+    try:
+        assert execute(c, batch).success
+        assert [x[1] for x in c.calls] == [5, 2]
+    finally:
+        c.session.close()

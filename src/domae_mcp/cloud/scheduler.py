@@ -173,7 +173,7 @@ def _is_item_retryable(result) -> bool:
     from domae_mcp.core.crawlers.base import SAFE_RESEND_REASONS
     return (not result.success
             and getattr(result, "reason_code", None) in SAFE_RESEND_REASONS
-            and getattr(result, "fulfilled_quantity", 0) == 0
+            and checked_qty(getattr(result, "fulfilled_quantity", None), 0) == 0
             and not getattr(result, "no_retry", False))
 
 
@@ -1404,7 +1404,7 @@ class CloudScheduler:
                     conn.commit()
                 result = crawler.order(product_id, quantity, product_name=product_name_hint,
                                        insurance_code=job.get("insurance_code"))
-                result = _as_unknown_if_unspecified(result)
+                result = _as_unknown_if_unspecified(result, quantity)
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, single_token)
 
@@ -1705,7 +1705,7 @@ class CloudScheduler:
                 succeeded = []  # [(idx, item, result)]
                 failed = []     # [(idx, item, result)]
                 for (idx, item), result in zip(group_items, results):
-                    result = _as_unknown_if_unspecified(result)
+                    result = _as_unknown_if_unspecified(result, item["quantity"])
                     if result.success:
                         succeeded.append((idx, item, result))
                     else:
@@ -1746,7 +1746,7 @@ class CloudScheduler:
                                     pass
                             retry_result = crawler.order(pid, qty, product_name=_retry_name,
                                                          insurance_code=item.get("insurance_code"))
-                            retry_result = _as_unknown_if_unspecified(retry_result)
+                            retry_result = _as_unknown_if_unspecified(retry_result, qty)
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
                                 retry_result.retried = True
@@ -2126,7 +2126,7 @@ class CloudScheduler:
             fallback_needs = []
 
             for item, result in zip(items, results):
-                result = _as_unknown_if_unspecified(result)
+                result = _as_unknown_if_unspecified(result, item["quantity"])
                 rcode = getattr(result, "reason_code", None)
                 order_message = getattr(result, "message", "")
                 unconfirmed = (not result.success) and rcode == "send_unknown"
