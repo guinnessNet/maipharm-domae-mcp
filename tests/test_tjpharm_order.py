@@ -647,3 +647,114 @@ def test_tj_final_basket_read_lease_loss_prevents_send(replacement):
     assert c._cart_frozen and site.basket == {'A': 2}
     assert store.load() is not None and store._r.get(store.failed_key) is None
     assert store._r.get(store.lock_key) == (replacement.encode() if replacement else None)
+
+
+@pytest.mark.parametrize("entry", ["order", "bare", "batch"])
+def test_tj_second_guard_catches_claim_loss_during_final_basket_read(entry):
+    site = Site({"A": 9, "Z": 9}, basket={"Z": 3})
+    c = crawler(site)
+    owner, armed, guard_calls = [True], [False], [0]
+
+    def guard():
+        guard_calls[0] += 1
+        if not owner[0]:
+            raise RuntimeError("claim lost")
+        armed[0] = True
+
+    c.send_guard = guard
+    original_post = site.post
+
+    def post(url, **kwargs):
+        response = original_post(url, **kwargs)
+        if armed[0] and url.endswith("/Order/basket_api.php"):
+            armed[0] = False
+            owner[0] = False
+        return response
+
+    site.post = post
+    if entry == "order":
+        result = c.order("A", 2, product_name="A")
+    elif entry == "bare":
+        result = c._order_bare("A", 2)
+    else:
+        result = c.order_batch([{"product_id": "A", "quantity": 2}])[0]
+
+    assert result.reason_code == "not_sent" and result.no_retry
+    assert guard_calls[0] == 2 and site.sends == []
+    assert site.basket == {"Z": 3}
+
+
+def test_tj_second_guard_claim_failure_restores_original_cart_without_resend():
+    site = Site({"A": 9, "Z": 9}, basket={"Z": 3})
+    c = crawler(site)
+    guard_calls = [0]
+
+    def guard():
+        guard_calls[0] += 1
+        if guard_calls[0] == 2:
+            raise RuntimeError("claim deadline lost")
+
+    c.send_guard = guard
+    result = c._order_bare("A", 2)
+
+    assert result.reason_code == "not_sent" and result.no_retry
+    assert guard_calls[0] == 2 and site.sends == []
+    assert site.basket == {"Z": 3}
+    assert c.cart_snapshot.load() is None
+
+
+@pytest.mark.parametrize("replacement", [None, "foreign-owner"])
+def test_tj_account_lease_loss_during_second_guard_freezes_without_cleanup(replacement):
+    site = Site({"A": 9, "Z": 9}, basket={"Z": 3})
+    c = crawler(site)
+    store = c.cart_snapshot
+    guard_calls = [0]
+    posts = []
+    posts_at_second_guard = []
+    original_post = site.post
+
+    def post(url, **kwargs):
+        posts.append(url)
+        return original_post(url, **kwargs)
+
+    site.post = post
+
+    def guard():
+        guard_calls[0] += 1
+        if guard_calls[0] == 2:
+            posts_at_second_guard.append(len(posts))
+            if replacement is None:
+                store._r.delete(store.lock_key)
+            else:
+                store._r.set(store.lock_key, replacement, ex=17)
+
+    c.send_guard = guard
+    result = c._order_bare("A", 2)
+
+    assert result.reason_code == "not_sent" and result.no_retry
+    assert guard_calls[0] == 2 and site.sends == []
+    assert c._cart_frozen and site.basket == {"A": 2}
+    assert posts_at_second_guard and len(posts) == posts_at_second_guard[0]
+    assert store.load() is not None and store._r.get(store.failed_key) is None
+    assert store._r.get(store.lock_key) == (replacement.encode() if replacement else None)
+
+
+def test_tj_second_guard_success_keeps_single_submit_body_and_restores_original_cart():
+    site = Site({"A": 9, "Z": 9}, basket={"Z": 3})
+    c = crawler(site)
+    guard_calls = [0]
+    submits = []
+    original_post = site.post
+
+    def post(url, **kwargs):
+        if url.endswith("/Order/basket_send_api.php"):
+            submits.append(kwargs)
+        return original_post(url, **kwargs)
+
+    site.post = post
+    c.send_guard = lambda: guard_calls.__setitem__(0, guard_calls[0] + 1)
+    result = c._order_bare("A", 2)
+
+    assert result.success and guard_calls[0] == 2
+    assert site.sends == [{"A": 2}] and site.basket == {"Z": 3}
+    assert submits == [{"data": {"ip": "", "memo": ""}, "headers": tj.TjPharmCrawler._ORDER_HEADERS}]
