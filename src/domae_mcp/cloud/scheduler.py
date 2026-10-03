@@ -502,7 +502,15 @@ class CloudScheduler:
             cur.close()
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
             logger.warning("stale DB 커넥션 감지, 새 커넥션 획득")
-            self._db_pool.putconn(conn, close=True)
+            try:
+                self._db_pool.putconn(conn, close=True)
+            except Exception:
+                # 풀 슬롯 정리가 불명하면 추가 연결을 얻지 않고 원래 오류를 전파한다.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
             conn = self._db_pool.getconn()
         return conn
 

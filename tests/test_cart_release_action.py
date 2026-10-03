@@ -294,3 +294,47 @@ def test_release_process_exit_propagates_and_does_not_notify_completion(monkeypa
             'supplier': '백제', 'account_binding': store.account_binding, 'revision': revision, 'chat_id': '12345'})
     notify.assert_not_called()
     assert store.load() is None and redis.zcard('domae:cart_release_pending') == 1
+
+
+@pytest.mark.parametrize('stale_error', ['operational', 'interface'])
+@pytest.mark.parametrize('close_fails', [False, True])
+def test_stale_acquisition_pool_return_failure_closes_without_reacquiring(monkeypatch, stale_error, close_fails):
+    import psycopg2
+    conn, cur, pool = Mock(closed=0), Mock(), Mock()
+    conn.cursor.return_value = cur; pool.getconn.return_value = conn
+    error_type = psycopg2.OperationalError if stale_error == 'operational' else psycopg2.InterfaceError
+    cur.execute.side_effect = error_type('stale local connection')
+    return_error = RuntimeError('local pool return failure')
+    pool.putconn.side_effect = return_error
+    if close_fails: conn.close.side_effect = RuntimeError('local close failure')
+    scheduler = CloudScheduler(pool, fakeredis.FakeRedis())
+    with pytest.raises(RuntimeError) as raised:
+        scheduler._get_conn()
+    assert raised.value is return_error
+    pool.getconn.assert_called_once_with()
+    pool.putconn.assert_called_once_with(conn, close=True)
+    conn.close.assert_called_once_with()
+    pool.reset_mock(); conn.close.reset_mock()
+    sent = []
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *args: sent.append(args))
+    scheduler.cart_release({'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제',
+        'account_binding': 'AAAAAAAAAAAAAAAA', 'revision': 1, 'chat_id': '12345'})
+    assert sent == [('12345', '확인 해제 처리 중 오류가 발생했습니다.')]
+    pool.getconn.assert_called_once_with()
+    pool.putconn.assert_called_once_with(conn, close=True)
+    conn.close.assert_called_once_with()
+    assert scheduler._redis.zcard('domae:cart_release_pending') == 0
+
+
+@pytest.mark.parametrize('stale_error', ['operational', 'interface'])
+def test_stale_acquisition_successfully_discards_then_retries_once(stale_error):
+    import psycopg2
+    stale, fresh, pool = Mock(), Mock(), Mock()
+    error_type = psycopg2.OperationalError if stale_error == 'operational' else psycopg2.InterfaceError
+    stale.cursor.return_value.execute.side_effect = error_type('stale local connection')
+    pool.getconn.side_effect = [stale, fresh]
+    scheduler = CloudScheduler(pool, fakeredis.FakeRedis())
+    assert scheduler._get_conn() is fresh
+    assert pool.getconn.call_count == 2
+    pool.putconn.assert_called_once_with(stale, close=True)
+    stale.close.assert_not_called()
