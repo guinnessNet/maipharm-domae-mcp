@@ -474,3 +474,43 @@ def test_tj_history_diagnostic_names_field_without_raw_token():
     with pytest.raises(tj.HistoryReadError, match='행 0 품목 0 OrdQty') as error:
         crawler(site)._order_keys((TODAY,TODAY))
     assert 'secret-token' not in str(error.value)
+
+
+@pytest.mark.parametrize('identity', ['2026-10-03', '20261003'])
+def test_tj_history_date_identity_accepts_public_order_with_fixed_request_range(identity):
+    site = Site({'A': 9})
+    site.orders.append((TODAY, 'existing', {'A': 1}))
+    original = site.post
+    requests = []
+    def post(url, **kwargs):
+        if url.endswith('order_list_ajax.php'):
+            requests.append(kwargs['data'])
+            return Resp(json.dumps([
+                {'OrdDate': identity, 'OrdNo': number,
+                 'Items': [{'ItemCode': code, 'OrdQty': qty} for code, qty in items.items()]}
+                for _, number, items in site.orders
+            ]))
+        return original(url, **kwargs)
+    site.post = post
+    result = crawler(site).order('A', 2)
+    assert result.success and result.fulfilled_quantity == 2
+    assert result.message == f'주문번호 {identity}-2'
+    assert site.sends == [{'A': 2}]
+    yesterday = (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=1)).strftime('%Y%m%d')
+    assert len(requests) == 2
+    assert all(request == {'sdate': yesterday, 'edate': TODAY} for request in requests)
+
+
+@pytest.mark.parametrize('identity', [None, True, False, [], {}, '', '   ', 20261003])
+def test_tj_history_rejects_malformed_date_identity(identity):
+    site = Site({'A': 9})
+    original = site.post
+    def post(url, **kwargs):
+        if url.endswith('order_list_ajax.php'):
+            return Resp(json.dumps([{'OrdDate': identity, 'OrdNo': '1',
+                                    'Items': [{'ItemCode': 'A', 'OrdQty': 2}]}]))
+        return original(url, **kwargs)
+    site.post = post
+    result = crawler(site).order('A', 2)
+    assert result.reason_code == 'not_sent' and result.no_retry
+    assert site.sends == []
