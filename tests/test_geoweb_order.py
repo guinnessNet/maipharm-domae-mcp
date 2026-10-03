@@ -622,3 +622,30 @@ def test_geo_final_cart_read_ownership_loss_prevents_send(loss):
     r = c._order_bare('A',2)
     assert r.reason_code == 'not_sent' and site.sends == []
     assert len(guarded) >= 1
+
+@pytest.mark.parametrize('entrypoint', ['order','_order_bare','order_batch'])
+@pytest.mark.parametrize('with_insurance', [True,False])
+def test_geo_cold_metadata_uses_full_item_candidates_before_pid(entrypoint, with_insurance):
+    site = Site({'A':9}, {})
+    original = site.post
+    queries = []
+    def post(url, **kw):
+        if url.endswith('PartialSearchProduct'):
+            keyword = kw['data']['srchText']
+            queries.append(keyword)
+            supported = '123456789' if with_insurance else '가상정M30T'
+            return Resp(search_html() if keyword == supported else '<table><tr><td>검색된 제품이 없습니다.</td></tr></table>')
+        return original(url, **kw)
+    site.post = post
+    c = crawler(site)
+    c._names = {}
+    item = {'product_id':'A','quantity':2,'product_name':'가상정M 30T'}
+    if with_insurance:
+        item['insurance_code'] = '123456789'
+    if entrypoint == 'order_batch':
+        r = c.order_batch([item])[0]
+    else:
+        r = getattr(c,entrypoint)('A',2,**{k:v for k,v in item.items() if k not in ('product_id','quantity')})
+    assert r.success and r.fulfilled_quantity == 2
+    assert queries == ['123456789' if with_insurance else '가상정M30T']
+    assert c._names['A'] == NAMES['A'] and site.sends == [{('A',''):2}]
