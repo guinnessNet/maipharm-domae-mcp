@@ -73,7 +73,7 @@ class UrgentDatabase:
             yield conn
 
     def pool(self):
-        return ThreadedConnectionPool(1, 4, self.dsn)
+        return ThreadedConnectionPool(1, 3, self.dsn)
 
 
 @contextmanager

@@ -745,3 +745,31 @@ def test_c4_failed_final_state_query_is_unknown_without_losing_receipt(env, monk
     payload = immediate(env, uo, mid)
     assert payload['state'] == 'unknown' and payload['filled_quantity'] == 10
     assert read_urgent(db, uo) == (10, False, False, None, True) and not pool._used
+
+
+def test_c4_serial_wrappers_fit_runtime_three_connection_budget(env, monkeypatch):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env, total=4)
+    next_uo = seed_urgent(db, mid, total=3)
+    sc._crawlers = {'인천': make_crawler(results=[OrderResult(success=True), OrderResult(success=True)])}
+    original_get = pool.getconn
+    occupancies = []
+    def get(*args, **kwargs):
+        connection = original_get(*args, **kwargs)
+        occupancies.append(len(pool._used))
+        return connection
+    def notifier_failure(**kwargs):
+        raise RuntimeError('local serial notifier failure')
+    monkeypatch.setattr(pool, 'getconn', get)
+    monkeypatch.setattr(Notifier, 'send_urgent_order_result', notifier_failure)
+    assert pool.maxconn == 3
+    payload = immediate(env, uo, mid)
+    assert (payload['state'], payload['total_filled'], payload['filled_quantity']) == ('completed', 4, 4)
+    assert not pool._used, '즉시 실행과 새 상태 조회의 연결이 모두 반환되어야 한다'
+    periodic(env, mid, creds)
+    assert sc._crawlers['인천'].orders == [('P1', 4), ('P1', 3)]
+    assert [entry[:3] for entry in logs(db, uo)] == [('인천', 4, True)]
+    assert [entry[:3] for entry in logs(db, next_uo)] == [('인천', 3, True)]
+    assert read_urgent(db, next_uo) == (3, False, False, None, True)
+    assert max(occupancies) == 3 and all(used <= 3 for used in occupancies)
+    assert not pool._used, '주기 실행의 호출부·실행·guard·감사 연결이 모두 반환되어야 한다'
