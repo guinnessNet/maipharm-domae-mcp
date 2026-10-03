@@ -80,6 +80,7 @@ class CloudWorker:
 
         while self._running:
             try:
+                self._scheduler.recover_cart_releases()
                 self._drain_delayed()
                 result = self._redis.brpop(["domae:jobs:urgent", "domae:jobs"], timeout=5)
                 if result is None:

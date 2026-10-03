@@ -32,6 +32,7 @@ def test_release_action_revalidates_and_audits(monkeypatch, mode):
     assert (store.load() is None) == (mode in ('ok', 'repeat'))
     assert pool.putconn.call_count == (2 if mode == 'repeat' else 1)
     assert sent
+    assert redis.zcard("domae:cart_release_pending") == 0
     query = next(call.args for call in cur.execute.call_args_list if "telegramChatId" in call.args[0])
     assert '"telegramChatId" = %s' in query[0] and '123456' in query[1]
 
@@ -49,6 +50,7 @@ def test_worker_dispatches_cart_release(monkeypatch):
     worker._redis.brpop.side_effect = take
     worker.run()
     worker._scheduler.cart_release.assert_called_once_with(job)
+    worker._scheduler.recover_cart_releases.assert_called_once_with()
 
 def test_telegram_order_preserves_unknown_partial_quantity(monkeypatch):
     from domae_mcp.core.crawlers.base import OrderResult
@@ -71,3 +73,54 @@ def test_telegram_order_preserves_unknown_partial_quantity(monkeypatch):
     fields = [field.strip().strip('"') for field in sql[sql.index('(')+1:sql.index(')')].split(',')]
     row = dict(zip(fields, args))
     assert row['success'] is None and row['confirmedQuantity'] == 3 and row['reasonCode'] == 'send_unknown'
+
+def test_recovery_is_bounded_and_retains_receipt_on_failed_commit():
+    redis = fakeredis.FakeRedis()
+    for i in range(12):
+        store = CartSnapshot(redis, 'monitor1full', '백제', account=f'account{i}')
+        store.lock(); rev = store.save({}); store.unlock()
+        assert store.release(rev) == 'ok'
+    conn, cur, pool = Mock(), Mock(), Mock()
+    conn.cursor.return_value = cur; pool.getconn.return_value = conn
+    conn.commit.side_effect = RuntimeError('DB unavailable')
+    scheduler = CloudScheduler(pool, redis)
+    scheduler.recover_cart_releases()
+    assert conn.commit.call_count == 10
+    assert redis.zcard('domae:cart_release_pending') == 12
+    for key in redis.zrange('domae:cart_release_pending', 0, -1):
+        assert redis.ttl(key) == -1
+    conn.commit.side_effect = None
+    scheduler.recover_cart_releases()
+    assert redis.zcard('domae:cart_release_pending') == 2
+    scheduler.recover_cart_releases()
+    assert redis.zcard('domae:cart_release_pending') == 0
+
+
+def test_release_receipt_ack_cannot_delete_replacement():
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='account')
+    store.lock(); rev = store.save({}); store.unlock(); store.release(rev)
+    key = store.release_key(rev)
+    receipt = store.release_receipt(redis, key)
+    replacement = {**receipt, 'id': 'replacement'}
+    redis.set(key, json.dumps(replacement))
+    assert not CartSnapshot.ack_release(redis, key, receipt)
+    assert store.release_receipt(redis, key) == replacement
+    assert redis.zcard('domae:cart_release_pending') == 1
+
+def test_interruption_before_release_transaction_exec_keeps_snapshot_and_no_receipt():
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='account')
+    store.lock(); rev = store.save({'original': 3}); store.unlock()
+    original = store.load()
+    tx = store._tx
+    def interrupt_before_exec(fn, *keys):
+        def call(pipe):
+            fn(pipe)
+            raise KeyboardInterrupt('before EXEC')
+        return tx(call, *keys)
+    store._tx = interrupt_before_exec
+    with pytest.raises(KeyboardInterrupt): store.release(rev)
+    assert store.load() == original
+    assert not redis.get(store.release_key(rev))
+    assert redis.zcard('domae:cart_release_pending') == 0

@@ -423,7 +423,7 @@ def test_cart_release_commits_audit_once_in_isolated_schema(database, monkeypatc
     origin, observer = database
     cur = origin.cursor()
     cur.execute('CREATE TABLE domae_cloud_monitors (id text, credentials jsonb, "telegramChatId" text, "isActive" boolean)')
-    cur.execute('''CREATE TABLE domae_order_audit_events (id text, "monitorId" text, supplier text,
+    cur.execute('''CREATE TABLE domae_order_audit_events (id text PRIMARY KEY, "monitorId" text, supplier text,
         "eventType" text, source text, payload jsonb, "createdAt" timestamp)''')
     cur.execute("INSERT INTO domae_cloud_monitors VALUES ('monitor1full','{}','12345',true)")
     origin.commit()
@@ -453,3 +453,81 @@ def test_fallback_unknown_partial_survives_null_row(database):
     recorder.unconfirmed(row, 'partial', confirmed=3)
     cur = origin.cursor(); cur.execute('SELECT success,"confirmedQuantity" FROM domae_cloud_orders WHERE id=%s', (row,))
     assert cur.fetchone() == (None, 3)
+
+@pytest.mark.parametrize('boundary', ['insert_failure', 'commit_failure', 'after_release', 'after_insert', 'after_commit', 'commit_ambiguity', 'before_ack'])
+def test_cart_release_audit_recovers_after_failure_and_interruption(database, monkeypatch, boundary):
+    import fakeredis
+    from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+    from domae_mcp.cloud.notifier import Notifier
+    origin, observer = database
+    cur = origin.cursor()
+    cur.execute('CREATE TABLE domae_cloud_monitors (id text, credentials jsonb, "telegramChatId" text, "isActive" boolean)')
+    cur.execute('''CREATE TABLE domae_order_audit_events (id text PRIMARY KEY, "monitorId" text, supplier text,
+        "eventType" text, source text, payload jsonb, "createdAt" timestamp)''')
+    cur.execute("INSERT INTO domae_cloud_monitors VALUES ('monitor1full','{}','12345',true)")
+    origin.commit()
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='local-account')
+    store.lock(); rev = store.save({'original': 3}); store.unlock()
+    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'revision': rev, 'chat_id': '12345'}
+    state = {'fail': True}
+    class Cursor:
+        def __init__(self, cursor): self.cursor = cursor
+        def execute(self, sql, params=None):
+            audit = 'INSERT INTO domae_order_audit_events' in sql
+            if audit and state['fail'] and boundary == 'insert_failure': raise RuntimeError('insert failed')
+            out = self.cursor.execute(sql, params)
+            if audit and state['fail'] and boundary == 'after_insert': raise KeyboardInterrupt('crash after insert')
+            return out
+        def __getattr__(self, name): return getattr(self.cursor, name)
+    class Connection:
+        def cursor(self): return Cursor(origin.cursor())
+        def rollback(self): return origin.rollback()
+        def commit(self):
+            if state['fail'] and boundary == 'commit_failure': raise RuntimeError('commit failed')
+            origin.commit()
+            if state['fail'] and boundary == 'after_commit': raise KeyboardInterrupt('commit acknowledgement lost')
+            if state['fail'] and boundary == 'commit_ambiguity': raise RuntimeError('commit acknowledgement lost')
+    connection = Connection()
+    class Pool:
+        def getconn(self): return connection
+        def putconn(self, c): c.rollback()
+    scheduler = sch.CloudScheduler(Pool(), redis)
+    scheduler._decrypt_creds = lambda c: {'백제': {'login_id': 'local-account'}}
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: None)
+    release = CartSnapshot.release
+    def release_crash(self, revision):
+        result = release(self, revision)
+        if state['fail'] and boundary == 'after_release': raise KeyboardInterrupt('crash after release')
+        return result
+    monkeypatch.setattr(CartSnapshot, 'release', release_crash)
+    if hasattr(CartSnapshot, 'ack_release'):
+        ack = CartSnapshot.ack_release
+        def ack_crash(redis_client, key, receipt):
+            if state['fail'] and boundary == 'before_ack': raise RuntimeError('ack failed')
+            return ack(redis_client, key, receipt)
+        monkeypatch.setattr(CartSnapshot, 'ack_release', ack_crash)
+    try:
+        scheduler.cart_release(job)
+    except KeyboardInterrupt:
+        pass
+    assert store.load() is None
+    assert redis.zcard('domae:cart_release_pending') == 1
+    pending_key = redis.zrange('domae:cart_release_pending', 0, 0)[0]
+    receipt = CartSnapshot.release_receipt(redis, pending_key)
+    # Credential changes/deactivation must not erase the already accepted receipt.
+    cur = origin.cursor(); cur.execute('UPDATE domae_cloud_monitors SET "isActive"=false, credentials=\'{}\''); origin.commit()
+    # A new run may start before audit recovery: recovery never recreates/deletes its cart record.
+    next_run = CartSnapshot(redis, 'another-monitor', '백제', account='local-account')
+    next_run.lock(); next_run.save({'new': 7})
+    record = next_run.load()
+    state['fail'] = False
+    scheduler.recover_cart_releases()
+    scheduler.recover_cart_releases()
+    assert next_run.load() == record and redis.get(next_run.lock_key).decode() == next_run.run_id
+    assert redis.zcard('domae:cart_release_pending') == 0
+    cur = observer.cursor(); cur.execute('SELECT "monitorId", supplier, "eventType", payload FROM domae_order_audit_events')
+    assert cur.fetchall() == [('monitor1full', '백제', 'cart_snapshot_released', {'revision': rev})]
+    from datetime import datetime
+    cur.execute('SELECT id, "createdAt" FROM domae_order_audit_events')
+    assert cur.fetchone() == (receipt['id'], datetime.fromisoformat(receipt['releasedAt']).replace(tzinfo=None))

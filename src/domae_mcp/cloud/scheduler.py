@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, confirmed_quantity
-from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
 from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
@@ -3080,6 +3080,41 @@ class CloudScheduler:
         except Exception as e:
             logger.warning("_cart_sync_update_status 실패: %s", e)
 
+    def _persist_cart_release(self, conn, key, receipt):
+        """안정된 ID·시각으로 감사 기록 후 커밋한다. 모호한 커밋도 재실행 가능하다."""
+        cur = conn.cursor()
+        cur.execute('''INSERT INTO domae_order_audit_events
+            (id, "monitorId", supplier, "eventType", source, payload, "createdAt")
+            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING''',
+            (receipt["id"], receipt["monitorId"], receipt["supplier"], "cart_snapshot_released", "worker",
+             json.dumps({"revision": receipt["revision"]}), receipt["releasedAt"]))
+        conn.commit()
+        CartSnapshot.ack_release(self._redis, key, receipt)
+
+    def recover_cart_releases(self):
+        """워커의 정상 잡 대기 루프에서 오래된 영수증 최대 10건을 복구한다.
+
+        승인이 끝난 영수증을 사용하므로 모니터 비활성화·계정 변경 이후에도 감사 기록한다.
+        전역 SCAN 없이 전용 pending ZSET의 첫 10건만 읽는다. 실패 시 영수증은 남는다.
+        """
+        for key in self._redis.zrange(RELEASE_PENDING_KEY, 0, 9):
+            key = key.decode() if isinstance(key, bytes) else key
+            receipt = CartSnapshot.release_receipt(self._redis, key)
+            if receipt is None:
+                # 정상 ACK가 같은 트랜잭션에서 pending 항목도 지운다.
+                continue
+            conn = None
+            try:
+                conn = self._get_conn()
+                self._persist_cart_release(conn, key, receipt)
+            except Exception:
+                if conn is not None:
+                    conn.rollback()
+                logger.exception("장바구니 해제 감사 복구 실패 id=%s", receipt["id"])
+            finally:
+                if conn is not None:
+                    self._db_pool.putconn(conn)
+
     def cart_release(self, job: dict):
         """확인 버튼의 소유권을 다시 확인하고 해당 계정·차수만 해제한다."""
         from domae_mcp.cloud.notifier import Notifier
@@ -3098,14 +3133,13 @@ class CloudScheduler:
             if row:
                 cred = self._decrypt_creds(row[1]).get(supplier)
                 if cred and cred.get("login_id"):
-                    result = CartSnapshot(self._redis, row[0], supplier, account=cred["login_id"]).release(rev)
+                    store = CartSnapshot(self._redis, row[0], supplier, account=cred["login_id"])
+                    result = store.release(rev)
                     if result == "ok":
-                        cur.execute('''INSERT INTO domae_order_audit_events
-                            (id, "monitorId", supplier, "eventType", source, payload, "createdAt")
-                            VALUES (%s,%s,%s,%s,%s,%s,now())''',
-                            (_generate_cuid(), row[0], supplier, "cart_snapshot_released", "worker",
-                             json.dumps({"revision": rev})))
-                        conn.commit()
+                        key = store.release_key(rev)
+                        receipt = CartSnapshot.release_receipt(self._redis, key)
+                        if receipt is not None:
+                            self._persist_cart_release(conn, key, receipt)
         except Exception:
             conn.rollback()
             logger.exception("장바구니 확인 해제 처리 실패 chat=%s", Notifier._tail(chat_id))

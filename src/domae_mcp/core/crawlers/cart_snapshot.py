@@ -17,9 +17,12 @@ import hashlib
 import json
 import logging
 import uuid
+import time
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 LOCK_TTL = 900          # 실행 잠금. 조작 직전마다 갱신한다
+RELEASE_PENDING_KEY = "domae:cart_release_pending"
 REISSUE_SEC = 3600      # 막힌 상태에서 확인 버튼 재발급 간격
 
 
@@ -200,9 +203,34 @@ class CartSnapshot:
         except Exception as e:
             logger.error("확인 요청 알림 실패: %s", e)
 
-    def release(self, rev: int) -> str:
-        """확인 완료 버튼 — 실행 중이 아니고 차수가 같을 때만, 한 트랜잭션으로 해제."""
+    def release_key(self, rev):
+        return self.key.replace("domae:cart_snapshot:", "domae:cart_release:", 1) + f":{rev}"
+
+    @staticmethod
+    def release_receipt(redis_client, key):
+        raw = redis_client.get(key)
+        return json.loads(raw) if raw is not None else None
+
+    @staticmethod
+    def ack_release(redis_client, key, receipt):
+        """DB 커밋 확인 이후에만 호출: 같은 영수증만 ACK한다."""
         def fn(pipe):
+            raw = pipe.get(key)
+            if raw is None or json.loads(raw) != receipt:
+                return False
+            pipe.multi()
+            pipe.delete(key)
+            pipe.zrem(RELEASE_PENDING_KEY, key)
+            return True
+        return redis_client.transaction(fn, key, value_from_callable=True)
+
+    def release(self, rev: int) -> str:
+        """해제와 영구 감사 영수증을 한 Redis 트랜잭션으로 저장한다."""
+        receipt_key = self.release_key(rev)
+        def fn(pipe):
+            # 이전에 승인된 동일 해제의 재처리. 새 주문 기록에는 손대지 않는다.
+            if pipe.exists(receipt_key):
+                return "ok"
             if pipe.exists(self.lock_key):
                 return "주문이 진행 중입니다. 잠시 후 다시 눌러 주세요."
             rec = self._rec(pipe)
@@ -210,10 +238,18 @@ class CartSnapshot:
                 return "이미 해제됐습니다."
             if rec.get("rev") != rev:
                 return "새로운 확인 요청이 있습니다. 최신 알림의 버튼을 눌러 주세요."
+            receipt = {
+                "id": "cr" + hashlib.sha256(receipt_key.encode()).hexdigest()[:23],
+                "monitorId": self._m, "supplier": self._s, "revision": rev,
+                "accountKey": self.key,
+                "releasedAt": datetime.now(timezone.utc).isoformat(),
+            }
             pipe.multi()
+            pipe.set(receipt_key, json.dumps(receipt, ensure_ascii=False))
+            pipe.zadd(RELEASE_PENDING_KEY, {receipt_key: time.time()})
             pipe.delete(self.key, self.failed_key, self.reissue_key)
             return "ok"
-        return self._tx(fn, self.lock_key, self.key, self.failed_key, self.reissue_key)
+        return self._tx(fn, self.lock_key, self.key, self.failed_key, self.reissue_key, receipt_key)
 
 
 class CartGuardMixin:
