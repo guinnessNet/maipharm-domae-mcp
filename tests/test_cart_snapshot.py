@@ -354,3 +354,82 @@ def test_confirmation_button_binds_account_and_fits_telegram(monkeypatch, suppli
     resumed = CartSnapshot(store._r, 'monitor1full', supplier, account='private-login')
     resumed.lock(); resumed.reissue(resumed.load())
     assert sent[-1][2]['inline_keyboard'][0][0]['callback_data'] == original
+
+
+@pytest.mark.parametrize('mutation, lose_on_read', [('delete', 2), ('clear', 1), ('add', 2)])
+@pytest.mark.parametrize('replacement', [None, 'foreign-owner'])
+def test_lease_loss_during_before_mutation_read_freezes_without_touch(mutation, lose_on_read, replacement):
+    class ReadingCart(FakeCart):
+        def __init__(self, cart, store):
+            super().__init__(cart, store)
+            self.reads, self.mutations, self.on_read = 0, [], None
+
+        def _cart_map(self):
+            self.reads += 1
+            if self.on_read:
+                self.on_read(self.reads)
+            return super()._cart_map()
+
+        def _cart_clear_raw(self):
+            self.mutations.append('clear')
+            super()._cart_clear_raw()
+
+        def _cart_add_raw(self, key, quantity):
+            self.mutations.append('add')
+            super()._cart_add_raw(key, quantity)
+
+    class DeletingCart(ReadingCart):
+        def _cart_delete_raw(self, key):
+            self.mutations.append('delete')
+            del self.cart[key]
+
+    store = _store()
+    initial = {} if mutation == 'add' else {'A': 2}
+    assert store.lock()
+    store.save(initial)
+    receipt_key = store.release_key(store.rev)
+    store.unlock()
+    assert store.release(store.rev) == 'ok'
+    cart = (DeletingCart if mutation == 'delete' else ReadingCart)(initial, store)
+    error, snap = cart._cart_start()
+    assert error is None
+    # Existing durable evidence must survive a lost owner, including finish/unlock.
+    store.restore_failed('existing failure')
+    evidence = {key: store._r.get(key) for key in (store.key, store.failed_key, receipt_key)}
+    cart.reads = 0
+
+    def lose_lease(read):
+        if read == lose_on_read:
+            if replacement is None:
+                store._r.delete(store.lock_key)
+            else:
+                store._r.set(store.lock_key, replacement, ex=17)
+    cart.on_read = lose_lease
+    target = {'A': 2} if mutation == 'add' else {}
+    with pytest.raises(cs.CartChanged, match='잠금'):
+        cart._cart_build(snap, target)
+    assert cart._cart_frozen and not cart._cart_touched
+    assert cart.cart == initial and cart.mutations == []
+    reads = cart.reads
+    with pytest.raises(cs.CartChanged):
+        cart._cart_build(snap, target)
+    cart._cart_finish(snap, [target])
+    assert cart.reads == reads and cart.mutations == []
+    assert {key: store._r.get(key) for key in evidence} == evidence
+    assert store._r.get(store.lock_key) == (replacement.encode() if replacement else None)
+
+
+def test_same_owner_read_renews_lease_after_network_boundary():
+    class ReadingCart(FakeCart):
+        def _cart_map(self):
+            self.cart_snapshot._r.expire(self.cart_snapshot.lock_key, 1)
+            return super()._cart_map()
+
+    store = _store()
+    assert store.lock()
+    store.save({'A': 2})
+    cart = ReadingCart({'A': 2}, store)
+    cart._cart_check({'A': 2})
+    assert not cart._cart_frozen and not cart._cart_touched
+    assert store._r.get(store.lock_key).decode() == store.run_id
+    assert store._r.ttl(store.lock_key) > cs.LOCK_TTL - 5

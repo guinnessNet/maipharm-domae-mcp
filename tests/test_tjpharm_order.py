@@ -621,3 +621,29 @@ def test_tj_direct_add_boundary_rejects_invalid_metadata_without_post(token, pri
     with pytest.raises(tj.BasketReadError):
         crawler(site)._add_to_basket('A', price, 2, token)
     assert mutations == []
+
+
+@pytest.mark.parametrize('replacement', [None, 'foreign-owner'])
+def test_tj_final_basket_read_lease_loss_prevents_send(replacement):
+    class LosingSite(Site):
+        lose_on_basket = False
+
+        def post(self, url, **kwargs):
+            response = super().post(url, **kwargs)
+            if self.lose_on_basket and url.endswith('/Order/basket_api.php'):
+                self.lose_on_basket = False
+                if replacement is None:
+                    store._r.delete(store.lock_key)
+                else:
+                    store._r.set(store.lock_key, replacement, ex=17)
+            return response
+
+    site = LosingSite({'A': 9, 'Z': 9}, {'Z': 3})
+    c = crawler(site)
+    store = c.cart_snapshot
+    c.send_guard = lambda: setattr(site, 'lose_on_basket', True)
+    result = c._order_bare('A', 2)
+    assert result.reason_code == 'not_sent' and site.sends == []
+    assert c._cart_frozen and site.basket == {'A': 2}
+    assert store.load() is not None and store._r.get(store.failed_key) is None
+    assert store._r.get(store.lock_key) == (replacement.encode() if replacement else None)

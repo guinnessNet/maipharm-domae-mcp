@@ -282,6 +282,9 @@ class CartGuardMixin:
             if self.cart_snapshot is not None and not self.cart_snapshot.owned():
                 raise CartChanged("실행 잠금을 잃음 — 장바구니를 더 조작하지 않음")
             now = self._cart_map()
+            # 네트워크 판독 중 잠금이 만료·교체될 수 있으므로 변경 직전에 다시 확인한다.
+            if self.cart_snapshot is not None and not self.cart_snapshot.owned():
+                raise CartChanged("실행 잠금을 잃음 — 장바구니를 더 조작하지 않음")
         except Exception:
             self._cart_frozen = True
             raise
