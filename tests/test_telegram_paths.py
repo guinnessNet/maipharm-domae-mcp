@@ -274,3 +274,22 @@ def test_result_record_failure_keeps_known_quantity_in_notice(env, boundary, res
     assert env.sent[-1]['reply_markup'] == {'inline_keyboard': []}
     env.run()
     assert len(env.calls) == 1 and not buttons(env)
+
+
+@pytest.mark.parametrize('reason', ['not_sent', 'stock_zero', 'rejected', 'isolated_fail'])
+@pytest.mark.parametrize('fulfilled,known', [(2, 2), (True, None), (6, None), (-1, None), ('2', None), (None, None)])
+def test_failed_fulfillment_evidence_blocks_alternatives(env, monkeypatch, reason, fulfilled, known):
+    searches = []
+    monkeypatch.setattr(env.scheduler, '_search_alternatives', lambda *a: searches.append(a) or [])
+    env.state['result'] = OrderResult(success=False, reason_code=reason, fulfilled_quantity=fulfilled)
+    env.run()
+    assert env.rows()[0][:3] == (None, 'send_unknown', known)
+    assert '전송 결과 확인 필요' in env.sent[-1]['text']
+    if known is not None:
+        assert f'확정 수량 {known}개' in env.sent[-1]['text']
+    else:
+        assert '확정 수량' not in env.sent[-1]['text']
+    assert env.sent[-1]['reply_markup'] == {'inline_keyboard': []}
+    assert not searches and not buttons(env)
+    env.run()
+    assert len(env.calls) == 1 and not searches

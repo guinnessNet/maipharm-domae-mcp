@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 
-from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, confirmed_quantity
+from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, checked_qty, confirmed_quantity
 from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
 from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
@@ -2444,6 +2444,12 @@ class CloudScheduler:
             result.reason_code = "send_unknown"
         if result.reason_code == "send_unknown":
             result.success = False
+        if not result.success:
+            # Only a validated exact zero supports a confirmed failure. Positive
+            # or malformed fulfillment cannot authorize another full order.
+            fulfilled = checked_qty(result.fulfilled_quantity, quantity)
+            if fulfilled is None or fulfilled > 0:
+                result.reason_code = "send_unknown"
         if result.success and confirmed_quantity(result, quantity) is None:
             result.success = False
             result.reason_code = "send_unknown"
