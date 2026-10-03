@@ -297,6 +297,8 @@ def test_deadline_rechecks_after_guard_db_read(env, monkeypatch):
                     clock[0] = 601
                     return row
             return Cursor()
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
         def rollback(self):
             self.connection.rollback()
     def blocking_get(*args, **kwargs):
@@ -308,8 +310,8 @@ def test_deadline_rechecks_after_guard_db_read(env, monkeypatch):
     monkeypatch.setattr(pool, 'putconn', put)
     sc._crawlers = {'인천': make_crawler()}
     r = run(env, uo, creds)
-    assert not sc._crawlers['인천'].orders and r.halted
-    assert read_urgent(db, uo)[:3] == (0, False, True)
+    assert not sc._crawlers['인천'].orders and r.deadline_expired and not r.halted
+    assert read_urgent(db, uo) == (0, True, False, None, False)
 
 
 def test_normal_receipts_defer_audit_and_notification_to_finish(env):
@@ -490,11 +492,17 @@ def test_late_receipt_evidence_survives_audit_cleanup_and_notifier_failure(
         def rollback(self):
             rollback_attempts.append(True)
             raise RuntimeError('local connection cleanup failure')
-    with db.connection() as connection, connection.cursor() as cur:
-        try:
-            r = sc._urgent_fill(BrokenCleanup(connection), cur, uo, creds)
-        finally:
-            connection.rollback()  # caller-owned cleanup is separate from C3's failure handler
+    original_get, original_put = sc._get_conn, pool.putconn
+    discarded = []
+    monkeypatch.setattr(sc, '_get_conn', lambda: BrokenCleanup(original_get()))
+    def return_audit(connection, **kwargs):
+        if isinstance(connection, BrokenCleanup):
+            discarded.append(kwargs.get('close'))
+            connection = connection.connection
+        return original_put(connection, **kwargs)
+    monkeypatch.setattr(pool, 'putconn', return_audit)
+    r = run(env, uo, creds)
+    assert discarded == [True] and not pool._used
     assert r.lost and rollback_attempts == [True]
     assert read_urgent(db, uo) == (0, False, True, None, False) and logs(db, uo) == []
     assert len(notification_attempts) == 1

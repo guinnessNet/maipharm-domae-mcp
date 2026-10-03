@@ -70,6 +70,14 @@ def find_listing(crawler, product_id: str, keywords: list[str]):
     return None
 
 
+class DeadlineExpired(Exception):
+    """실행 시한 종료. 이전 단계 전송 가능성은 예외 이름으로 추정하지 않는다."""
+
+    def __init__(self, message, *, may_have_sent=True):
+        super().__init__(message)
+        self.may_have_sent = may_have_sent
+
+
 @dataclass
 class UrgentStep:
     state: str
@@ -178,6 +186,10 @@ def urgent_supplier_step(crawler, product_id, keywords, need, *, before_send, re
             confirmed = fulfilled
         message = f"주문 결과 불명({result.message}){note} — 도매몰 주문내역 확인 필요"
         return UrgentStep("halt", 0, message, fulfilled=confirmed)
+    except DeadlineExpired as error:
+        if error.may_have_sent:
+            return UrgentStep("halt", 0, "실행 시간 초과 — 이전 단계 접수 여부 확인 필요")
+        return UrgentStep("skip", 0, "실행 시간 초과 — 전송 안 함")
     except Exception as exc:
         logger.error("긴급 주문 결과 불명 pid=%s: %s", product_id, exc)
         return UrgentStep("halt", 0, f"주문 중 오류 — 접수 여부 확인 필요 ({exc})")

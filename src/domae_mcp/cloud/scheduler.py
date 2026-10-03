@@ -26,7 +26,7 @@ from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fall
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 from domae_mcp.cloud.notifier import Notifier
-from domae_mcp.cloud.urgent import urgent_keywords, find_listing, urgent_supplier_step, _integer_quantity
+from domae_mcp.cloud.urgent import urgent_keywords, find_listing, urgent_supplier_step, _integer_quantity, DeadlineExpired
 
 
 def _generate_cuid() -> str:
@@ -483,6 +483,18 @@ class UrgentRun:
     completed: bool = False
     claimed: bool = False
     lost: bool = False
+    deadline_expired: bool = False
+    guard_stop: str | None = None
+    unsettled: list = field(default_factory=list)  # 접수 증거는 있지만 DB 커밋이 확인되지 않은 결과
+    late_results: list = field(default_factory=list)
+    finish_attempted: bool = False  # caller가 호출 전에 설정
+    finish_started: bool = False  # helper가 첫 진입 전에 설정
+    audit_attempted: bool = False
+    notification_attempts: set = field(default_factory=set)
+    pool_safe: bool = True
+    discard_conn: bool = False
+    chat_id: str | None = None
+    product_name: str = ""
 
 
 class CloudScheduler:
@@ -2714,26 +2726,35 @@ class CloudScheduler:
             logger.warning("긴급주문 DB 연결 정리 실패 — 연결 폐기")
             return False
 
-    def _return_urgent_connection(self, conn):
+    def _return_urgent_connection(self, conn, *, discard=False, health=None):
+        """슬롯 반환이 확인된 경우만 True. 불명 상태에서는 이후 획득을 중단한다."""
         if conn is None:
-            return
+            return True
         usable = self._urgent_rollback(conn)
+        if health is not None:
+            health.append(usable and not discard)
         try:
-            self._db_pool.putconn(conn, close=not usable)
+            self._db_pool.putconn(conn, close=discard or not usable)
+            return True
         except Exception:
-            logger.exception("긴급주문 DB 연결 반환 실패")
+            logger.warning("긴급주문 DB 연결 반환 실패 — 추가 획득 중단")
             try:
                 conn.close()
             except Exception:
                 pass
+            return False
 
     def urgent_order_immediate(self, job: dict):
         """잡의 식별자만 사용하고 실행 후 DB 상태를 정확히 한 번 응답한다."""
         monitor_id, response_key, uo_id = job["monitor_id"], job["response_key"], job["urgent_order_id"]
-        conn, run = None, None
+        conn, run = None, UrgentRun()
         payload = {"success": False, "message": "처리 실패", "filled_quantity": 0}
         try:
-            conn = self._get_conn()
+            try:
+                conn = self._get_conn()
+            except Exception:
+                run.pool_safe = False
+                raise
             with conn.cursor() as cur:
                 cur.execute('''SELECT m.credentials FROM domae_cloud_monitors m
                     JOIN domae_urgent_orders uo ON uo."monitorId"=m.id
@@ -2746,27 +2767,35 @@ class CloudScheduler:
                     if not self._crawlers_loaded:
                         self._load_crawlers(conn)
                     self._recover_stale_urgent(conn, cur, monitor_id)
-                    run = self._urgent_fill(conn, cur, uo_id, self._decrypt_creds(row[0]))
-                    self._finish_urgent_run(conn, cur, monitor_id, uo_id, run)
-                    payload.update(success=run.filled > 0, filled_quantity=run.filled,
-                                   stock_alerts=run.stock_alerts, details=run.details,
-                                   message="실행 완료")
+                    self._urgent_fill(conn, cur, uo_id, self._decrypt_creds(row[0]), run=run)
+                    payload["message"] = "실행 완료"
         except Exception as error:
-            logger.exception("urgent_order_immediate 실패 urgent=%s", uo_id)
-            payload["message"] = str(error)[:200]
-        finally:
-            # C3 감사/rollback 복합 실패도 다음 상태 조회 연결로 전달하지 않는다.
-            self._return_urgent_connection(conn)
-            state_conn = None
-            try:
+            run.discard_conn |= isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
+            logger.warning("urgent_order_immediate 실패 urgent=%s error=%s", uo_id, type(error).__name__)
+            payload["message"] = "실행 오류 — 현재 상태를 확인해 주세요"
+        except BaseException:
+            # 프로세스 종료는 일반 마무리·자동 해제·정상 응답으로 바꾸지 않는다.
+            self._return_urgent_connection(conn, discard=run.discard_conn)
+            raise
+        run.pool_safe &= self._return_urgent_connection(conn, discard=run.discard_conn)
+        if not run.finish_attempted:
+            run.finish_attempted = True
+            self._finish_urgent_run(None, None, monitor_id, uo_id, run)
+        payload.update(success=run.filled > 0, filled_quantity=run.filled,
+                       stock_alerts=run.stock_alerts, details=run.details)
+        state_conn = None
+        try:
+            if not run.pool_safe:
+                payload["state"] = "unknown"
+            else:
                 state_conn = self._get_conn()
                 payload.update(self._urgent_state(state_conn, uo_id, monitor_id))
-            except Exception:
-                logger.exception("긴급주문 상태 재조회 실패 urgent=%s", uo_id)
-                payload["state"] = "unknown"
-            finally:
-                self._return_urgent_connection(state_conn)
-            self._redis.lpush(response_key, json.dumps(payload))
+        except Exception:
+            logger.warning("긴급주문 상태 재조회 실패 urgent=%s", uo_id)
+            payload["state"] = "unknown"
+        finally:
+            self._return_urgent_connection(state_conn)
+        self._redis.lpush(response_key, json.dumps(payload))
 
     def _urgent_state(self, conn, uo_id, monitor_id=None):
         with conn.cursor() as cur:
@@ -3359,9 +3388,9 @@ class CloudScheduler:
             else:
                 self._db_pool.putconn(conn)
 
-    def _urgent_fill(self, conn, cur, uo_id, credentials):
+    def _urgent_fill(self, conn, cur, uo_id, credentials, *, run=None):
         """DB 잔량을 실행 토큰 아래서 채운다. 전송 전에 claim, 확정 수량은 즉시 커밋."""
-        run = UrgentRun()
+        run = run if run is not None else UrgentRun()
         started = time.monotonic()
         cur.execute('''SELECT "monitorId","productName","insuranceCode","totalQuantity",
             "filledQuantity",active,"checkRequired","sendingToken"
@@ -3372,6 +3401,7 @@ class CloudScheduler:
             return run
         monitor_id, product_name, insurance_code, total, initial_filled, active, check, existing_token = row
         run.total_qty, run.total_filled = total, initial_filled
+        run.product_name = product_name
         if not active or check or existing_token is not None or initial_filled >= total:
             conn.commit()
             return run
@@ -3381,64 +3411,60 @@ class CloudScheduler:
         cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id=%s', (monitor_id,))
         chat_row = cur.fetchone()
         chat_id = chat_row[0] if chat_row else None
+        run.chat_id = chat_id
         conn.commit()  # 검색·네트워크를 기다리는 동안 DB 트랜잭션을 열어 두지 않는다.
         keywords = urgent_keywords(product_name, insurance_code)
         auto_order = os.environ.get("DOMAE_URGENT_AUTO_ORDER") != "0"
         token = None
+        guard_passes = 0
 
-        def notify(message):
-            if chat_id:
-                try:
-                    Notifier.send_telegram(chat_id, message)
-                except Exception:
-                    logger.warning("긴급주문 알림 실패 urgent=%s", uo_id)
+        def deadline():
+            if time.monotonic() - started >= URGENT_DEADLINE_SEC:
+                run.deadline_expired = True
+                run.guard_stop = "deadline"
+                raise DeadlineExpired("실행 시간 초과 — 다음 전송 안 함", may_have_sent=guard_passes > 0)
 
         def before_send():
             nonlocal token
-            if time.monotonic() - started >= URGENT_DEADLINE_SEC:
-                raise ClaimLost("실행 시간 초과 — 전송 안 함")
+            deadline()
             if token is None:
                 token = _urgent_claim(conn, cur, uo_id, initial_filled)
                 run.claimed = True
 
         def guard():
-            # 검색에는 토큰이 없다. claim 이후 실제 전송 직전에만 DB 소유권을 확인한다.
+            nonlocal guard_passes
             if token is None:
                 return
-            if time.monotonic() - started >= URGENT_DEADLINE_SEC:
-                raise ClaimLost("실행 시간 초과 — 전송 안 함")
-            guard_conn = self._db_pool.getconn()
+            deadline()
+            guard_conn, discard = None, False
             try:
+                guard_conn = self._db_pool.getconn()
                 with guard_conn.cursor() as guard_cur:
                     guard_cur.execute('''SELECT 1 FROM domae_urgent_orders
                         WHERE id=%s AND "sendingToken"=%s''', (uo_id, token))
                     owned = guard_cur.fetchone() is not None
-                # DB 조회 자체가 길어졌다면 조회 전 시한 검사만으로는 부족하다.
-                if time.monotonic() - started >= URGENT_DEADLINE_SEC:
-                    raise ClaimLost("실행 시간 초과 — 전송 안 함")
+                deadline()  # SELECT 지연 이후에도 다음 wire 직전에 시한을 검사한다.
                 if not owned:
+                    run.guard_stop = "lost"
                     raise ClaimLost("실행 소유권을 잃음 — 전송 안 함")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                discard = True
+                run.guard_stop = "unsafe"
+                raise
             finally:
-                cleanup_failed = False
-                try:
-                    guard_conn.rollback()
-                except Exception:
-                    cleanup_failed = True
-                finally:
-                    self._db_pool.putconn(guard_conn, close=cleanup_failed)
-                if cleanup_failed:
+                health = []
+                if not self._return_urgent_connection(guard_conn, discard=discard, health=health):
+                    run.pool_safe = False
+                    run.guard_stop = "unsafe"
+                    raise ClaimLost("전송 소유권 확인 연결 반환 불명 — 전송 안 함")
+                if health and not health[0]:
+                    run.guard_stop = "unsafe"
                     raise ClaimLost("전송 소유권 확인 연결 실패 — 전송 안 함")
-
-        def late_receipt_log(supplier, quantity, success, message):
-            cur.execute('''INSERT INTO domae_urgent_logs
-                (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
-                (_generate_cuid(), uo_id, supplier, quantity, success, message,
-                 run.first_scanned_at or _utcnow(), _utcnow()))
-            conn.commit()
+            guard_passes += 1
 
         for supplier, product_id in suppliers:
-            if run.total_filled >= run.total_qty:
+            guard_passes = 0
+            if run.total_filled >= run.total_qty or run.deadline_expired or not run.pool_safe:
                 break
             run.supplier_results.setdefault(supplier, {"quantity": 0})
             cred, crawler_cls = credentials.get(supplier), self._crawlers.get(supplier)
@@ -3475,6 +3501,11 @@ class CloudScheduler:
                     run.total_qty - run.total_filled, before_send=before_send, reject_reason=reject)
                 run.details.append(f"{supplier}: {step.message}")
                 confirmed = step.qty if step.state == "filled" else step.fulfilled
+                if run.guard_stop == "lost":
+                    raise ClaimLost("실행 소유권을 잃음 — 결과만 보존")
+                evidence = {"supplier": supplier, "quantity": confirmed, "unknown": step.state == "halt", "message": step.message}
+                if confirmed or step.state == "halt":
+                    run.unsettled.append(evidence)
                 if step.state == "filled":
                     _owned_update(conn, cur, uo_id, token,
                         '"filledQuantity"=LEAST("filledQuantity"+%s,"totalQuantity")', (confirmed,))
@@ -3487,31 +3518,31 @@ class CloudScheduler:
                         "sendingAt"=NULL,"sendingToken"=NULL''', (confirmed, step.message))
                     committed = True
                     run.halted = True
+                if committed:
+                    run.unsettled.remove(evidence)
                 if confirmed:
                     run.filled += confirmed
                     run.total_filled += confirmed
                     run.supplier_results[supplier]["quantity"] += confirmed
                     run.any_success = True
                     run.successes.append({"supplier": supplier, "quantity": confirmed, "price": step.price})
-                if run.halted:
+                if time.monotonic() - started >= URGENT_DEADLINE_SEC:
+                    run.deadline_expired = True
+                if run.halted or run.deadline_expired:
                     break
+            except DeadlineExpired:
+                run.deadline_expired = True
+                break
             except ClaimLost:
                 run.lost = run.claimed
                 confirmed = (step.qty if step.state == "filled" else step.fulfilled) if step else 0
-                if confirmed and not committed:
-                    message = f"⚠ 확인 처리 이후 도착한 체결: {supplier} {confirmed}개 — 수동 정산 필요"
-                    try:
-                        late_receipt_log(supplier, confirmed, True, message)
-                    except Exception:
-                        # 감사 DB와 연결 정리가 함께 실패해도 실제 체결 증거부터 남긴다.
-                        logger.error("늦은 체결 감사 기록 실패 urgent=%s supplier=%s quantity=%s — 수동 정산 필요",
-                                     uo_id, supplier, confirmed)
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            logger.error("늦은 체결 감사 연결 정리 실패 urgent=%s — 호출부에서 연결 폐기 필요", uo_id)
-                    finally:
-                        notify(message)
+                if step is not None and (confirmed or step.state == "halt") and not committed:
+                    evidence = {"supplier": supplier, "quantity": confirmed, "unknown": step.state == "halt", "message": step.message}
+                    if evidence in run.unsettled:
+                        run.unsettled.remove(evidence)
+                    run.late_results.append(evidence)
+                    # guard는 이미 반환됐다. 실행 연결과 별도 감사 연결만 사용한다.
+                    self._attempt_late_urgent(run, monitor_id, uo_id, evidence)
                 break
             except Exception:
                 confirmed = (step.qty if step.state == "filled" else step.fulfilled) if step else 0
@@ -3520,7 +3551,7 @@ class CloudScheduler:
                     logger.error("긴급주문 접수 확정 수량 DB 기록 불명 urgent=%s supplier=%s quantity=%s "
                                  "— DB·도매몰 주문내역 수동 대조 필요", uo_id, supplier, confirmed)
                 raise
-        if run.claimed and not run.halted and not run.lost:
+        if run.claimed and not run.halted and not run.lost and not run.unsettled and run.pool_safe:
             try:
                 _owned_update(conn, cur, uo_id, token,
                     '''active=("filledQuantity" < "totalQuantity"),
@@ -3554,55 +3585,122 @@ class CloudScheduler:
                     logger.warning("긴급주문 회수 알림 실패 monitor=%s", monitor_id)
         return recovered
 
+    def _attempt_late_urgent(self, run, monitor_id, uo_id, receipt):
+        """늦은 결과의 감사·알림은 같은 live receipt마다 한 번만 시도한다."""
+        supplier, quantity = receipt["supplier"], receipt["quantity"]
+        if receipt["unknown"]:
+            message = (f"⚠ 실행 소유권 상실 뒤 전송 결과 불명: {supplier} urgent={uo_id} "
+                       f"— 현재 확정된 접수량 {quantity}개, 추가 접수 불명 — "
+                       f"{receipt['message']} — 도매몰 수동 대조·수동 정산 필요")
+        else:
+            message = f"⚠ 확인 처리 이후 도착한 체결: {supplier} {quantity}개 — 수동 정산 필요"
+        receipt["audit_message"] = message
+        audit_conn, discard = None, False
+        if not receipt.get("audit_attempted"):
+            receipt["audit_attempted"] = True
+            try:
+                if not run.pool_safe:
+                    raise RuntimeError("연결 풀 반환 불명")
+                try:
+                    audit_conn = self._get_conn()
+                except Exception:
+                    run.pool_safe = False
+                    raise
+                with audit_conn.cursor() as audit_cur:
+                    audit_cur.execute('''INSERT INTO domae_urgent_logs
+                        (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+                        (_generate_cuid(), uo_id, supplier, quantity, quantity > 0, message,
+                         run.first_scanned_at or _utcnow(), _utcnow()))
+                audit_conn.commit()
+            except Exception as error:
+                discard = isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
+                logger.error("늦은 결과 감사 기록 실패 urgent=%s supplier=%s quantity=%s — 수동 정산 필요 error=%s",
+                             uo_id, supplier, quantity, type(error).__name__)
+            finally:
+                run.pool_safe &= self._return_urgent_connection(audit_conn, discard=discard)
+        if not receipt.get("notification_attempted"):
+            receipt["notification_attempted"] = True
+            if run.chat_id:
+                try:
+                    Notifier.send_telegram(run.chat_id, html.escape(message))
+                except Exception:
+                    logger.warning("늦은 결과 알림 실패 urgent=%s supplier=%s quantity=%s — 수동 정산 필요",
+                                   uo_id, supplier, quantity)
+
     def _finish_urgent_run(self, conn, cur, monitor_id, uo_id, run):
-        """C3가 커밋한 수량의 정상 감사·알림만 작성한다. 수량을 다시 가산하지 않는다."""
+        """수량 재가산 없이 독립 감사와 알림을 live 실행마다 한 번 시도한다."""
+        if run.finish_started:
+            return
+        run.finish_started = True
+        run.finish_attempted = True
         if not run.supplier_results:
             return
-        finish_conn = None
-        chat_id, product_name = None, ""
-        try:
-            # 실행 연결과 감사 트랜잭션을 분리하여 감사 실패가 체결 상태를 건드리지 않는다.
-            finish_conn = self._get_conn()
-            with finish_conn.cursor() as finish_cur:
-                finish_cur.execute('''SELECT m."telegramChatId",uo."productName"
-                    FROM domae_urgent_orders uo JOIN domae_cloud_monitors m ON m.id=uo."monitorId"
-                    WHERE uo.id=%s AND m.id=%s''', (uo_id, monitor_id))
-                row = finish_cur.fetchone()
-                if row is None:
-                    return
-                chat_id, product_name = row
-                finish_conn.commit()
+        for receipt in run.late_results:
+            self._attempt_late_urgent(run, monitor_id, uo_id, receipt)
+        finish_conn, discard = None, False
+        chat_id, product_name = run.chat_id, run.product_name
+        if not run.audit_attempted:
+            run.audit_attempted = True
+            try:
+                if not run.pool_safe:
+                    raise RuntimeError("연결 풀 반환 불명")
                 try:
-                    ordered_at = _utcnow()
-                    for supplier, result in run.supplier_results.items():
-                        quantity = result["quantity"]
-                        # 소유권을 잃은 이번 도매의 늦은 체결은 C3가 이미 감사·알림한다.
-                        if run.lost and quantity == 0:
-                            continue
-                        message = "; ".join(run.details)
-                        if run.halted:
-                            message += " — 확인 필요"
-                        finish_cur.execute('''INSERT INTO domae_urgent_logs
-                            (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
-                            (_generate_cuid(), uo_id, supplier, quantity, quantity > 0, message,
-                             run.first_scanned_at or ordered_at, ordered_at))
-                    finish_cur.execute('''DELETE FROM domae_urgent_logs WHERE "urgentOrderId"=%s AND id NOT IN
-                        (SELECT id FROM domae_urgent_logs WHERE "urgentOrderId"=%s
-                         ORDER BY "orderedAt" DESC,id DESC LIMIT 20)''', (uo_id, uo_id))
-                    finish_conn.commit()
+                    finish_conn = self._get_conn()
                 except Exception:
-                    logger.exception("긴급주문 정상 감사 기록 실패 urgent=%s", uo_id)
-                    self._urgent_rollback(finish_conn)
-        except Exception:
-            logger.exception("긴급주문 완료 정보 조회 실패 urgent=%s", uo_id)
-        finally:
-            self._return_urgent_connection(finish_conn)
+                    run.pool_safe = False
+                    raise
+                with finish_conn.cursor() as finish_cur:
+                    finish_cur.execute('''SELECT m."telegramChatId",uo."productName"
+                        FROM domae_urgent_orders uo JOIN domae_cloud_monitors m ON m.id=uo."monitorId"
+                        WHERE uo.id=%s AND m.id=%s''', (uo_id, monitor_id))
+                    row = finish_cur.fetchone()
+                    if row is not None:
+                        chat_id, product_name = row
+                    finish_conn.commit()
+                    if row is not None:
+                        ordered_at = _utcnow()
+                        for supplier, result in run.supplier_results.items():
+                            quantity = result["quantity"]
+                            if run.lost and quantity == 0:
+                                continue
+                            uncertain = [r for r in run.unsettled if r["supplier"] == supplier]
+                            message = "; ".join(run.details)
+                            if uncertain:
+                                message += " — 접수 증거 DB 반영 불명: " + "; ".join(
+                                    f"확정된 접수량 {r['quantity']}개, 추가 접수 {'불명' if r['unknown'] else '없음'}, 수동 대조 필요"
+                                    for r in uncertain)
+                            if run.halted:
+                                message += " — 확인 필요"
+                            finish_cur.execute('''INSERT INTO domae_urgent_logs
+                                (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+                                (_generate_cuid(), uo_id, supplier, quantity, quantity > 0, message,
+                                 run.first_scanned_at or ordered_at, ordered_at))
+                        ordinary = ("supplier <> '확인처리' AND COALESCE(message,'') NOT LIKE %s "
+                                    "AND COALESCE(message,'') NOT LIKE %s")
+                        markers = ("⚠ 확인 처리 이후 도착한 체결:%", "⚠ 실행 소유권 상실 뒤 전송 결과 불명:%")
+                        finish_cur.execute(f'''DELETE FROM domae_urgent_logs WHERE "urgentOrderId"=%s AND {ordinary}
+                            AND id NOT IN (SELECT id FROM domae_urgent_logs WHERE "urgentOrderId"=%s AND {ordinary}
+                            ORDER BY "orderedAt" DESC,id DESC LIMIT 20)''',
+                            (uo_id, *markers, uo_id, *markers))
+                        finish_conn.commit()
+            except Exception as error:
+                discard = isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
+                for supplier, result in run.supplier_results.items():
+                    logger.error("긴급주문 감사 기록 실패 urgent=%s supplier=%s quantity=%s — 수동 대조 필요 error=%s",
+                                 uo_id, supplier, result["quantity"], type(error).__name__)
+            finally:
+                run.pool_safe &= self._return_urgent_connection(finish_conn, discard=discard)
         if not chat_id:
             return
         current_filled = run.total_filled - run.filled
-        for receipt in run.successes:
+        for index, receipt in enumerate(run.successes):
             current_filled += receipt["quantity"]
+            key = ("success", index)
+            if key in run.notification_attempts:
+                continue
+            run.notification_attempts.add(key)
             try:
                 Notifier.send_urgent_order_result(chat_id=chat_id, product_name=product_name,
                     supplier=receipt["supplier"], quantity=receipt["quantity"], price=receipt["price"],
@@ -3613,10 +3711,17 @@ class CloudScheduler:
         if run.halted:
             warnings.append(f"⚠ 긴급주문 확인 필요: {html.escape(product_name)}\n"
                             + html.escape("; ".join(run.details)))
+        for receipt in run.unsettled:
+            warnings.append(f"⚠ 긴급주문 DB 반영 불명: {html.escape(receipt['supplier'])} urgent={uo_id} "
+                            f"확정된 접수량 {receipt['quantity']}개 — 도매몰·DB 수동 대조 필요")
         for stock in run.stock_alerts:
             warnings.append(f"⚡ 긴급주문 재고 확인: {html.escape(stock['supplier'])} "
                             f"{html.escape(product_name)} {stock['quantity']}개 — 직접 주문해 주세요")
-        for message in warnings:
+        for index, message in enumerate(warnings):
+            key = ("warning", index)
+            if key in run.notification_attempts:
+                continue
+            run.notification_attempts.add(key)
             try:
                 Notifier.send_telegram(chat_id, message)
             except Exception:
@@ -3632,14 +3737,24 @@ class CloudScheduler:
             urgent_ids = cur.fetchall()
             conn.commit()
         for (uo_id,) in urgent_ids:
-            run_conn = None
+            run_conn, run = None, UrgentRun()
             try:
-                # 각 실행이 자기 연결을 정리하므로 하나의 실패가 뒤의 실행을 막지 않는다.
-                run_conn = self._get_conn()
+                try:
+                    run_conn = self._get_conn()
+                except Exception:
+                    run.pool_safe = False
+                    raise
                 with run_conn.cursor() as run_cur:
-                    run = self._urgent_fill(run_conn, run_cur, uo_id, credentials)
-                    self._finish_urgent_run(run_conn, run_cur, monitor_id, uo_id, run)
-            except Exception:
-                logger.exception("urgent fill 실패 urgent=%s", uo_id)
-            finally:
-                self._return_urgent_connection(run_conn)
+                    self._urgent_fill(run_conn, run_cur, uo_id, credentials, run=run)
+            except Exception as error:
+                run.discard_conn |= isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
+                logger.warning("urgent fill 실패 urgent=%s error=%s", uo_id, type(error).__name__)
+            except BaseException:
+                self._return_urgent_connection(run_conn, discard=run.discard_conn)
+                raise
+            run.pool_safe &= self._return_urgent_connection(run_conn, discard=run.discard_conn)
+            if not run.finish_attempted:
+                run.finish_attempted = True
+                self._finish_urgent_run(None, None, monitor_id, uo_id, run)
+            if not run.pool_safe:
+                break
