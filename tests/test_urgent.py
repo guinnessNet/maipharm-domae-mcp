@@ -132,7 +132,7 @@ def test_positive_partial_fulfillment_is_preserved(ful):
 
 
 @pytest.mark.parametrize("rc", ["not_sent", "stock_zero"])
-@pytest.mark.parametrize("ful", [0, False, True, None, "0", -1, 6])
+@pytest.mark.parametrize("ful", [0, 1, 3, 5, False, True, None, "0", -1, 6])
 def test_safe_skip_requires_validated_integer_zero(rc, ful):
     s, _ = _step(Crawler({"k": [sr("P", 5)]}, OrderResult(success=False, reason_code=rc,
                                                            fulfilled_quantity=ful)), need=5)
