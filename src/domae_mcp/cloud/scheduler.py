@@ -2471,8 +2471,10 @@ class CloudScheduler:
                 conn.rollback()
             except Exception:
                 logger.exception("텔레그램 주문 연결 rollback 실패")
+            # Keep validated in-memory evidence for manual settlement, while the
+            # durable row remains pending and the notice remains confirmation-only.
             self._notify_unknown(chat_id,message_id,original_text,supplier,product_name,
-                                 OrderResult(success=False,reason_code="send_unknown"),quantity)
+                                 result,quantity)
             return
         if db_ok is None:
             self._notify_unknown(chat_id,message_id,original_text,supplier,product_name,result,quantity)

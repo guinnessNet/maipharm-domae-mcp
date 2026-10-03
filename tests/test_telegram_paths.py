@@ -234,3 +234,43 @@ def test_telegram_preserves_inventory_snapshot_metadata(env):
     env.run()
     assert env.rows()[0][7:9] == ('30EA','999999999')
     assert env.calls[0][2]['insurance_code'] == '999999999'
+
+
+@pytest.mark.parametrize('boundary', ['result_update', 'result_commit'])
+@pytest.mark.parametrize('result,known', [
+    (OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=2), 2),
+    (OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=3), 3),
+    (OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=0), 0),
+])
+def test_result_record_failure_keeps_known_quantity_in_notice(env, boundary, result, known):
+    pool = env.pool
+    class Cursor:
+        def __init__(self, cur): self.cur = cur
+        def execute(self, sql, params=None):
+            if boundary == 'result_update' and 'UPDATE domae_cloud_orders' in sql:
+                self.cur.execute('SELECT 1/0')
+            return self.cur.execute(sql, params)
+        def __getattr__(self, name): return getattr(self.cur, name)
+    class Connection:
+        def __init__(self, conn): self.conn, self.commits = conn, 0
+        def cursor(self): return Cursor(self.conn.cursor())
+        def commit(self):
+            self.commits += 1
+            if boundary == 'result_commit' and self.commits == 2:
+                raise RuntimeError('result commit failed')
+            self.conn.commit()
+        def __getattr__(self, name): return getattr(self.conn, name)
+    class Pool:
+        def getconn(self): return Connection(pool.getconn())
+        def putconn(self, conn, **kw):
+            conn.rollback()
+            pool.putconn(conn.conn, **kw)
+    env.scheduler._db_pool = Pool()
+    env.state['result'] = result
+    env.run()
+    assert env.rows()[0][:3] == (None, 'send_unknown', None)
+    assert f'확정 수량 {known}개' in env.sent[-1]['text']
+    assert '전송 결과 확인 필요' in env.sent[-1]['text']
+    assert env.sent[-1]['reply_markup'] == {'inline_keyboard': []}
+    env.run()
+    assert len(env.calls) == 1 and not buttons(env)
