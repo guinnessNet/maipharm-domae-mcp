@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from domae_mcp.core.crawlers.base import OrderResult, confirmed_quantity
+from domae_mcp.core.crawlers.base import OrderResult, confirmed_quantity, _as_unknown_if_unspecified
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,7 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
     try:
         result = crawler.order(pick.product_id, need, product_name=pick.product_name,
                                insurance_code=pick.insurance_code)
+        result = _as_unknown_if_unspecified(result, need)
     except Exception as e:
         logger.error("대체주문 전송 예외 [%s] — 접수 여부 불명: %s", sup, e)
         return _unconfirmed(item, need, sup, 0, row, record_unconfirmed,
@@ -154,7 +155,7 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
         return _unconfirmed(item, need, sup, 0, row, record_unconfirmed,
                             f"{sup} 주문 결과 불명({result.message}) — 도매몰 주문내역 확인 필요", result=result)
 
-    ordered = (getattr(result, "adjusted_quantity", None) or need) if result.success else 0
+    ordered = confirmed_quantity(result, need) or 0
     try:
         record_result(row, item, sup, result)
     except Exception as e:

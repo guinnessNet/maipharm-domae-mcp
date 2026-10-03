@@ -174,6 +174,8 @@ def _is_item_retryable(result) -> bool:
     return (not result.success
             and getattr(result, "reason_code", None) in SAFE_RESEND_REASONS
             and checked_qty(getattr(result, "fulfilled_quantity", None), 0) == 0
+            and (getattr(result, "adjusted_quantity", None) is None
+                 or checked_qty(result.adjusted_quantity, 0) == 0)
             and not getattr(result, "no_retry", False))
 
 

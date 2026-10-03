@@ -112,6 +112,13 @@ def _as_unknown_if_unspecified(result, requested=None, *, allow_zero_adjustment=
     if not result.success and (result.reason_code in (None, "other")
             or (requested is not None and checked_qty(result.fulfilled_quantity, requested) is None)):
         result.reason_code = "send_unknown"
+    if requested is not None and not result.success:
+        receipt = max(checked_qty(result.adjusted_quantity, requested) or 0,
+                      checked_qty(result.fulfilled_quantity, requested) or 0)
+        if receipt > 0:
+            # 두 필드는 같은 시도의 접수 증거다. 합산하면 실제 주문량을 부풀린다.
+            result.fulfilled_quantity = receipt
+            result.reason_code = "send_unknown"
     return result
 
 
@@ -646,5 +653,6 @@ def confirmed_quantity(result, requested):
             return requested
         return checked_qty(result.adjusted_quantity, requested)
     if result.reason_code == "send_unknown":
-        return checked_qty(result.fulfilled_quantity, requested) or None
+        return max(checked_qty(result.fulfilled_quantity, requested) or 0,
+                   checked_qty(result.adjusted_quantity, requested) or 0) or None
     return None

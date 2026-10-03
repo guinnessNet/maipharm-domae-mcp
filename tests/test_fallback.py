@@ -1,6 +1,7 @@
 # tests/test_fallback.py
 import sys
 sys.path.insert(0, "src")
+import pytest
 
 from domae_mcp.core.crawlers.base import OrderResult, SearchResult
 from domae_mcp.cloud.fallback import (
@@ -114,6 +115,26 @@ def _run(crawlers, locks=None, renew_ok=None, pending_raises=(), result_raises=(
 
 def _ok(sup):
     return FakeCrawler([sr(sup, sup + "1", "694003321", "12EA", 30)], OrderResult(success=True))
+
+
+@pytest.mark.parametrize('fulfilled', [0, 2, 4, True])
+def test_positive_adjusted_failure_stops_fallback_and_preserves_receipt(fulfilled):
+    first, second = _ok('복산'), _ok('백제')
+    first.order_result = OrderResult(reason_code='not_sent', adjusted_quantity=3, fulfilled_quantity=fulfilled)
+    outcome, calls = _run({'복산': first, '백제': second})
+    assert not second.orders and len(first.orders) == 1
+    assert outcome.state == 'unconfirmed'
+    assert outcome.ordered_qty == (4 if type(fulfilled) is int and fulfilled == 4 else 3)
+
+
+@pytest.mark.parametrize('adjusted', [True, 1.5, '3', -1, 16, 0])
+def test_invalid_success_adjustment_stops_fallback_before_recording_raw_quantity(adjusted):
+    first, second = _ok('복산'), _ok('백제')
+    first.order_result = OrderResult(success=True, adjusted_quantity=adjusted, fulfilled_quantity=3)
+    outcome, calls = _run({'복산': first, '백제': second})
+    assert not second.orders and outcome.state == 'unconfirmed' and outcome.ordered_qty == 3
+    assert first.order_result.adjusted_quantity is None
+    assert not any(call[0] == 'result' for call in calls)
 
 
 def test_success_on_first_candidate():

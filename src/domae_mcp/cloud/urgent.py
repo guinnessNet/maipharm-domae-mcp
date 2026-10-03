@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from numbers import Real
 from typing import Optional
 
-from domae_mcp.core.crawlers.base import OrderResult, checked_qty
+from domae_mcp.core.crawlers.base import OrderResult, checked_qty, _as_unknown_if_unspecified
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,7 @@ def urgent_supplier_step(crawler, product_id, keywords, need, *, before_send, re
         )
         if not isinstance(result, OrderResult):
             raise TypeError(f"주문 결과 형식 이상: {type(result).__name__}")
+        result = _as_unknown_if_unspecified(result, order_qty)
 
         if result.success:
             actual = order_qty if result.adjusted_quantity is None else checked_qty(result.adjusted_quantity, order_qty)

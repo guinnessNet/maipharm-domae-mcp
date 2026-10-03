@@ -137,7 +137,7 @@ def test_explicit_safe_policy_is_unchanged(env, reason, fulfilled, no_retry, ret
         fulfilled_quantity=fulfilled, no_retry=no_retry), retrying=True)
     env.run('batch_order')
     assert len(env.calls) == (2 if retries else 1)
-    assert env.read()[0][1] == ('ok' if retries else reason)
+    assert env.read()[0][1] == ('ok' if retries else 'send_unknown' if fulfilled > 0 else reason)
 
 
 @pytest.mark.parametrize('path', ['batch_order', 'auto_order', 'order'])
@@ -199,3 +199,19 @@ def test_valid_adjustment_still_records_actual_quantity(env, path):
 def test_confirmed_unsent_stock_zero_adjustment_remains_zero(env, path):
     run_reported_result(env, path, OrderResult(reason_code='stock_zero', adjusted_quantity=0))
     assert env.read()[0] == (False, 'stock_zero', None, 0)
+
+
+@pytest.mark.parametrize('path', ['batch_order', 'batch_retry', 'auto_order', 'order'])
+@pytest.mark.parametrize('reason', ['not_sent', 'stock_zero', 'rejected'])
+@pytest.mark.parametrize('adjusted,fulfilled', [(3, 0), (3, 2), (3, 4), (None, 3)])
+def test_failed_positive_adjustment_preserves_receipt_without_resend(env, path, reason, adjusted, fulfilled):
+    result = OrderResult(reason_code=reason, adjusted_quantity=adjusted, fulfilled_quantity=fulfilled)
+    run_reported_result(env, path, result)
+    order, cart, batch = env.read()
+    assert order == (None, 'send_unknown', max(adjusted or 0, fulfilled), adjusted)
+    assert cart[0] == 15 and '전송 결과 확인 필요' in cart[1]
+    assert batch == ('processing', 0)
+    expected = [('batch', 15), ('order', 15)] if path == 'batch_retry' else [
+        ('order' if path == 'order' else 'batch', 15)]
+    assert env.calls == expected and not env.alternatives
+    assert any('확인 필요' in str(n) for n in env.notices)

@@ -181,6 +181,18 @@ def test_bad_adjustment_preserves_independent_partial_evidence(env, success, adj
     assert len(env.calls) == 1 and not buttons(env)
 
 
+@pytest.mark.parametrize('reason', ['not_sent', 'stock_zero', 'rejected'])
+@pytest.mark.parametrize('adjusted,fulfilled', [(3, 0), (3, 2), (3, 4), (None, 3)])
+def test_failed_adjustment_receipt_blocks_telegram_alternatives(env, monkeypatch, reason, adjusted, fulfilled):
+    searches = []
+    monkeypatch.setattr(env.scheduler, '_search_alternatives', lambda *a: searches.append(a) or [])
+    env.state['result'] = OrderResult(reason_code=reason, adjusted_quantity=adjusted, fulfilled_quantity=fulfilled)
+    env.run()
+    assert env.rows()[0][:3] == (None, 'send_unknown', max(3, fulfilled))
+    assert not searches and not buttons(env) and len(env.calls) == 1
+    assert f'확정 수량 {max(3, fulfilled)}개' in env.sent[-1]['text']
+
+
 def test_distinct_message_ids_and_path_prefixes_are_separate(env):
     # Each call sees its own newly committed marker, alongside previous results.
     env.run()

@@ -6,6 +6,7 @@ import pytest
 
 from domae_mcp.core.crawlers.base import OrderResult, SearchResult
 from domae_mcp.cloud.fallback_db import FallbackRecorder
+from tests.urgent_db_fixture import urgent_database, seed_monitor
 
 
 class Cur:
@@ -36,6 +37,58 @@ class Conn:
 
 PICK = SearchResult(maker="", product_name="베아놀", unit="12EA", insurance_code="694003321",
                     quantity=30, supplier="복산", price=1000, product_id="b1")
+
+
+@pytest.mark.parametrize('success,adjusted,fulfilled,known', [
+    (False, 3, 0, 3), (False, 3, 4, 4), (False, 3, True, 3),
+    (True, 1.5, 3, 3), (False, 1.5, 3, 3), (True, 3, 0, 3), (False, None, 3, 3),
+])
+@pytest.mark.parametrize('record_failure', [False, True])
+def test_actual_fallback_recorder_preserves_receipt_and_quarantines_adjustment(
+        urgent_database, success, adjusted, fulfilled, known, record_failure):
+    from datetime import datetime
+    from domae_mcp.cloud.scheduler import _record_order_result
+    from domae_mcp.cloud.fallback import run_fallback
+    db = urgent_database
+    mid = seed_monitor(db, ('복산', '백제'))
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute('INSERT INTO domae_order_batches (id,"monitorId","totalItems") VALUES (%s,%s,1)', ('fallbackbatch', mid))
+        if record_failure:
+            cur.execute('''CREATE FUNCTION reject_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'local receipt write failure'; END $$;
+                CREATE TRIGGER reject_receipt BEFORE UPDATE ON domae_cloud_orders
+                FOR EACH ROW EXECUTE FUNCTION reject_receipt();''')
+    calls = []
+    receipt = OrderResult(success=success, reason_code='stock_adjusted' if success else 'not_sent',
+        adjusted_quantity=adjusted, fulfilled_quantity=fulfilled)
+    class Crawler:
+        def search(self, keyword): return [PICK]
+        def order(self, pid, qty, **metadata):
+            calls.append((pid, qty))
+            with db.connection() as observer, observer.cursor() as cur:
+                cur.execute('SELECT success,"reasonCode" FROM domae_cloud_orders WHERE id=%s', ('fallbackreceipt',))
+                assert cur.fetchone() == (None, 'fallback_pending')
+            return receipt
+    opened = []
+    with db.connection() as conn:
+        recorder = FallbackRecorder(conn, mid, 'fallbackbatch', '인천', _record_order_result,
+            lambda: 'fallbackreceipt', datetime.now)
+        outcome, = run_fallback([({'insurance_code':PICK.insurance_code, 'unit':PICK.unit, 'quantity':15}, 15)],
+            ['복산', '백제'], lambda supplier: opened.append(supplier) or Crawler(),
+            lambda supplier: 'lock', lambda *args: True, lambda *args: None,
+            recorder.pending, recorder.result, recorder.unconfirmed)
+    assert calls == [('b1', 15)] and opened == ['복산']
+    assert outcome.ordered_qty == known
+    assert outcome.state == ('ordered' if success and adjusted == 3 and not record_failure else 'unconfirmed')
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute('SELECT success,"reasonCode","confirmedQuantity","adjustedQuantity" FROM domae_cloud_orders WHERE id=%s', ('fallbackreceipt',))
+        row = cur.fetchone()
+    if record_failure:
+        assert row == (None, 'fallback_pending', None, None)
+    elif outcome.state == 'ordered':
+        assert row == (True, 'stock_adjusted', known, 3)
+    else:
+        assert row == (None, 'send_unknown', known, None)
 
 
 def _rec(conn, record_fn=None):

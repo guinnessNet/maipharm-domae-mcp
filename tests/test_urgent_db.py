@@ -96,6 +96,22 @@ def test_fill_commits_and_uses_db_remaining(env):
     assert (r.filled, r.total_filled, r.total_qty, r.claimed, r.completed) == (6, 10, 10, True, True)
 
 
+@pytest.mark.parametrize('reason', ['not_sent', 'stock_zero'])
+@pytest.mark.parametrize('adjusted,fulfilled', [(3, 0), (3, 2), (3, 4), (None, 3)])
+def test_failed_adjustment_receipt_halts_before_next_supplier(env, reason, adjusted, fulfilled):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env, suppliers=(('인천', 'P1'), ('백제', 'P1')))
+    first = make_crawler(results=[OrderResult(reason_code=reason, adjusted_quantity=adjusted,
+        fulfilled_quantity=fulfilled)])
+    second = make_crawler()
+    sc._crawlers = {'인천': first, '백제': second}
+    result = run(env, uo, creds)
+    assert first.orders == [('P1', 10)] and second.orders == []
+    assert read_urgent(db, uo) == (max(3, fulfilled), False, True, None, False)
+    assert result.halted and result.filled == max(3, fulfilled)
+    assert not pool._used
+
+
 def test_partial_fill_commits_before_next_supplier(env):
     sc, _, db, _ = env
     uo, mid, creds = setup(env, suppliers=(('인천', 'P1'), ('백제', 'P1')))

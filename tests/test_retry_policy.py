@@ -76,11 +76,12 @@ def test_partial_or_no_retry_result_is_untouched(batch, blocked):
 
 
 @pytest.mark.parametrize("reason", [None, "other", "cart_dirty", "rejected"])
-def test_second_failure_preserves_or_normalizes_reason(reason):
-    c = Crawler([OrderResult(reason_code="not_sent"), OrderResult(reason_code=reason, adjusted_quantity=1)])
+@pytest.mark.parametrize('adjusted', [None, 1])
+def test_second_failure_preserves_or_normalizes_reason(reason, adjusted):
+    c = Crawler([OrderResult(reason_code="not_sent"), OrderResult(reason_code=reason, adjusted_quantity=adjusted)])
     r = execute(c)
-    assert r.reason_code == ("send_unknown" if reason in (None, "other") else reason)
-    assert r.adjusted_quantity == 1
+    assert r.reason_code == ("send_unknown" if adjusted or reason in (None, "other") else reason)
+    assert r.adjusted_quantity == adjusted
 
 
 @pytest.mark.parametrize("value,expected", [(0,0),(3,3),(5,5),(True,None),(1.0,None),("1",None),(-1,None),(6,None)])
@@ -203,3 +204,22 @@ def test_resend_adjustment_and_partial_are_bounded_by_actual_sent_quantity(batch
         assert base.confirmed_quantity(r, 15) == confirmed
     finally:
         c.session.close()
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('adjusted,fulfilled', [(3, 0), (3, 2), (3, 4), (None, 3)])
+def test_failed_positive_adjustment_blocks_base_resend(batch, adjusted, fulfilled):
+    r = OrderResult(reason_code='not_sent', adjusted_quantity=adjusted, fulfilled_quantity=fulfilled)
+    c = Crawler([r, OrderResult(success=True)])
+    try:
+        assert execute(c, batch) is r
+        assert len(c.calls) == 1 and not c.refetches
+        assert r.reason_code == 'send_unknown'
+        assert base.confirmed_quantity(r, 5) == max(3, fulfilled)
+    finally:
+        c.session.close()
+
+
+@pytest.mark.parametrize('adjusted', [3, True, 1.5, -1, '3'])
+def test_retry_predicate_requires_no_adjustment_receipt(adjusted):
+    assert not _is_item_retryable(OrderResult(reason_code='not_sent', adjusted_quantity=adjusted))
