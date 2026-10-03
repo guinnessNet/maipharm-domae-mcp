@@ -132,13 +132,6 @@ UNCONFIRMED_REASONS = ("send_unknown", "fallback_pending")
 _KEEP_UNCONFIRMED = ('AND ("reasonCode" IS NULL OR "reasonCode" NOT IN '
                      "('send_unknown', 'fallback_pending'))")
 
-NO_RETRY_KEYWORDS = [
-    "재고 0", "재고 부족", "수량 조정 후 재시도",
-    "로그인 실패", "계정 미등록", "크롤러 없음", "미지원",
-]
-# 크롤러가 이미 판정을 끝냈거나(재고), 다시 보내면 안 되는(접수 불명) 사유
-NO_RETRY_REASONS = ("stock_zero", "stock_adjusted", "send_unknown", "isolated_fail", "not_sent", "rejected",
-                    "cart_dirty")
 
 
 def _db_success(result):
@@ -170,10 +163,11 @@ def _batch_success_line(supplier, item, result) -> str:
 
 def _is_item_retryable(result) -> bool:
     """batch_order 의 품목별 1회 재시도 대상인가. send_unknown 을 다시 보내면 이중 주문이 된다."""
-    if getattr(result, "reason_code", None) in NO_RETRY_REASONS:
-        return False
-    msg = getattr(result, "message", "") or ""
-    return not any(kw in msg for kw in NO_RETRY_KEYWORDS)
+    from domae_mcp.core.crawlers.base import SAFE_RESEND_REASONS
+    return (not result.success
+            and getattr(result, "reason_code", None) in SAFE_RESEND_REASONS
+            and getattr(result, "fulfilled_quantity", 0) == 0
+            and not getattr(result, "no_retry", False))
 
 
 CART_SENDING_REASON = '전송 결과 확인 중'
@@ -1344,7 +1338,8 @@ class CloudScheduler:
                         conn.rollback()
                         return
                     conn.commit()
-                result = crawler.order(product_id, quantity, product_name=product_name_hint)
+                result = crawler.order(product_id, quantity, product_name=product_name_hint,
+                                       insurance_code=job.get("insurance_code"))
             finally:
                 _release_cart_lock(self._redis, monitor_id, supplier_name, single_token)
 
@@ -1618,17 +1613,18 @@ class CloudScheduler:
                     # 이미 전송한 공급사가 있으면 재큐잉이 중복 주문을 만든다 → 이 공급사만 실패.
                     logger.error("batch_order 락 상실 [%s] (전송분 존재로 재큐잉 안 함): %s",
                                  supplier_name, e)
-                    results = [OrderResult(success=False, message=str(e), reason_code="not_sent") for _ in group_items]
+                    results = [OrderResult(success=False, message=str(e), reason_code="not_sent", no_retry=True) for _ in group_items]
                 except _ReconcileFatal as e:
                     conn.rollback()
                     logger.error("batch_order 대조 중단 [%s]: %s", supplier_name, e)
-                    results = [OrderResult(success=False, message=f"대조 중단: {e}", reason_code="not_sent") for _ in group_items]
+                    results = [OrderResult(success=False, message=f"대조 중단: {e}", reason_code="not_sent", no_retry=True) for _ in group_items]
                 except Exception as e:
                     # 대조 중 만든 pending 행이 커밋되면 아무도 마감하지 않는 고아가 된다.
                     # 대조분을 통째로 버린다. 보호 커밋 전 예외는 전송 전이므로 not_sent.
                     conn.rollback()
                     _rc = "send_unknown" if _send_committed else "not_sent"
-                    results = [OrderResult(success=False, message=str(e), reason_code=_rc) for _ in group_items]
+                    results = [OrderResult(success=False, message=str(e), reason_code=_rc,
+                                           no_retry=not _send_committed) for _ in group_items]
 
                 # 길이 불일치 방어
                 if len(results) != len(group_items):
@@ -1680,7 +1676,8 @@ class CloudScheduler:
                                     crawler.search(_retry_name)
                                 except Exception:
                                     pass
-                            retry_result = crawler.order(pid, qty, product_name=_retry_name)
+                            retry_result = crawler.order(pid, qty, product_name=_retry_name,
+                                                         insurance_code=item.get("insurance_code"))
                             if retry_result.success:
                                 logger.info("batch_order 재시도 성공: %s pid=%s", supplier_name, pid)
                                 retry_result.retried = True
@@ -2449,12 +2446,14 @@ class CloudScheduler:
             # 제품명/가격 조회
             product_name = product_id
             price = 0
+            insurance_code = None
             try:
                 search_results = crawler.search(product_id)
                 for sr in search_results:
                     if sr.product_id == product_id:
                         product_name = sr.product_name
                         price = sr.price or 0
+                        insurance_code = sr.insurance_code
                         break
             except Exception:
                 pass
@@ -2469,7 +2468,8 @@ class CloudScheduler:
             _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
             if _reject:
                 raise RuntimeError(_reject)
-            result = crawler.order(product_id, quantity, product_name=product_name or "")
+            result = crawler.order(product_id, quantity, product_name=product_name or "",
+                                   insurance_code=insurance_code)
 
             if result.success:
                 # 성공 → 메시지 편집: 버튼 제거 + 완료 표시
@@ -2655,9 +2655,11 @@ class CloudScheduler:
                     # product_name 으로 검색 후 product_id 로 매칭 (위 주석 참조)
                     search_results = crawler.search(product_name)
                     available = 0
+                    insurance_code = None
                     for sr in search_results:
                         if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
                             available = sr.quantity
+                            insurance_code = sr.insurance_code
                             break
 
                     if available == 0:
@@ -2674,7 +2676,8 @@ class CloudScheduler:
                     _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
                     if _reject:
                         raise RuntimeError(_reject)
-                    result = crawler.order(product_id_val, order_qty)
+                    result = crawler.order(product_id_val, order_qty, product_name=product_name,
+                                           insurance_code=insurance_code)
 
                     if result.success:
                         filled += order_qty
@@ -3193,7 +3196,8 @@ class CloudScheduler:
             _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
             if _reject:
                 raise RuntimeError(_reject)
-            result = crawler.order(product_id, quantity, product_name=product_name or "")
+            result = crawler.order(product_id, quantity, product_name=product_name or "",
+                                   insurance_code=insurance_code)
             logger.info(
                 "telegram_order 완료: supplier=%s product=%s(%s) qty=%d success=%s msg=%s",
                 supplier_name, product_id, product_name, quantity,
@@ -3307,9 +3311,11 @@ class CloudScheduler:
                     #     available=0 으로 빠져 주문이 아예 시도되지 않았다.
                     search_results = crawler.search(product_name)
                     available = 0
+                    insurance_code = None
                     for sr in search_results:
                         if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
                             available = sr.quantity
+                            insurance_code = sr.insurance_code
                             break
 
                     if available == 0:
@@ -3324,7 +3330,8 @@ class CloudScheduler:
                     _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
                     if _reject:
                         raise RuntimeError(_reject)
-                    result = crawler.order(product_id_val, order_qty)
+                    result = crawler.order(product_id_val, order_qty, product_name=product_name,
+                                           insurance_code=insurance_code)
 
                     if result.success:
                         filled_this_round += order_qty

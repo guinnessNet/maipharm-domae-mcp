@@ -36,10 +36,13 @@ def test_finalize_protects_unconfirmed():
 
 
 def test_retry_excludes_unsafe_reasons():
-    for rc in ("send_unknown", "isolated_fail", "not_sent", "rejected", "stock_zero", "stock_adjusted"):
+    for rc in ("send_unknown", "isolated_fail", "stock_zero", "stock_adjusted"):
         assert sch._is_item_retryable(OrderResult(success=False, reason_code=rc, message="x")) is False
     assert sch._is_item_retryable(OrderResult(success=False, message="재고 0 — 주문 누락")) is False
-    assert sch._is_item_retryable(OrderResult(success=False, message="세션 만료")) is True
+    # 확인된 미전송/거부만 허용한다. 메시지만으로 접수 여부를 추정하지 않는다.
+    for rc in ("not_sent", "rejected"):
+        assert sch._is_item_retryable(OrderResult(success=False, reason_code=rc)) is True
+    assert sch._is_item_retryable(OrderResult(success=False, message="세션 만료")) is False
 
 
 def test_db_success_keeps_unknown_null():

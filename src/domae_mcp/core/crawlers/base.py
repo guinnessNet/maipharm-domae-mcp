@@ -50,6 +50,7 @@ class OrderResult:
     reason_code: Optional[str] = None
     # 첫 전송이 아니라 재전송(Phase 2·3, 수량 조정, 품목별 재시도)으로 나온 결과인가 — 알림 표시용
     retried: bool = False
+    no_retry: bool = False
 
 
 class CrawlerError(Exception):
@@ -87,6 +88,40 @@ def _keep_or_other(reason):
     return reason if reason in PRESERVED_REASONS else "other"
 
 
+# rejected는 인천의 명시적 거부 확인 경로에서만 발행한다.
+SAFE_RESEND_REASONS = ("not_sent", "rejected")
+
+
+def checked_qty(value, upper):
+    """접수 수량은 범위 안의 정수만 신뢰한다 (bool 제외)."""
+    return value if type(value) is int and 0 <= value <= upper else None
+
+
+def _as_unknown_if_unspecified(result):
+    if not result.success and result.reason_code in (None, "other"):
+        result.reason_code = "send_unknown"
+    return result
+
+
+def _settle_resend(result, original_qty, resend_qty):
+    result.original_quantity = original_qty
+    result.available_stock = resend_qty
+    result.retried = True
+    if not result.success:
+        return _as_unknown_if_unspecified(result)
+    actual = resend_qty if result.adjusted_quantity is None else checked_qty(result.adjusted_quantity, resend_qty)
+    if actual is None or actual == 0:
+        import logging
+        logging.getLogger(__name__).warning("재전송 접수 수량 검증 실패 — 주문내역 확인 필요")
+        result.success = False
+        result.reason_code = "send_unknown"
+        return result
+    result.adjusted_quantity = actual
+    result.reason_code = "stock_adjusted"
+    result.message = f"재고 부족으로 {original_qty}→{actual}개 조정 주문"
+    return result
+
+
 class BaseCrawler(ABC):
     """도매상 크롤러 기본 클래스.
 
@@ -107,6 +142,7 @@ class BaseCrawler(ABC):
             ),
         })
         self._logged_in = False
+        self.send_guard = None
 
     @abstractmethod
     def login(self, login_id: str, login_pw: str) -> bool:
@@ -118,7 +154,7 @@ class BaseCrawler(ABC):
         """키워드 검색. 결과 리스트 반환."""
         ...
 
-    def order(self, product_id: str, quantity: int) -> OrderResult:
+    def order(self, product_id: str, quantity: int, **item) -> OrderResult:
         """주문 실행. 미구현 크롤러는 기본 실패 반환."""
         return OrderResult(success=False, message="주문 미지원 도매상입니다.")
 
@@ -132,29 +168,25 @@ class BaseCrawler(ABC):
         for item in items:
             pid = item["product_id"]
             qty = item["quantity"]
-            name = item.get("product_name", "")
-            r = self.order(pid, qty)
+            metadata = {k: v for k, v in item.items() if k not in ("product_id", "quantity")}
+            r = self.order(pid, qty, **metadata)
             r.original_quantity = qty
             if r.success:
                 if r.reason_code is None:
                     r.reason_code = "ok"
                 results.append(r)
                 continue
-            if r.reason_code == "send_unknown":
+            if (r.reason_code not in SAFE_RESEND_REASONS
+                    or r.fulfilled_quantity != 0 or r.no_retry):
+                _as_unknown_if_unspecified(r)
                 # 접수됐을 수 있다 — 수량을 줄여 다시 보내면 이중 주문이 된다
                 results.append(r)
                 continue
             # 실패 — 재고 재조회 후 수량 조정 재시도
             stock = self._refetch_stock_for_item(item)
             if stock is not None and 0 < stock < qty:
-                r2 = self.order(pid, stock)
-                r2.original_quantity = qty
-                r2.adjusted_quantity = stock
-                r2.available_stock = stock
-                r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
-                r2.retried = True
-                if r2.success and not r2.message:
-                    r2.message = f"재고 부족으로 {qty}→{stock}개 조정 주문"
+                r2 = self.order(pid, stock, **metadata)
+                _settle_resend(r2, qty, stock)
                 results.append(r2)
             elif stock == 0:
                 results.append(OrderResult(
@@ -166,9 +198,33 @@ class BaseCrawler(ABC):
                     reason_code="stock_zero",
                 ))
             else:
-                r.reason_code = _keep_or_other(r.reason_code)
+                _as_unknown_if_unspecified(r)
                 results.append(r)
         return results
+
+    def presend_stock(self, item: dict) -> Optional[int]:
+        """전송 전 검색 후보를 순서대로 조회하고 동일 제품 재고만 반환한다."""
+        pid = item.get("product_id") or ""
+        code = str(item.get("insurance_code") or "").strip()
+        name = (item.get("product_name") or "").strip()
+        candidates = ([code] if len(code) == 9 and code.isascii() and code.isdigit() else [])
+        candidates += ["".join(name.split()), name, pid]
+        seen = set()
+        for keyword in candidates:
+            if not keyword or keyword in seen:
+                continue
+            seen.add(keyword)
+            try:
+                for result in self.search(keyword) or []:
+                    if result.product_id != pid:
+                        continue
+                    local = int(result.local_stock or 0)
+                    other = int(result.other_stock or 0)
+                    stock = local + other if local or other else int(result.quantity or 0)
+                    return max(0, stock)
+            except Exception:
+                continue
+        return None
 
     def refetch_stock(self, product_id: str, product_name: str = "") -> Optional[int]:
         """재고 재조회 훅.
@@ -373,29 +429,32 @@ class PartialStockFallbackMixin:
         return plans
 
     def _order_with_stock_fallback(
-        self, bare_order_fn, product_id: str, quantity: int, product_name: str = ""
+        self, bare_order_fn, product_id: str, quantity: int, product_name: str = "", **item
     ) -> OrderResult:
         """단건 order() 의 Phase 2 wrapper.
 
-        bare_order_fn(pid, qty) → OrderResult — 크롤러 내부의 "순수" order 로직.
+        bare_order_fn(pid, qty, **item) → OrderResult — 크롤러 내부의 "순수" order 로직.
         이 wrapper 가 1차 실패 감지 → refetch_stock → 수량 자동 조정 → bare 재호출.
 
         Group A 크롤러 사용 패턴:
             def order(self, pid, qty, **kwargs):
                 return self._order_with_stock_fallback(
                     self._order_bare, pid, qty,
-                    product_name=kwargs.get("product_name", "")
+                    **kwargs
                 )
         """
         original_qty = int(quantity)
-        r = bare_order_fn(product_id, original_qty)
+        metadata = dict(item, product_name=product_name)
+        r = bare_order_fn(product_id, original_qty, **metadata)
         r.original_quantity = original_qty
         if r.success:
             if r.reason_code is None:
                 r.reason_code = "ok"
             return r
 
-        if r.reason_code == "send_unknown":
+        if (r.reason_code not in SAFE_RESEND_REASONS
+                or r.fulfilled_quantity != 0 or r.no_retry):
+            _as_unknown_if_unspecified(r)
             # 접수됐을 수 있다. 수량을 줄여 다시 보내면 이중 주문이 된다.
             return r
 
@@ -406,7 +465,7 @@ class PartialStockFallbackMixin:
 
         stock = None
         try:
-            stock = self._refetch_stock_for_item({"product_id": product_id, "product_name": product_name})
+            stock = self._refetch_stock_for_item(dict(metadata, product_id=product_id, quantity=original_qty))
         except Exception:
             stock = None
         if stock is not None and (stock < 0 or stock > self._MAX_SANE_STOCK):
@@ -414,7 +473,7 @@ class PartialStockFallbackMixin:
 
         if stock is None:
             _logger.warning("Phase 2 재고 조회 불가 — 원래 실패 결과 유지")
-            r.reason_code = _keep_or_other(r.reason_code)
+            _as_unknown_if_unspecified(r)
             return r
         if stock == 0:
             _logger.warning("Phase 2 재고 0 — stock_zero")
@@ -429,7 +488,7 @@ class PartialStockFallbackMixin:
         if stock >= original_qty:
             # 재고 충분한데 실패 → 재고 외 원인. 그대로 실패 반환.
             _logger.warning("Phase 2 재고 %d ≥ 요청 %d — 재고 원인 아님, 재시도 스킵", stock, original_qty)
-            r.reason_code = _keep_or_other(r.reason_code)
+            _as_unknown_if_unspecified(r)
             r.available_stock = stock
             return r
 
@@ -459,15 +518,8 @@ class PartialStockFallbackMixin:
                                    original_quantity=original_qty, reason_code="not_sent")
             break
 
-        r2 = bare_order_fn(product_id, stock)
-        r2.original_quantity = original_qty
-        r2.adjusted_quantity = stock
-        r2.available_stock = stock
-        r2.reason_code = "stock_adjusted" if r2.success else _keep_or_other(r2.reason_code)
-        r2.retried = True
-        if r2.success:
-            # Mixin 이 수량 조정을 감지했음을 명시적으로 메시지에 반영 (bare 가 채운 "주문 전송 완료" 덮어씀)
-            r2.message = f"재고 부족으로 {original_qty}→{stock}개 조정 주문"
+        r2 = bare_order_fn(product_id, stock, **metadata)
+        _settle_resend(r2, original_qty, stock)
         _logger.warning("Phase 2 재시도 결과: %s", r2.success)
         return r2
 

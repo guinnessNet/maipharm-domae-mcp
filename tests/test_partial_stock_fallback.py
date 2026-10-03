@@ -131,7 +131,7 @@ def test_single_order_unknown_not_retried():
     site = FakeSite(real_stock={"A": 1}, visible_stock={"A": 1})
     calls = []
 
-    def bare(pid, qty):
+    def bare(pid, qty, **metadata):
         calls.append(qty)
         return OrderResult(success=False, message="결과 불명", reason_code="send_unknown")
 
@@ -143,7 +143,7 @@ def _scripted(*results):
     """호출될 때마다 준비된 OrderResult 를 차례로 돌려주는 bare 주문 함수."""
     calls = []
 
-    def bare(pid, qty):
+    def bare(pid, qty, **metadata):
         calls.append(qty)
         return results[len(calls) - 1]
     return bare, calls

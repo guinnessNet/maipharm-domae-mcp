@@ -43,7 +43,7 @@ def test_phase2_success_results_are_marked_retried():
 def test_adjusted_resend_is_marked_retried():
     calls = []
 
-    def bare(pid, qty):
+    def bare(pid, qty, **metadata):
         calls.append(qty)
         if len(calls) == 1:
             return OrderResult(success=False, message="거부", reason_code="rejected")
@@ -54,7 +54,7 @@ def test_adjusted_resend_is_marked_retried():
 
 
 def test_first_try_success_is_not_retried():
-    r = Site()._order_with_stock_fallback(lambda pid, qty: OrderResult(success=True), "A", 5)
+    r = Site()._order_with_stock_fallback(lambda pid, qty, **metadata: OrderResult(success=True), "A", 5)
     assert r.retried is False
 
 
