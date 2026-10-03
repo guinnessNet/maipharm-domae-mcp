@@ -336,3 +336,21 @@ def test_redis_check_failure_freezes_run(monkeypatch):
     monkeypatch.setattr(c.cart_snapshot, 'owned', owned)
     with pytest.raises(cs.CartChanged): c._cart_build(snap, {'A': 2})
     assert c.cart == snap
+
+@pytest.mark.parametrize("supplier", ["티제이팜", "백제", "지오영"])
+def test_confirmation_button_binds_account_and_fits_telegram(monkeypatch, supplier):
+    sent = []
+    monkeypatch.setattr(cs, '_notify', lambda *a, **k: sent.append(a))
+    store = CartSnapshot(fakeredis.FakeRedis(), 'monitor1full', supplier, account='private-login')
+    store.lock(); store.save({}); store.restore_failed('blocked')
+    data = sent[0][2]['inline_keyboard'][0][0]['callback_data']
+    assert len(data.split(':')) == 5 and len(data.encode()) <= 64
+    assert 'private-login' not in data
+    assert data.split(':')[-1] == store.account_binding
+    store._send_button(9007199254740991, 'largest revision', {})
+    assert len(sent[-1][2]['inline_keyboard'][0][0]['callback_data'].encode()) <= 64
+    original = data
+    store.unlock(); store._r.delete(store.reissue_key)
+    resumed = CartSnapshot(store._r, 'monitor1full', supplier, account='private-login')
+    resumed.lock(); resumed.reissue(resumed.load())
+    assert sent[-1][2]['inline_keyboard'][0][0]['callback_data'] == original

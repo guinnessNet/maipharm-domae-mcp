@@ -14,6 +14,7 @@ Redis 쓰기는 모두 WATCH/MULTI 트랜잭션으로 소유자·차수를 비�
 _cart_clear_raw(). 판독·대조는 이 모듈이 한다. 여러 요청을 묶어 한 번에 지우지 않는다.
 """
 import hashlib
+import base64
 import json
 import logging
 import uuid
@@ -57,6 +58,8 @@ class CartSnapshot:
 
     def __init__(self, redis, monitor_id, supplier, account=""):
         acct = hashlib.sha1(account.encode()).hexdigest()[:16] if account else f"m-{monitor_id}"
+        identity = "account:" + account if account else "monitor:" + monitor_id
+        self.account_binding = base64.urlsafe_b64encode(hashlib.sha256(identity.encode()).digest()[:12]).decode()
         self._r, self._m, self._s = redis, monitor_id, supplier
         base = f"{supplier}:{acct}"
         self.lock_key = f"domae:cart_lock:{base}"
@@ -196,7 +199,7 @@ class CartSnapshot:
     def _send_button(self, rev, reason, snap):
         names = ", ".join(str(k) for k in list(snap)[:5]) or "(빈 장바구니)"
         button = {"inline_keyboard": [[{"text": "장바구니 확인 완료",
-                                        "callback_data": f"CR:{self._m[:8]}:{self._s[:10]}:{rev}"}]]}
+                                        "callback_data": f"CR:{self._m[:8]}:{self._s[:10]}:{rev}:{self.account_binding}"}]]}
         try:
             _notify(self._m, f"⚠ [{self._s}] {reason}\n원래 장바구니: {names}\n도매몰 장바구니를 확인·정리한 뒤 "
                              f"아래 버튼을 눌러 주세요. 누르기 전까지 이 도매 자동주문은 멈춥니다.", button)

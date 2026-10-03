@@ -436,12 +436,19 @@ def test_cart_release_commits_audit_once_in_isolated_schema(database, monkeypatc
     store.lock(); rev = store.save({'original': 3}); store.unlock()
     sent = []
     monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: sent.append(a))
-    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'revision': rev, 'chat_id': '12345'}
+    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'account_binding': store.account_binding, 'revision': rev, 'chat_id': '12345'}
+    old_account = CartSnapshot(scheduler._redis, 'monitor1full', '백제', account='previous-account')
+    old_account.lock(); old_rev = old_account.save({'old': 2}); old_account.unlock()
+    assert old_rev == rev
+    scheduler.cart_release({**job, 'account_binding': old_account.account_binding})
+    assert store.load() is not None and old_account.load() is not None
+    cur = observer.cursor(); cur.execute('SELECT count(*) FROM domae_order_audit_events')
+    assert cur.fetchone() == (0,)
     scheduler.cart_release(job); scheduler.cart_release(job)
     cur = observer.cursor()
     cur.execute('SELECT "monitorId",supplier,"eventType",source,payload FROM domae_order_audit_events')
     assert cur.fetchall() == [('monitor1full','백제','cart_snapshot_released','worker',{'revision': rev})]
-    assert store.load() is None and len(sent) == 2
+    assert store.load() is None and old_account.load() is not None and len(sent) == 3
 
 
 def test_fallback_unknown_partial_survives_null_row(database):
@@ -469,7 +476,7 @@ def test_cart_release_audit_recovers_after_failure_and_interruption(database, mo
     redis = fakeredis.FakeRedis()
     store = CartSnapshot(redis, 'monitor1full', '백제', account='local-account')
     store.lock(); rev = store.save({'original': 3}); store.unlock()
-    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'revision': rev, 'chat_id': '12345'}
+    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'account_binding': store.account_binding, 'revision': rev, 'chat_id': '12345'}
     state = {'fail': True}
     class Cursor:
         def __init__(self, cursor): self.cursor = cursor

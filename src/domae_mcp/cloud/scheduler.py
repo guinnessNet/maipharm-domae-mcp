@@ -1,5 +1,6 @@
 """클라우드 모니터링 스케줄러"""
 import hashlib
+import hmac
 import importlib.util
 import json
 import logging
@@ -3147,6 +3148,9 @@ class CloudScheduler:
         from domae_mcp.cloud.notifier import Notifier
         prefix, supplier = job.get("monitor_prefix", ""), job.get("supplier", "")
         rev, chat_id = job.get("revision"), str(job.get("chat_id", ""))
+        binding = job.get("account_binding")
+        if not isinstance(binding, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16}", binding):
+            return
         if not re.fullmatch(r"[A-Za-z0-9]{8}", prefix) or supplier not in ("티제이팜", "백제", "지오영") or type(rev) is not int or rev <= 0 or not chat_id:
             return
         conn = self._get_conn()
@@ -3161,12 +3165,15 @@ class CloudScheduler:
                 cred = self._decrypt_creds(row[1]).get(supplier)
                 if cred and cred.get("login_id"):
                     store = CartSnapshot(self._redis, row[0], supplier, account=cred["login_id"])
-                    result = store.release(rev)
-                    if result == "ok":
-                        key = store.release_key(rev)
-                        receipt = CartSnapshot.release_receipt(self._redis, key)
-                        if receipt is not None:
-                            self._persist_cart_release(conn, key, receipt)
+                    if hmac.compare_digest(binding, store.account_binding):
+                        result = store.release(rev)
+                        if result == "ok":
+                            key = store.release_key(rev)
+                            receipt = CartSnapshot.release_receipt(self._redis, key)
+                            if receipt is not None:
+                                self._persist_cart_release(conn, key, receipt)
+                    else:
+                        result = "도매 계정이 변경되었습니다. 최신 장바구니 확인 알림을 사용해 주세요."
         except Exception:
             conn.rollback()
             logger.exception("장바구니 확인 해제 처리 실패 chat=%s", Notifier._tail(chat_id))

@@ -24,7 +24,7 @@ def test_release_action_revalidates_and_audits(monkeypatch, mode):
     sent = []
     monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: sent.append(a))
     job = {'action': 'cart_release', 'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1',
-           'supplier': '백제', 'revision': rev+1 if mode == 'stale' else rev, 'chat_id': '123456'}
+           'supplier': '백제', 'account_binding': store.account_binding, 'revision': rev+1 if mode == 'stale' else rev, 'chat_id': '123456'}
     scheduler.cart_release(job)
     if mode == 'repeat': scheduler.cart_release(job)
     audits = [args for args, kw in cur.execute.call_args_list if 'INSERT INTO domae_order_audit_events' in args[0]]
@@ -191,3 +191,27 @@ def test_unexpected_recovery_exception_still_dequeues_job():
     worker._redis.brpop.return_value = 'domae:jobs', json.dumps(job)
     worker.run()
     worker._scheduler.execute.assert_called_once_with(job)
+
+@pytest.mark.parametrize('binding_kind', ['old_account', 'malformed', 'forged', 'legacy'])
+def test_old_account_callback_cannot_release_new_accounts_same_revision(monkeypatch, binding_kind):
+    import base64, hashlib
+    redis = fakeredis.FakeRedis()
+    old = CartSnapshot(redis, 'monitor1full', '백제', account='account-A')
+    current = CartSnapshot(redis, 'monitor1full', '백제', account='account-B')
+    for store in (old, current):
+        store.lock(); assert store.save({'original': 3}) == 1; store.unlock()
+    conn, cur, pool = Mock(), Mock(), Mock()
+    conn.cursor.return_value = cur; cur.fetchone.return_value = ('monitor1full', {})
+    pool.getconn.return_value = conn
+    scheduler = CloudScheduler(pool, redis)
+    scheduler._decrypt_creds = lambda c: {'백제': {'login_id': 'account-B'}}
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: None)
+    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'revision': 1, 'chat_id': '12345'}
+    if binding_kind == 'old_account':
+        job['account_binding'] = base64.urlsafe_b64encode(hashlib.sha256(b'account:account-A').digest()[:12]).decode()
+    elif binding_kind != 'legacy':
+        job['account_binding'] = 'invalid!' if binding_kind == 'malformed' else 'AAAAAAAAAAAAAAAA'
+    scheduler.cart_release(job)
+    assert old.load() is not None and current.load() is not None
+    assert not redis.zcard('domae:cart_release_pending')
+    assert not any('INSERT INTO domae_order_audit_events' in c.args[0] for c in cur.execute.call_args_list)
