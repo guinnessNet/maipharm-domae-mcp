@@ -97,8 +97,18 @@ def checked_qty(value, upper):
     return value if type(value) is int and 0 <= value <= upper else None
 
 
-def _as_unknown_if_unspecified(result, requested=None):
-    """불명확한 실패 또는 검증 불가 접수 수량은 확인 필요로 보존한다."""
+def _as_unknown_if_unspecified(result, requested=None, *, allow_zero_adjustment=False):
+    """불명확한 결과는 확인 필요로 보존하고 검증 불가 조정 수량을 격리한다."""
+    if requested is not None and result.adjusted_quantity is not None:
+        adjusted = checked_qty(result.adjusted_quantity, requested)
+        if adjusted is None or (result.success and adjusted == 0 and not allow_zero_adjustment):
+            import logging
+            warning = "접수 조정 수량 검증 실패 — 도매몰 주문내역 확인 필요"
+            logging.getLogger(__name__).warning(warning)
+            result.message = f"{result.message} — {warning}" if result.message else warning
+            result.adjusted_quantity = None
+            result.success = False
+            result.reason_code = "send_unknown"
     if not result.success and (result.reason_code in (None, "other")
             or (requested is not None and checked_qty(result.fulfilled_quantity, requested) is None)):
         result.reason_code = "send_unknown"
@@ -109,6 +119,9 @@ def _settle_resend(result, original_qty, resend_qty):
     result.original_quantity = original_qty
     result.available_stock = resend_qty
     result.retried = True
+    # 원래 요청보다 줄여 보냈으므로 접수 증거도 실제 전송량을 넘을 수 없다.
+    if checked_qty(result.fulfilled_quantity, resend_qty) is None:
+        result.fulfilled_quantity = None
     if not result.success:
         return _as_unknown_if_unspecified(result, resend_qty)
     actual = resend_qty if result.adjusted_quantity is None else checked_qty(result.adjusted_quantity, resend_qty)
@@ -119,6 +132,7 @@ def _settle_resend(result, original_qty, resend_qty):
         result.message = f"{result.message} — {warning}" if result.message else warning
         result.success = False
         result.reason_code = "send_unknown"
+        result.adjusted_quantity = None
         return result
     result.adjusted_quantity = actual
     result.reason_code = "stock_adjusted"

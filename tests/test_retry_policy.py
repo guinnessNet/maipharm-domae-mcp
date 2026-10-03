@@ -170,3 +170,36 @@ def test_valid_integer_zero_still_authorizes_base_resend(batch, reason):
         assert [x[1] for x in c.calls] == [5, 2]
     finally:
         c.session.close()
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('adjusted', [True, False, 0, 0.0, 1.5, 6, -1, '2'])
+def test_invalid_initial_adjustment_preserves_known_partial_without_resend(batch, adjusted):
+    r = OrderResult(success=True, adjusted_quantity=adjusted, fulfilled_quantity=3)
+    c = Crawler([r])
+    try:
+        assert execute(c, batch) is r
+        assert not r.success and r.reason_code == 'send_unknown'
+        assert r.adjusted_quantity is None
+        assert base.confirmed_quantity(r, 5) == 3
+        assert len(c.calls) == 1 and not c.refetches
+    finally:
+        c.session.close()
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('fulfilled,confirmed', [(3, 3), (6, None)])
+def test_resend_adjustment_and_partial_are_bounded_by_actual_sent_quantity(batch, fulfilled, confirmed):
+    c = Crawler([OrderResult(reason_code='not_sent'),
+        OrderResult(success=True, adjusted_quantity=6, fulfilled_quantity=fulfilled)], stock=5)
+    try:
+        if batch:
+            r = c.order_batch([dict(product_id='p', quantity=15)])[0]
+        else:
+            r = c._order_with_stock_fallback(c.bare, 'p', 15)
+        assert [x[1] for x in c.calls] == [15, 5]
+        assert not r.success and r.reason_code == 'send_unknown'
+        assert r.adjusted_quantity is None
+        assert base.confirmed_quantity(r, 15) == confirmed
+    finally:
+        c.session.close()

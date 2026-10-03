@@ -2499,7 +2499,7 @@ class CloudScheduler:
             result = OrderResult(success=False, reason_code="send_unknown", message="주문 중 오류 — 확인 필요")
         if not isinstance(result, OrderResult):
             result = OrderResult(success=False, reason_code="send_unknown", message="주문 결과 형식 이상 — 확인 필요")
-        result = _as_unknown_if_unspecified(result)
+        result = _as_unknown_if_unspecified(result, quantity, allow_zero_adjustment=True)
         if result.reason_code == "send_unknown":
             result.success = False
         if not result.success:

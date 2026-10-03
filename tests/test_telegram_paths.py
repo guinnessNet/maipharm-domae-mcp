@@ -2,6 +2,7 @@
 import sys
 sys.path.insert(0, 'src')
 import fakeredis
+from copy import deepcopy
 import pytest
 from domae_mcp.cloud import scheduler as sch
 from domae_mcp.cloud import notifier as nmod
@@ -155,16 +156,29 @@ def test_database_failure_never_resends(env, boundary):
         assert len(env.calls) == 1 and env.rows()[0][:3] == (None,'send_unknown',None)
 
 
-@pytest.mark.parametrize('adjusted', [0, True, -1, 6, '3'])
+@pytest.mark.parametrize('adjusted', [0, True, False, 0.0, 1.5, -1, 6, '3'])
 def test_success_uses_only_validated_quantity(env, adjusted):
     env.state['result'] = OrderResult(success=True, adjusted_quantity=adjusted)
     env.run()
     row = env.rows()[0]
-    if adjusted == 0 and type(adjusted) is int:
-        assert row[:3] == (True,None,0)
+    if type(adjusted) is int and adjusted == 0:
+        assert row[:3] == (True, None, 0) and row[5] == 0
         assert '0개' in env.sent[-1]['text']
     else:
         assert row[:3] == (None,'send_unknown',None) and not buttons(env)
+        assert row[5] is None
+
+
+@pytest.mark.parametrize('success', [False, True])
+@pytest.mark.parametrize('adjusted', [1.5, 6])
+def test_bad_adjustment_preserves_independent_partial_evidence(env, success, adjusted):
+    env.state['result'] = OrderResult(success=success, reason_code='stock_adjusted' if success else 'not_sent',
+        adjusted_quantity=adjusted, fulfilled_quantity=2)
+    env.run()
+    row = env.rows()[0]
+    assert row[:3] == (None, 'send_unknown', 2) and row[5] is None
+    assert '확정 수량 2개' in env.sent[-1]['text']
+    assert len(env.calls) == 1 and not buttons(env)
 
 
 def test_distinct_message_ids_and_path_prefixes_are_separate(env):
@@ -266,7 +280,7 @@ def test_result_record_failure_keeps_known_quantity_in_notice(env, boundary, res
             conn.rollback()
             pool.putconn(conn.conn, **kw)
     env.scheduler._db_pool = Pool()
-    env.state['result'] = result
+    env.state['result'] = deepcopy(result)
     env.run()
     assert env.rows()[0][:3] == (None, 'send_unknown', None)
     assert f'확정 수량 {known}개' in env.sent[-1]['text']

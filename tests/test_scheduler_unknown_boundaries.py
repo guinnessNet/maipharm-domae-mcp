@@ -156,3 +156,46 @@ def test_invalid_fulfillment_is_protected_without_any_resend(env, path, reason, 
     assert any('확인 필요' in str(n) for n in env.notices)
     assert env.state['first'].fulfilled_quantity is fulfilled
     assert not env.pool._used
+
+
+ADJUSTMENT_CASES = [(True, value) for value in (True, False, 0, 0.0, 1.5, 16, -1, '2')]
+ADJUSTMENT_CASES += [(False, value) for value in (True, False, 0.0, 1.5, 16, -1, '2')]
+
+
+def run_reported_result(env, path, result):
+    retry = path == 'batch_retry'
+    env.state.update(first=OrderResult(reason_code='not_sent') if retry else result,
+        retry=result, retrying=retry)
+    env.run('batch_order' if retry else path)
+
+
+@pytest.mark.parametrize('path', ['batch_order', 'batch_retry', 'auto_order', 'order'])
+@pytest.mark.parametrize('success,adjusted', ADJUSTMENT_CASES)
+@pytest.mark.parametrize('fulfilled', [0, 3])
+def test_invalid_adjustment_is_quarantined_before_sql_and_cart(env, path, success, adjusted, fulfilled):
+    result = OrderResult(success=success, reason_code='stock_adjusted' if success else 'not_sent',
+        adjusted_quantity=adjusted, fulfilled_quantity=fulfilled)
+    run_reported_result(env, path, result)
+    order, cart, batch = env.read()
+    assert order == (None, 'send_unknown', fulfilled or None, None)
+    assert cart[0] == 15 and '전송 결과 확인 필요' in cart[1]
+    assert batch == ('processing', 0)
+    expected = [('batch', 15), ('order', 15)] if path == 'batch_retry' else [
+        ('order' if path == 'order' else 'batch', 15)]
+    assert env.calls == expected and not env.alternatives
+    assert result.fulfilled_quantity == fulfilled
+    assert any('확인 필요' in str(n) for n in env.notices)
+    assert not env.pool._used
+
+
+@pytest.mark.parametrize('path', ['batch_order', 'batch_retry', 'auto_order', 'order'])
+def test_valid_adjustment_still_records_actual_quantity(env, path):
+    run_reported_result(env, path, OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    assert env.read()[0] == (True, 'stock_adjusted', 10, 10)
+    assert env.read()[1][0] == (15 if path == 'order' else 5)
+
+
+@pytest.mark.parametrize('path', ['batch_order', 'batch_retry', 'auto_order', 'order'])
+def test_confirmed_unsent_stock_zero_adjustment_remains_zero(env, path):
+    run_reported_result(env, path, OrderResult(reason_code='stock_zero', adjusted_quantity=0))
+    assert env.read()[0] == (False, 'stock_zero', None, 0)
