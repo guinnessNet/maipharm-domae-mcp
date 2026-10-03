@@ -23,6 +23,9 @@ dependencies = [
     "Pillow>=10.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "fakeredis>=2.0"]
+
 [project.scripts]
 domae-mcp = "domae_mcp.__main__:main"
 
