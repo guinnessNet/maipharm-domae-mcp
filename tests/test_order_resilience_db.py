@@ -501,7 +501,8 @@ def test_cart_release_audit_recovers_after_failure_and_interruption(database, mo
         def putconn(self, c): c.rollback()
     scheduler = sch.CloudScheduler(Pool(), redis)
     scheduler._decrypt_creds = lambda c: {'백제': {'login_id': 'local-account'}}
-    monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: sent.append(a))
     release = CartSnapshot.release
     def release_crash(self, revision):
         result = release(self, revision)
@@ -511,6 +512,9 @@ def test_cart_release_audit_recovers_after_failure_and_interruption(database, mo
     if hasattr(CartSnapshot, 'ack_release'):
         ack = CartSnapshot.ack_release
         def ack_crash(redis_client, key, receipt):
+            observed = observer.cursor()
+            observed.execute('SELECT count(*) FROM domae_order_audit_events WHERE id=%s', (receipt['id'],))
+            assert observed.fetchone() == (1,)  # A separate PG session sees commit before Redis ACK.
             if state['fail'] and boundary == 'before_ack': raise RuntimeError('ack failed')
             return ack(redis_client, key, receipt)
         monkeypatch.setattr(CartSnapshot, 'ack_release', ack_crash)
@@ -518,6 +522,10 @@ def test_cart_release_audit_recovers_after_failure_and_interruption(database, mo
         scheduler.cart_release(job)
     except KeyboardInterrupt:
         pass
+    if boundary in ('insert_failure', 'commit_failure', 'commit_ambiguity', 'before_ack'):
+        assert sent == [('12345', '장바구니 확인 해제 완료 — 감사 기록 재시도 중')]
+    else:
+        assert sent == []  # Process interruption is never normalized into success.
     assert store.load() is None
     assert redis.zcard('domae:cart_release_pending') == 1
     pending_key = redis.zrange('domae:cart_release_pending', 0, 0)[0]
@@ -575,3 +583,73 @@ def test_audit_recovery_rotates_permanent_pg_failures_without_starving(database)
     assert redis.zcard('domae:cart_release_pending') == 10
     for key in redis.zrange('domae:cart_release_pending', 0, -1):
         assert redis.get(key) == originals[key.decode()] and redis.ttl(key) == -1
+
+
+@pytest.mark.parametrize('failure', ['rollback', 'operational', 'interface', 'closed', 'poolreturn'])
+def test_cart_release_discards_actual_pg_connection_and_still_notifies(database, monkeypatch, failure):
+    import fakeredis
+    from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+    from domae_mcp.cloud.notifier import Notifier
+    origin, observer = database
+    cur = origin.cursor()
+    cur.execute('CREATE TABLE domae_cloud_monitors (id text, credentials jsonb, "telegramChatId" text, "isActive" boolean)')
+    cur.execute('CREATE TABLE domae_order_audit_events (id text PRIMARY KEY, "monitorId" text, supplier text, "eventType" text, source text, payload jsonb, "createdAt" timestamp)')
+    cur.execute("INSERT INTO domae_cloud_monitors VALUES ('monitor1full','{}','12345',true)")
+    cur.execute('SHOW search_path'); search_path = cur.fetchone()[0]
+    origin.commit()
+    disposable = psycopg2.connect(os.environ['DOMAE_TEST_DATABASE_URL'])
+    disposable.cursor().execute('SET search_path TO ' + search_path)
+    disposable.commit()
+    class Cursor:
+        def __init__(self, cursor): self.cursor = cursor
+        def execute(self, sql, params=None):
+            if 'INSERT INTO domae_order_audit_events' in sql and failure != 'poolreturn':
+                if failure == 'closed': disposable.close()
+                if failure == 'rollback': return self.cursor.execute('SELECT 1/0')
+                error = psycopg2.InterfaceError if failure == 'interface' else psycopg2.OperationalError
+                raise error('local test connection failure')
+            return self.cursor.execute(sql, params)
+        def __getattr__(self, name): return getattr(self.cursor, name)
+    class Connection:
+        @property
+        def closed(self): return disposable.closed
+        def cursor(self): return Cursor(disposable.cursor())
+        def commit(self): return disposable.commit()
+        def rollback(self):
+            if failure == 'rollback': raise psycopg2.InterfaceError('local rollback failure')
+            return disposable.rollback()
+        def close(self): disposable.close()
+    connection = Connection()
+    returns = []
+    class Pool:
+        def getconn(self): return connection if not disposable.closed else origin
+        def putconn(self, conn, close=False):
+            returns.append((conn, close))
+            if conn is connection and failure == 'poolreturn': raise RuntimeError('local pool failure')
+            if close: conn.close()
+            else: conn.rollback()
+    redis = fakeredis.FakeRedis()
+    scheduler = sch.CloudScheduler(Pool(), redis)
+    scheduler._decrypt_creds = lambda _: {'백제': {'login_id': 'local-account'}}
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='local-account')
+    store.lock(); revision = store.save({'original': 3}); store.unlock()
+    sent = []
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *args: sent.append(args))
+    try:
+        scheduler.cart_release({'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제',
+            'account_binding': store.account_binding, 'revision': revision, 'chat_id': '12345'})
+        assert disposable.closed and store.load() is None
+        assert returns == [(connection, failure != 'poolreturn')]
+        if failure == 'poolreturn':
+            assert sent == [('12345', '장바구니 확인이 완료되었습니다.')]
+        else:
+            assert sent == [('12345', '장바구니 확인 해제 완료 — 감사 기록 재시도 중')]
+            receipt = store.release_receipt(redis, store.release_key(revision))
+            scheduler.recover_cart_releases()
+            scheduler.recover_cart_releases()
+            observed = observer.cursor()
+            observed.execute('SELECT id, payload FROM domae_order_audit_events')
+            assert observed.fetchall() == [(receipt['id'], {'revision': revision})]
+        assert redis.zcard('domae:cart_release_pending') == 0
+    finally:
+        disposable.close()

@@ -3141,9 +3141,11 @@ class CloudScheduler:
             return
         if not re.fullmatch(r"[A-Za-z0-9]{8}", prefix) or supplier not in ("티제이팜", "백제", "지오영") or type(rev) is not int or rev <= 0 or not chat_id:
             return
-        conn = self._get_conn()
+        conn = None
+        released, audit_complete, discard_conn = False, False, False
         result = "권한 없음"
         try:
+            conn = self._get_conn()
             cur = conn.cursor()
             cur.execute('''SELECT id, credentials FROM domae_cloud_monitors
                 WHERE LEFT(id, 8) = %s AND "telegramChatId" = %s AND "isActive" = true
@@ -3156,19 +3158,43 @@ class CloudScheduler:
                     if hmac.compare_digest(binding, store.account_binding):
                         result = store.release(rev)
                         if result == "ok":
+                            released = True
                             key = store.release_key(rev)
                             receipt = CartSnapshot.release_receipt(self._redis, key)
                             if receipt is not None:
                                 self._persist_cart_release(conn, key, receipt)
+                                # ACK가 거절된 경우에도 영수증을 성공으로 오인하지 않는다.
+                                audit_complete = CartSnapshot.release_receipt(self._redis, key) is None
                     else:
                         result = "도매 계정이 변경되었습니다. 최신 장바구니 확인 알림을 사용해 주세요."
-        except Exception:
-            conn.rollback()
-            logger.exception("장바구니 확인 해제 처리 실패 chat=%s", Notifier._tail(chat_id))
+        except Exception as error:
+            discard_conn = isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    discard_conn = True
+            logger.warning("장바구니 %s 실패 chat=%s error=%s",
+                           "해제 감사" if released else "확인 해제 처리",
+                           Notifier._tail(chat_id), type(error).__name__)
             result = "확인 해제 처리 중 오류가 발생했습니다."
         finally:
-            self._db_pool.putconn(conn)
-        Notifier.send_telegram(chat_id, "장바구니 확인이 완료되었습니다." if result == "ok" else result)
+            if conn is not None:
+                try:
+                    if discard_conn or getattr(conn, "closed", False):
+                        self._db_pool.putconn(conn, close=True)
+                    else:
+                        self._db_pool.putconn(conn)
+                except Exception:
+                    logger.warning("장바구니 확인 해제 DB 연결 반환 실패 — 직접 연결 종료")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        if released:
+            result = ("장바구니 확인이 완료되었습니다." if audit_complete else
+                      "장바구니 확인 해제 완료 — 감사 기록 재시도 중")
+        Notifier.send_telegram(chat_id, result)
 
     def telegram_order(self, job: dict):
         """텔레그램 인라인 버튼으로 접수된 주문 처리.

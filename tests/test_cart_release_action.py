@@ -15,7 +15,7 @@ def test_release_action_revalidates_and_audits(monkeypatch, mode):
     store = CartSnapshot(redis, 'monitor1full', '백제', account='login')
     store.lock(); rev = store.save({'Z': 3}); store.unlock()
     if mode == 'live': store.lock()
-    conn, cur = Mock(), Mock()
+    conn, cur = Mock(closed=0), Mock()
     conn.cursor.return_value = cur
     cur.fetchone.return_value = None if mode == 'foreign' else ('monitor1full', {})
     pool = Mock(); pool.getconn.return_value = conn
@@ -32,6 +32,8 @@ def test_release_action_revalidates_and_audits(monkeypatch, mode):
     assert (store.load() is None) == (mode in ('ok', 'repeat'))
     assert pool.putconn.call_count == (2 if mode == 'repeat' else 1)
     assert sent
+    if mode not in ("ok", "repeat"):
+        assert all("완료" not in message for _, message in sent)
     assert redis.zcard("domae:cart_release_pending") == 0
     query = next(call.args for call in cur.execute.call_args_list if "telegramChatId" in call.args[0])
     assert '"telegramChatId" = %s' in query[0] and '123456' in query[1]
@@ -204,7 +206,7 @@ def test_old_account_callback_cannot_release_new_accounts_same_revision(monkeypa
     current = CartSnapshot(redis, 'monitor1full', '백제', account='account-B')
     for store in (old, current):
         store.lock(); assert store.save({'original': 3}) == 1; store.unlock()
-    conn, cur, pool = Mock(), Mock(), Mock()
+    conn, cur, pool = Mock(closed=0), Mock(), Mock()
     conn.cursor.return_value = cur; cur.fetchone.return_value = ('monitor1full', {})
     pool.getconn.return_value = conn
     scheduler = CloudScheduler(pool, redis)
@@ -219,3 +221,76 @@ def test_old_account_callback_cannot_release_new_accounts_same_revision(monkeypa
     assert old.load() is not None and current.load() is not None
     assert not redis.zcard('domae:cart_release_pending')
     assert not any('INSERT INTO domae_order_audit_events' in c.args[0] for c in cur.execute.call_args_list)
+
+
+@pytest.mark.parametrize('failure', ['insert', 'commit', 'ack', 'ack_false', 'rollback', 'operational', 'interface', 'closed', 'poolreturn'])
+def test_release_audit_failure_preserves_success_and_notifies(monkeypatch, failure):
+    import psycopg2
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='login')
+    store.lock(); revision = store.save({'original': 3}); store.unlock()
+    conn, cur, pool = Mock(closed=0), Mock(), Mock()
+    conn.cursor.return_value = cur
+    cur.fetchone.return_value = ('monitor1full', {})
+    pool.getconn.return_value = conn
+    scheduler = CloudScheduler(pool, redis)
+    scheduler._decrypt_creds = lambda _: {'백제': {'login_id': 'login'}}
+    sent = []
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *args: sent.append(args))
+    original_ack = CartSnapshot.ack_release
+    if failure in ('ack', 'ack_false'):
+        def fail_ack(*args):
+            if failure == 'ack': raise RuntimeError('ACK unavailable')
+            return False
+        monkeypatch.setattr(CartSnapshot, 'ack_release', fail_ack)
+    elif failure == 'poolreturn':
+        pool.putconn.side_effect = RuntimeError('pool unavailable')
+    elif failure == 'commit':
+        conn.commit.side_effect = RuntimeError('commit unavailable')
+    else:
+        error = {'operational': psycopg2.OperationalError, 'interface': psycopg2.InterfaceError}.get(failure, RuntimeError)
+        def execute(sql, params=None):
+            if 'INSERT INTO domae_order_audit_events' in sql:
+                if failure == 'closed': conn.closed = 1
+                raise error('audit unavailable')
+        cur.execute.side_effect = execute
+        if failure == 'rollback': conn.rollback.side_effect = RuntimeError('rollback unavailable')
+    scheduler.cart_release({'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1',
+        'supplier': '백제', 'account_binding': store.account_binding, 'revision': revision, 'chat_id': '12345'})
+    assert store.load() is None
+    pending = failure != 'poolreturn'
+    assert redis.zcard('domae:cart_release_pending') == int(pending)
+    expected = '장바구니 확인 해제 완료 — 감사 기록 재시도 중' if pending else '장바구니 확인이 완료되었습니다.'
+    assert sent == [('12345', expected)]
+    if failure in ('rollback', 'operational', 'interface', 'closed'):
+        pool.putconn.assert_called_once_with(conn, close=True)
+    if failure == 'poolreturn': conn.close.assert_called_once()
+    if pending:
+        receipt = store.release_receipt(redis, store.release_key(revision))
+        assert receipt['revision'] == revision and redis.ttl(store.release_key(revision)) == -1
+        conn.commit.side_effect = None
+        conn.rollback.side_effect = None
+        conn.closed = 0
+        cur.execute.side_effect = None
+        monkeypatch.setattr(CartSnapshot, 'ack_release', original_ack)
+        scheduler.recover_cart_releases()
+        assert redis.zcard('domae:cart_release_pending') == 0
+        assert cur.execute.call_args.args[1][0] == receipt['id']
+
+
+def test_release_process_exit_propagates_and_does_not_notify_completion(monkeypatch):
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1full', '백제', account='login')
+    store.lock(); revision = store.save({}); store.unlock()
+    conn, cur, pool = Mock(closed=0), Mock(), Mock()
+    conn.cursor.return_value = cur; cur.fetchone.return_value = ('monitor1full', {})
+    pool.getconn.return_value = conn
+    scheduler = CloudScheduler(pool, redis)
+    scheduler._decrypt_creds = lambda _: {'백제': {'login_id': 'login'}}
+    conn.commit.side_effect = SystemExit('process exit')
+    notify = Mock(); monkeypatch.setattr(Notifier, 'send_telegram', notify)
+    with pytest.raises(SystemExit):
+        scheduler.cart_release({'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1',
+            'supplier': '백제', 'account_binding': store.account_binding, 'revision': revision, 'chat_id': '12345'})
+    notify.assert_not_called()
+    assert store.load() is None and redis.zcard('domae:cart_release_pending') == 1
