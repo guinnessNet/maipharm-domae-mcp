@@ -121,3 +121,15 @@ def test_partial_order_log_is_not_full_success(monkeypatch):
     primary,*_=run(monkeypatch,[OrderResult(success=True,reason_code='stock_adjusted',adjusted_quantity=10)])
     updates=[params for sql,params in primary.sql if sql.startswith('UPDATE domae_auto_order_logs')]
     assert updates[-1][0]=='partial_fail'
+
+def test_fallback_crawler_receives_account_snapshot(monkeypatch):
+    from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+    observed = []
+    def fallback(needs, candidates, open_crawler, *args, **kwargs):
+        crawler = open_crawler(candidates[0])
+        observed.append(crawler.cart_snapshot)
+        return []
+    monkeypatch.setattr(sch, 'run_fallback', fallback)
+    run(monkeypatch, [OrderResult(success=False, reason_code='stock_zero')], fallback=True)
+    assert len(observed) == 1 and isinstance(observed[0], CartSnapshot)
+    assert observed[0].key == CartSnapshot(None, 'm', '복산', account='x').key

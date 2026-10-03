@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from domae_mcp.core.crawlers.base import OrderResult
+from domae_mcp.core.crawlers.base import OrderResult, confirmed_quantity
 
 logger = logging.getLogger(__name__)
 
@@ -112,12 +112,13 @@ class FallbackOutcome:
         return self.state == "ordered"
 
 
-def _unconfirmed(item, need, sup, ordered, row, record_unconfirmed, message):
+def _unconfirmed(item, need, sup, ordered, row, record_unconfirmed, message, result=None):
     try:
-        record_unconfirmed(row, message)
+        ordered = confirmed_quantity(result, need) if result is not None else None
+        record_unconfirmed(row, message, confirmed=ordered)
     except Exception as e:
         logger.error("대체주문 미확정 기록 실패 [%s]: %s", sup, e)
-    return FallbackOutcome(item, need, sup, ordered, "unconfirmed", message)
+    return FallbackOutcome(item, need, sup, ordered or 0, "unconfirmed", message)
 
 
 def _attempt(item, need, sup, pick, crawler, token, renew_lock,
@@ -141,7 +142,8 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
             logger.error("대체주문 not_sent 기록 실패 [%s]: %s", sup, e)
         return None
     try:
-        result = crawler.order(pick.product_id, need, product_name=pick.product_name)
+        result = crawler.order(pick.product_id, need, product_name=pick.product_name,
+                               insurance_code=pick.insurance_code)
     except Exception as e:
         logger.error("대체주문 전송 예외 [%s] — 접수 여부 불명: %s", sup, e)
         return _unconfirmed(item, need, sup, 0, row, record_unconfirmed,
@@ -150,14 +152,14 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
     reason = getattr(result, "reason_code", None)
     if not result.success and reason not in SAFE_TO_CONTINUE:
         return _unconfirmed(item, need, sup, 0, row, record_unconfirmed,
-                            f"{sup} 주문 결과 불명({result.message}) — 도매몰 주문내역 확인 필요")
+                            f"{sup} 주문 결과 불명({result.message}) — 도매몰 주문내역 확인 필요", result=result)
 
     ordered = (getattr(result, "adjusted_quantity", None) or need) if result.success else 0
     try:
         record_result(row, item, sup, result)
     except Exception as e:
         logger.error("대체주문 결과 기록 실패 [%s] success=%s: %s", sup, result.success, e)
-        return FallbackOutcome(item, need, sup, ordered, "unconfirmed",
+        return FallbackOutcome(item, need, sup, ordered or 0, "unconfirmed",
                                f"{sup} 주문 결과 기록 실패 — 접수 여부 확인 필요")
     if result.success:
         return FallbackOutcome(item, need, sup, ordered, "ordered", f"{sup}에 {ordered}개 대체 주문")

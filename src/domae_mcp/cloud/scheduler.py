@@ -16,7 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 
-from domae_mcp.core.crawlers.base import CrawlerError, OrderResult
+from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, confirmed_quantity
+from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
 from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
@@ -230,7 +231,7 @@ def _fail_pending_rows(cur, batch_id, message):
     배치만 failed 로 바꾸면 품목 이력이 success=null, message='pending' 으로 영원히 남는다.
     """
     cur.execute(
-        'UPDATE domae_cloud_orders SET success = false, message = %s '
+        'UPDATE domae_cloud_orders SET success = false, "confirmedQuantity" = NULL, message = %s '
         'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED, (message, batch_id))
 
 
@@ -250,7 +251,7 @@ def _finalize_if_confirmed(conn, cur, batch_id, reason) -> bool:
 
     logger.error("batch 재실행 중단: batch=%s (%s)", batch_id, reason)
     cur.execute(
-        'UPDATE domae_cloud_orders SET success = false, message = %s '
+        'UPDATE domae_cloud_orders SET success = false, "confirmedQuantity" = NULL, message = %s '
         'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED, (reason, batch_id))
     cur.execute("""
         SELECT count(*) FILTER (WHERE success), count(*) FILTER (WHERE NOT success),
@@ -330,8 +331,8 @@ def _absorb_reconciled(cur, monitor_id, batch_id, supplier_name, rec, payload_it
             cur.execute("""
                 INSERT INTO domae_cloud_orders
                 (id, "monitorId", "batchId", supplier, "productName", quantity, price,
-                 success, "productId", message, "orderedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, 'pending', now())
+                 success, "confirmedQuantity", "productId", message, "orderedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s, 'pending', now())
             """, (new_order_id, monitor_id, batch_id, supplier_name,
                   item["product_name"], qty, item.get("price"), pid))
             item["db_order_id"] = new_order_id
@@ -377,23 +378,28 @@ def _reject_unreconciled(supplier_name, crawler_cls, where):
 
 def _record_order_result(cur, monitor_id, batch_id, supplier_name, item, *,
                          success, message, order_id=None, adjusted_qty=None,
-                         avail_stock=None, reason_code=None):
+                         avail_stock=None, reason_code=None, confirmed_qty=None):
     """주문 결과 기록.
 
     서버가 미리 만든 pending 행(db_order_id)이 있으면 **UPDATE** 한다. 새로 INSERT 하면
     재큐잉·워커 재실행 때 실물 주문 1건에 DB 2행이 생긴다.
     대조가 추가한 차집합 품목만 db_order_id 가 없어 INSERT 로 떨어진다.
     """
+    if reason_code == "send_unknown":
+        success = None
+    if confirmed_qty is None:
+        confirmed_qty = confirmed_quantity(OrderResult(success=bool(success), adjusted_quantity=adjusted_qty,
+                                           reason_code=reason_code), item.get("quantity", 1))
     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
     db_order_id = item.get("db_order_id")
     if db_order_id:
         cur.execute("""
             UPDATE domae_cloud_orders
             SET success = %s, message = %s, "orderId" = %s, "orderedAt" = %s,
-                "adjustedQuantity" = %s, "availableStock" = %s, "reasonCode" = %s
+                "adjustedQuantity" = %s, "availableStock" = %s, "confirmedQuantity" = %s, "reasonCode" = %s
             WHERE id = %s AND success IS NULL
         """, (success, message, order_id, utc_now,
-              adjusted_qty, avail_stock, reason_code, db_order_id))
+              adjusted_qty, avail_stock, confirmed_qty, reason_code, db_order_id))
         if cur.rowcount:
             return
         # 이미 확정된 행이면 덮지 않는다 (재실행이 성공을 실패로 바꾸면 안 된다)
@@ -409,14 +415,14 @@ def _record_order_result(cur, monitor_id, batch_id, supplier_name, item, *,
         INSERT INTO domae_cloud_orders
         (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
          quantity, price, success, "productId", "orderId", message, "orderedAt",
-         "adjustedQuantity", "availableStock", "reasonCode")
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         "adjustedQuantity", "availableStock", "reasonCode", "confirmedQuantity")
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         _generate_cuid(), monitor_id, batch_id, supplier_name,
         item.get("product_name", ""), item.get("unit"), item.get("insurance_code"),
         int(item.get("quantity", 1)), item.get("price"), success,
         item.get("product_id"), order_id, message, utc_now,
-        adjusted_qty, avail_stock, reason_code,
+        adjusted_qty, avail_stock, reason_code, confirmed_qty,
     ))
 
 
@@ -1139,7 +1145,7 @@ class CloudScheduler:
         def _finalize(success: bool | None, order_id: str | None, message: str,
                       adjusted_quantity: int | None = None,
                       available_stock: int | None = None,
-                      reason_code: str | None = None):
+                      reason_code: str | None = None, confirmed_qty: int | None = None):
             if reason_code == "send_unknown":
                 success = None
             elif success is False and not may_have_sent:
@@ -1157,11 +1163,11 @@ class CloudScheduler:
                                 message = %s,
                                 "adjustedQuantity" = %s,
                                 "availableStock" = %s,
-                                "reasonCode" = %s
+                                "reasonCode" = %s, "confirmedQuantity" = %s
                             WHERE id = %s AND success IS NULL
                         """, (success, order_id, message,
                               adjusted_quantity, available_stock, reason_code,
-                              db_order_id))
+                              confirmed_qty if confirmed_qty is not None else confirmed_quantity(OrderResult(success=bool(success), adjusted_quantity=adjusted_quantity, reason_code=reason_code), quantity), db_order_id))
                         # quick-order 단건 batch도 함께 마감
                         if db_batch_id:
                             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1275,6 +1281,7 @@ class CloudScheduler:
 
             # 3. 주문 실행
             crawler = crawler_cls()
+            crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
             if not crawler.login(cred.get("login_id", ""), cred.get("login_pw", "")):
                 raise CrawlerError("로그인 실패")
             # 주문마다 새 크롤러 인스턴스라 토큰/단가 캐시가 비어 있다.
@@ -1350,6 +1357,7 @@ class CloudScheduler:
                 adjusted_quantity=getattr(result, "adjusted_quantity", None),
                 available_stock=getattr(result, "available_stock", None),
                 reason_code=getattr(result, "reason_code", None),
+                confirmed_qty=confirmed_quantity(result, quantity),
             )
 
             # 텔레그램 알림
@@ -1488,7 +1496,7 @@ class CloudScheduler:
                     WHERE id = %s
                 """, ("failed", batch_id))
                 cur.execute(
-                    'UPDATE domae_cloud_orders SET success = false, message = %s '
+                    'UPDATE domae_cloud_orders SET success = false, "confirmedQuantity" = NULL, message = %s '
                     'WHERE "batchId" = %s AND success IS NULL ' + _KEEP_UNCONFIRMED,
                     ("장바구니 락 획득 실패 (재시도 소진)", batch_id))
                 conn.commit()
@@ -1532,6 +1540,7 @@ class CloudScheduler:
 
                 if supplier_name not in logged_in_crawlers:
                     crawler = crawler_cls()
+                    crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
                     logged_in_crawlers[supplier_name] = crawler
                 crawler = logged_in_crawlers[supplier_name]
@@ -1703,7 +1712,7 @@ class CloudScheduler:
                     _record_order_result(
                         cur, monitor_id, batch_id, supplier_name, item,
                         success=True, message=order_message, order_id=order_id_val,
-                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
+                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode, confirmed_qty=confirmed_quantity(result, item.get("quantity", 1)))
                     success_count += 1
                     if rcode == "stock_adjusted" and adjusted_qty is not None:
                         missing_qty_total += max(0, original_qty - int(adjusted_qty))
@@ -1736,7 +1745,7 @@ class CloudScheduler:
                     _record_order_result(
                         cur, monitor_id, batch_id, supplier_name, item,
                         success=_db_success(result), message=order_message,
-                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode)
+                        adjusted_qty=adjusted_qty, avail_stock=avail_stock, reason_code=rcode, confirmed_qty=confirmed_quantity(result, item.get("quantity", 1)))
                     if rcode != "send_unknown":
                         fail_count += 1   # 미확정은 실패로 세지 않는다
                     if rcode == "send_unknown":
@@ -1972,6 +1981,7 @@ class CloudScheduler:
 
             # 5. 로그인 + 주문 실행
             crawler = crawler_cls()
+            crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
             if not crawler.login(cred.get("login_id", ""), cred.get("login_pw", "")):
                 raise CrawlerError("로그인 실패")
 
@@ -2068,7 +2078,7 @@ class CloudScheduler:
                     message=order_message, order_id=getattr(result, "order_id", None),
                     adjusted_qty=getattr(result, "adjusted_quantity", None),
                     avail_stock=getattr(result, "available_stock", None),
-                    reason_code=rcode)
+                    reason_code=rcode, confirmed_qty=confirmed_quantity(result, item.get("quantity", 1)))
 
                 if result.success:
                     success_count += 1
@@ -2120,6 +2130,7 @@ class CloudScheduler:
                     def _open(sup):
                         if sup not in opened:
                             c = self._crawlers[sup]()
+                            c.cart_snapshot = CartSnapshot(self._redis, monitor_id, sup, account=credentials[sup].get("login_id", ""))
                             # 로그인 실패는 전송 전이다 — 예외로 다음 순번에 넘기고 캐시하지 않는다
                             if not c.login(credentials[sup].get("login_id", ""), credentials[sup].get("login_pw", "")):
                                 raise CrawlerError(f"{sup} 로그인 실패")
@@ -2441,6 +2452,7 @@ class CloudScheduler:
 
             # 3. 주문 실행
             crawler = crawler_cls()
+            crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
             crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
             # 제품명/가격 조회
@@ -2483,13 +2495,13 @@ class CloudScheduler:
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", supplier, "productName",
-                     quantity, price, success, "productId", "orderId", message, "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     quantity, price, success, "productId", "orderId", message, "orderedAt", "confirmedQuantity", "reasonCode")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     _generate_cuid(), monitor_id, supplier_name,
                     product_name, quantity, price, True,
                     product_id, getattr(result, "order_id", None),
-                    getattr(result, "message", ""), utc_now,
+                    getattr(result, "message", ""), utc_now, confirmed_quantity(result, quantity), getattr(result, "reason_code", None),
                 ))
                 conn.commit()
             else:
@@ -2543,12 +2555,12 @@ class CloudScheduler:
                 cur.execute("""
                     INSERT INTO domae_cloud_orders
                     (id, "monitorId", supplier, "productName",
-                     quantity, price, success, "productId", message, "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     quantity, price, success, "productId", message, "orderedAt", "confirmedQuantity", "reasonCode")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     _generate_cuid(), monitor_id, supplier_name,
-                    product_name, quantity, price, False,
-                    product_id, error_msg, utc_now,
+                    product_name, quantity, price, _db_success(result),
+                    product_id, error_msg, utc_now, confirmed_quantity(result, quantity), getattr(result, "reason_code", None),
                 ))
                 conn.commit()
 
@@ -2646,6 +2658,7 @@ class CloudScheduler:
 
                 try:
                     crawler = crawler_cls()
+                    crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
                     # 재고 확인
@@ -3067,6 +3080,40 @@ class CloudScheduler:
         except Exception as e:
             logger.warning("_cart_sync_update_status 실패: %s", e)
 
+    def cart_release(self, job: dict):
+        """확인 버튼의 소유권을 다시 확인하고 해당 계정·차수만 해제한다."""
+        from domae_mcp.cloud.notifier import Notifier
+        prefix, supplier = job.get("monitor_prefix", ""), job.get("supplier", "")
+        rev, chat_id = job.get("revision"), str(job.get("chat_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9]{8}", prefix) or supplier not in ("티제이팜", "백제", "지오영") or type(rev) is not int or rev <= 0 or not chat_id:
+            return
+        conn = self._get_conn()
+        result = "권한 없음"
+        try:
+            cur = conn.cursor()
+            cur.execute('''SELECT id, credentials FROM domae_cloud_monitors
+                WHERE LEFT(id, 8) = %s AND "telegramChatId" = %s AND "isActive" = true
+                AND id = %s''', (prefix, chat_id, job.get("monitor_id")))
+            row = cur.fetchone()
+            if row:
+                cred = self._decrypt_creds(row[1]).get(supplier)
+                if cred and cred.get("login_id"):
+                    result = CartSnapshot(self._redis, row[0], supplier, account=cred["login_id"]).release(rev)
+                    if result == "ok":
+                        cur.execute('''INSERT INTO domae_order_audit_events
+                            (id, "monitorId", supplier, "eventType", source, payload, "createdAt")
+                            VALUES (%s,%s,%s,%s,%s,%s,now())''',
+                            (_generate_cuid(), row[0], supplier, "cart_snapshot_released", "worker",
+                             json.dumps({"revision": rev})))
+                        conn.commit()
+        except Exception:
+            conn.rollback()
+            logger.exception("장바구니 확인 해제 처리 실패 chat=%s", Notifier._tail(chat_id))
+            result = "확인 해제 처리 중 오류가 발생했습니다."
+        finally:
+            self._db_pool.putconn(conn)
+        Notifier.send_telegram(chat_id, "장바구니 확인이 완료되었습니다." if result == "ok" else result)
+
     def telegram_order(self, job: dict):
         """텔레그램 인라인 버튼으로 접수된 주문 처리.
 
@@ -3140,6 +3187,7 @@ class CloudScheduler:
 
             # 3. 주문 실행
             crawler = crawler_cls()
+            crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
             login_ok = crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
             logger.info(
                 "telegram_order 로그인: supplier=%s login_ok=%s",
@@ -3229,14 +3277,14 @@ class CloudScheduler:
             cur.execute("""
                 INSERT INTO domae_cloud_orders
                 (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                 quantity, price, success, "productId", "orderId", message, "orderedAt")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 quantity, price, success, "productId", "orderId", message, "orderedAt", "confirmedQuantity", "reasonCode")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 _generate_cuid(), monitor_id, batch_id, supplier_name,
                 product_name, unit, insurance_code,
-                quantity, price, result.success,
+                quantity, price, _db_success(result),
                 product_id, getattr(result, "order_id", None),
-                getattr(result, "message", ""), utc_now,
+                getattr(result, "message", ""), utc_now, confirmed_quantity(result, quantity), getattr(result, "reason_code", None),
             ))
             conn.commit()
 
@@ -3300,6 +3348,7 @@ class CloudScheduler:
 
                 try:
                     crawler = crawler_cls()
+                    crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
                     crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
 
                     scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)

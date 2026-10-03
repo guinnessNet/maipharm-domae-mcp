@@ -618,3 +618,15 @@ class PartialStockFallbackMixin:
             if r.success:
                 r.retried = True
         return results
+
+def confirmed_quantity(result, requested):
+    """DB confirmedQuantity — 접수가 확정된 수량. 모르면 None."""
+    if type(requested) is not int or requested <= 0:
+        return None
+    if result.success:
+        if result.adjusted_quantity is None:
+            return requested
+        return checked_qty(result.adjusted_quantity, requested)
+    if result.reason_code == "send_unknown":
+        return checked_qty(result.fulfilled_quantity, requested) or None
+    return None

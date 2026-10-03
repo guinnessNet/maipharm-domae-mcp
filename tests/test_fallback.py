@@ -98,7 +98,7 @@ def _run(crawlers, locks=None, renew_ok=None, pending_raises=(), result_raises=(
             raise RuntimeError("db down")
         calls.append(("result", s, r.success, r.reason_code))
 
-    def unconfirmed(row, msg):
+    def unconfirmed(row, msg, confirmed=None):
         calls.append(("unconfirmed", row))
 
     out = run_fallback(
@@ -238,3 +238,13 @@ def test_format_ordered_line():
     part = {"product_name": "베아놀", "quantity": 10, "requested_quantity": 15, "price": 1000}
     line = format_ordered_line(part)
     assert "10개" in line and "요청 15개" in line and "부족 5개" in line and "10,000원" in line
+
+def test_unknown_preserves_confirmed_part():
+    c = FakeCrawler([sr('백제', 'b1', '694003321', '12EA', 30)],
+                    OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3))
+    recorded = []
+    out = run_fallback([(dict(ITEM), 15)], ['백제'], lambda s: c,
+        lambda s: 't', lambda *a: True, lambda *a: None,
+        lambda *a: 'row', lambda *a: None,
+        lambda row, message, confirmed=None: recorded.append(confirmed))
+    assert out[0].ordered_qty == 3 and recorded == [3]

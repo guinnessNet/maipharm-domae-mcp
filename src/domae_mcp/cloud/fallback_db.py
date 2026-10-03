@@ -5,6 +5,7 @@ SQL 오류가 나면 이 연결만 rollback 하고 예외를 다시 던진다(ru
 "전송 안 함" 또는 "미확정"을 판단한다). 원 주문 연결의 트랜잭션은 오염되지 않는다.
 """
 
+from domae_mcp.core.crawlers.base import confirmed_quantity
 
 class FallbackRecorder:
     def __init__(self, conn, monitor_id, batch_id, origin_supplier, record_fn, id_fn, now_fn):
@@ -15,6 +16,7 @@ class FallbackRecorder:
         self._record = record_fn      # scheduler._record_order_result
         self._id = id_fn              # scheduler._generate_cuid
         self._now = now_fn
+        self._quantities = {}
 
     def _tx(self, fn):
         try:
@@ -32,13 +34,14 @@ class FallbackRecorder:
     def pending(self, item, sup, pick, qty) -> str:
         """주문 전송 전에 남기는 흔적. 크래시 시 success IS NULL + fallback_pending 으로 남는다."""
         row_id = self._id()
+        self._quantities[row_id] = qty
 
         def _do(cur):
             cur.execute("""
                 INSERT INTO domae_cloud_orders
                 (id, "monitorId", "batchId", supplier, "productName", unit, "insuranceCode",
-                 quantity, price, success, "productId", "orderId", message, "reasonCode", "orderedAt")
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,'',%s,%s,%s)
+                 quantity, price, "confirmedQuantity", success, "productId", "orderId", message, "reasonCode", "orderedAt")
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,%s,'',%s,%s,%s)
             """, (row_id, self.monitor_id, self.batch_id, sup, pick.product_name, pick.unit,
                   pick.insurance_code, qty, pick.price, pick.product_id,
                   f"대체주문 진행 중 ({self.origin} 품절)", "fallback_pending", self._now()))
@@ -51,18 +54,19 @@ class FallbackRecorder:
         self._tx(lambda cur: self._record(
             cur, self.monitor_id, self.batch_id, sup, {"db_order_id": row_id},
             success=res.success,
+            confirmed_qty=confirmed_quantity(res, self._quantities.get(row_id, item.get("quantity", 1))),
             message=(f"대체주문 ({self.origin} 품절) — " + (res.message or "")).strip(),
             order_id=getattr(res, "order_id", None),
             adjusted_qty=getattr(res, "adjusted_quantity", None),
             avail_stock=getattr(res, "available_stock", None),
             reason_code=getattr(res, "reason_code", None)))
 
-    def unconfirmed(self, row_id, message) -> None:
+    def unconfirmed(self, row_id, message, confirmed=None) -> None:
         """접수 여부 불명 — success 는 NULL 그대로 두고 사유만 남긴다."""
         self._tx(lambda cur: cur.execute(
-            'UPDATE domae_cloud_orders SET message = %s, "reasonCode" = %s '
+            'UPDATE domae_cloud_orders SET message = %s, "reasonCode" = %s, "confirmedQuantity" = %s '
             'WHERE id = %s AND success IS NULL',
-            (message, "send_unknown", row_id)))
+            (message, "send_unknown", confirmed, row_id)))
 
     def check_unconfirmed(self, sup, product_id):
         """같은 약국·도매의 결과 미확정(success IS NULL) 주문. None | same_product | other_product."""

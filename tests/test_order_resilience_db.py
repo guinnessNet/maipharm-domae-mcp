@@ -33,7 +33,7 @@ def database():
       id text PRIMARY KEY, "monitorId" text, "batchId" text, supplier text,
       "productName" text, unit text, "insuranceCode" text, quantity integer, price integer,
       success boolean, "productId" text, "orderId" text, message text,
-      "reasonCode" text, "orderedAt" timestamp, "adjustedQuantity" integer, "availableStock" integer)''')
+      "reasonCode" text, "orderedAt" timestamp, "adjustedQuantity" integer, "availableStock" integer, "confirmedQuantity" integer)''')
     cur.execute('''CREATE TABLE domae_order_batches (
       id text PRIMARY KEY, status text, "completedAt" timestamp, "successCount" integer,
       "failCount" integer, "adjustedCount" integer, "missingQuantity" integer)''')
@@ -389,3 +389,67 @@ def test_quick_order_keeps_unknown_and_never_resends(database,scenario):
     pool.available=[wrapped_origin,wrapped_secondary]
     scheduler.order(job)
     assert len(calls)==before
+
+def test_result_confirmed_quantity_is_persisted(database):
+    from domae_mcp.cloud.scheduler import _record_order_result
+    conn, _ = database
+    cur = conn.cursor()
+    _record_order_result(cur, 'm', 'b', '백제', {'quantity': 5, 'product_name': 'test'},
+                         success=False, message='partial', reason_code='send_unknown', confirmed_qty=3)
+    cur.execute('SELECT success, "confirmedQuantity" FROM domae_cloud_orders WHERE "productName" = %s', ('test',))
+    assert cur.fetchone() == (None, 3)
+
+def test_notify_monitor_closes_local_connection_before_send(database, monkeypatch):
+    from domae_mcp.cloud.notifier import Notifier
+    origin, independent = database
+    cur = origin.cursor()
+    cur.execute('CREATE TABLE domae_cloud_monitors (id text, "telegramChatId" text)')
+    cur.execute("INSERT INTO domae_cloud_monitors VALUES ('m','12345')")
+    origin.commit()
+    monkeypatch.setattr(psycopg2, 'connect', lambda *a, **k: independent)
+    monkeypatch.setenv('DATABASE_URL', 'unused-local-mocked')
+    sent = []
+    def send(chat, message, reply_markup=None):
+        assert independent.closed
+        sent.append((chat, message, reply_markup))
+    monkeypatch.setattr(Notifier, 'send_telegram', send)
+    Notifier.notify_monitor('m', 'hello', reply_markup={'x': 1})
+    assert sent == [('12345', 'hello', {'x': 1})]
+
+def test_cart_release_commits_audit_once_in_isolated_schema(database, monkeypatch):
+    import fakeredis
+    from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+    from domae_mcp.cloud.notifier import Notifier
+    origin, observer = database
+    cur = origin.cursor()
+    cur.execute('CREATE TABLE domae_cloud_monitors (id text, credentials jsonb, "telegramChatId" text, "isActive" boolean)')
+    cur.execute('''CREATE TABLE domae_order_audit_events (id text, "monitorId" text, supplier text,
+        "eventType" text, source text, payload jsonb, "createdAt" timestamp)''')
+    cur.execute("INSERT INTO domae_cloud_monitors VALUES ('monitor1full','{}','12345',true)")
+    origin.commit()
+    class Pool:
+        def getconn(self): return origin
+        def putconn(self, c): c.rollback()
+    scheduler = sch.CloudScheduler(Pool(), fakeredis.FakeRedis())
+    scheduler._decrypt_creds = lambda c: {'백제': {'login_id': 'local-account'}}
+    store = CartSnapshot(scheduler._redis, 'monitor1full', '백제', account='local-account')
+    store.lock(); rev = store.save({'original': 3}); store.unlock()
+    sent = []
+    monkeypatch.setattr(Notifier, 'send_telegram', lambda *a, **k: sent.append(a))
+    job = {'monitor_id': 'monitor1full', 'monitor_prefix': 'monitor1', 'supplier': '백제', 'revision': rev, 'chat_id': '12345'}
+    scheduler.cart_release(job); scheduler.cart_release(job)
+    cur = observer.cursor()
+    cur.execute('SELECT "monitorId",supplier,"eventType",source,payload FROM domae_order_audit_events')
+    assert cur.fetchall() == [('monitor1full','백제','cart_snapshot_released','worker',{'revision': rev})]
+    assert store.load() is None and len(sent) == 2
+
+
+def test_fallback_unknown_partial_survives_null_row(database):
+    origin, recorder_conn = database
+    recorder = FallbackRecorder(recorder_conn, 'm', 'b', '백제', sch._record_order_result, sch._generate_cuid, lambda: '2026-10-03')
+    pick = SearchResult(maker='', product_name='약', supplier='백제', unit='12EA', insurance_code='694003321', quantity=30, product_id='p', price=0)
+    item = {'quantity': 5}
+    row = recorder.pending(item, '백제', pick, 5)
+    recorder.unconfirmed(row, 'partial', confirmed=3)
+    cur = origin.cursor(); cur.execute('SELECT success,"confirmedQuantity" FROM domae_cloud_orders WHERE id=%s', (row,))
+    assert cur.fetchone() == (None, 3)

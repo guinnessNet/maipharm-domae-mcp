@@ -7,6 +7,7 @@ import re
 from typing import Optional
 
 import requests
+import psycopg2
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,20 @@ class Notifier:
     @staticmethod
     def _get_token() -> str:
         return os.environ.get("DOMAE_TELEGRAM_BOT_TOKEN", "")
+
+    @staticmethod
+    def notify_monitor(monitor_id: str, text: str, reply_markup=None):
+        """짧은 연결로 대화방만 읽고 연결을 닫은 뒤 알림을 보낸다."""
+        conn = psycopg2.connect(os.environ["DATABASE_URL"])
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return Notifier.send_telegram(str(row[0]), text, reply_markup=reply_markup)
+        return None
 
     @staticmethod
     def send_telegram(chat_id: str, message: str, reply_markup: Optional[dict] = None) -> Optional[int]:
