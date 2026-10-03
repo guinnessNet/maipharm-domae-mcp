@@ -54,6 +54,28 @@ def test_urgent_keywords_order_dedup_and_capacity_filter():
     assert urgent_keywords("100mg 제품", "123456789") == ["123456789"]
 
 
+@pytest.mark.parametrize(("name", "code", "expected"), [
+    ("`한화 람노스산/100g", "651602421", [
+        "651602421", "람노스산", "한화람노스산", "한화 람노스산", "`한화 람노스산/100g"
+    ]),
+    ("$삼아 씨투스건조시럽/100g", "645702221", [
+        "645702221", "씨투스건조시럽", "삼아씨투스건조시럽", "삼아 씨투스건조시럽",
+        "$삼아 씨투스건조시럽/100g"
+    ]),
+    ("B대웅 베아놀점안액 0.2%/0.3ml/12EA", "12345", [
+        "베아놀점안액", "대웅베아놀점안액0.2%", "대웅 베아놀점안액 0.2%",
+        "B대웅 베아놀점안액 0.2%/0.3ml/12EA"
+    ]),
+])
+def test_keyword_variants_clean_prefix_only_for_head_candidates(name, code, expected):
+    assert urgent_keywords(name, code) == expected
+
+
+@pytest.mark.parametrize("name", ["１００mg 제품", "١٠٠mg 제품"])
+def test_unicode_numeric_leading_name_is_omitted(name):
+    assert urgent_keywords(name, None) == []
+
+
 def test_find_listing_skips_failing_keyword():
     c = Crawler({"씨투스건조시럽": [sr("082636", 5)], "645702221": RuntimeError("null")})
     assert find_listing(c, "082636", ["645702221", "씨투스건조시럽"]).product_id == "082636"
@@ -138,13 +160,21 @@ def test_result_interpretation_failure_halts(bad):
 
 
 @pytest.mark.parametrize("need,stock", [(True, 5), (False, 5), (1.5, 5), (None, 5), ("bad", 5),
-                                        (0, 5), (-1, 5), (5, True), (5, False), (5, 2.5),
+                                        (-1, 5), (5, True), (5, False), (5, 2.5),
                                         (5, None), (5, "bad"), (5, -2)])
-def test_malformed_need_or_stock_never_sends(need, stock):
+def test_malformed_need_or_stock_is_definite_no_send(need, stock):
     c = Crawler({"k": [sr("P", stock)]}, OrderResult(success=True))
     s, calls = _step(c, need=need)
-    assert s.state in {"skip", "halt"}
+    assert s.state == "skip"
     assert calls == [] and c.orders == []
+
+
+def test_pre_reject_and_zero_stock_keep_skip_with_malformed_other_quantity():
+    rejected, reject_calls = _step(Crawler({"k": [sr("P", "bad")]}, OrderResult(success=True)),
+                                   need=None, reject="미확정")
+    no_stock, stock_calls = _step(Crawler({"k": [sr("P", 0)]}, OrderResult(success=True)), need="bad")
+    assert rejected.state == "skip" and reject_calls == []
+    assert no_stock.state == "skip" and stock_calls == []
 
 
 def test_lossless_integer_string_quantities_are_accepted():

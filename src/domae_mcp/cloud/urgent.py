@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 _INS_CODE = re.compile(r"^[0-9]{9}$")
 _INTEGER_TEXT = re.compile(r"^[+-]?[0-9]+$")
-_QTY_TOKEN = re.compile(r"^[0-9]")
+_QTY_TOKEN = re.compile(r"^\d")
 _LEADING_MARKS = re.compile(r"^[\$`'\s]+")
 _CAPITAL_BEFORE_KOREAN = re.compile(r"^[A-Z](?=[가-힣])")
 _PAREN_TAIL = re.compile(r"\(.*$")
@@ -40,15 +40,15 @@ def urgent_keywords(product_name: Optional[str], insurance_code: Optional[str]) 
     if not original:
         return keywords
 
-    core = _CAPITAL_BEFORE_KOREAN.sub("", _LEADING_MARKS.sub("", original))
-    tokens = core.split()
+    body = _CAPITAL_BEFORE_KOREAN.sub("", _LEADING_MARKS.sub("", original))
+    tokens = body.split()
     if len(tokens) > 1 and tokens[0] in _MAKERS:
         tokens = tokens[1:]
     if tokens:
         core_head = tokens[0].split("/", 1)[0]
         _keyword_add(keywords, _PAREN_TAIL.sub("", core_head))
 
-    slash_head = original.split("/", 1)[0]
+    slash_head = body.split("/", 1)[0]
     normalized_head = re.sub(r"\s+", "", slash_head)
     normalized_head = _PAREN_TAIL.sub("", normalized_head)
     _keyword_add(keywords, normalized_head)
@@ -127,16 +127,20 @@ def urgent_supplier_step(crawler, product_id, keywords, need, *, before_send, re
     if listing is None:
         return UrgentStep("skip", 0, "검색 매칭 실패")
 
-    order_need = _integer_quantity(need)
-    if order_need is None or order_need < 0:
-        return UrgentStep("halt", 0, "요청 수량 이상")
-    stock = _integer_quantity(getattr(listing, "quantity", None))
-    if stock is None:
-        return UrgentStep("halt", 0, "재고 수량 이상")
-    if stock <= 0 or order_need == 0:
-        return UrgentStep("skip", 0, "재고 또는 요청 수량 없음")
     if reject_reason:
         return UrgentStep("skip", 0, str(reject_reason))
+
+    stock = _integer_quantity(getattr(listing, "quantity", None))
+    if stock is not None and stock <= 0:
+        return UrgentStep("skip", 0, "재고 없음")
+    if stock is None:
+        return UrgentStep("skip", 0, "재고 수량 이상 — 주문 전 중단")
+
+    order_need = _integer_quantity(need)
+    if order_need is None or order_need < 0:
+        return UrgentStep("skip", 0, "요청 수량 이상 — 주문 전 중단")
+    if order_need == 0:
+        return UrgentStep("skip", 0, "요청 수량 없음")
 
     order_qty = min(order_need, stock)
     # Claim 실패는 주문 결과 해석 경계 밖에서 전파되어야 한다.
