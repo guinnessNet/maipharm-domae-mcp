@@ -56,7 +56,7 @@ def test_telegram_order_preserves_unknown_partial_quantity(monkeypatch):
     from domae_mcp.core.crawlers.base import OrderResult
     conn, cur = Mock(), Mock()
     conn.cursor.return_value = cur
-    cur.fetchone.side_effect = [('monitor1full', {}), None]
+    cur.fetchone.side_effect = [('monitor1full', {}), None, ('attempt-row',)]
     pool = Mock()
     scheduler = CloudScheduler(pool, fakeredis.FakeRedis())
     scheduler._get_conn = lambda: conn
@@ -65,14 +65,18 @@ def test_telegram_order_preserves_unknown_partial_quantity(monkeypatch):
     class Crawler:
         def login(self, *a): return True
         def search(self, *a): return []
-        def order(self, *a, **kw): return OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3)
+        def order(self, *a, **kw):
+            conn.commit.assert_called_once()  # pending marker committed before send
+            return OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3)
     scheduler._crawlers = {'백제': Crawler}
     monkeypatch.setattr(Notifier, 'send_order_result', lambda *a, **k: None)
     scheduler.telegram_order({'monitor_prefix': 'monitor1', 'supplier': '백제', 'product_id': 'p', 'quantity': 5, 'chat_id': '12345'})
     sql, args = next(c.args for c in cur.execute.call_args_list if 'INSERT INTO domae_cloud_orders' in c.args[0])
-    fields = [field.strip().strip('"') for field in sql[sql.index('(')+1:sql.index(')')].split(',')]
-    row = dict(zip(fields, args))
-    assert row['success'] is None and row['confirmedQuantity'] == 3 and row['reasonCode'] == 'send_unknown'
+    assert "NULL" in sql and "'send_unknown'" in sql and 'ON CONFLICT' in sql
+    pending_id = args[0]
+    sql, args = next(c.args for c in cur.execute.call_args_list if 'UPDATE domae_cloud_orders' in c.args[0])
+    assert args[:3] == (None, 'send_unknown', 3) and args[-1] == pending_id
+    assert conn.commit.call_count == 2
 
 def test_recovery_is_bounded_and_retains_receipt_on_failed_commit():
     redis = fakeredis.FakeRedis()
