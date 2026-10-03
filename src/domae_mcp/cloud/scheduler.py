@@ -2691,208 +2691,84 @@ class CloudScheduler:
             else:
                 self._db_pool.putconn(conn)
 
-    def urgent_order_immediate(self, job: dict):
-        """긴급주문 즉시 1회 실행 — response_key로 결과 반환"""
-        monitor_id = job["monitor_id"]
-        response_key = job["response_key"]
-        urgent_order_id = job["urgent_order_id"]
-        suppliers_info = job.get("suppliers", [])
-        remaining_qty = job.get("remaining_quantity", 0)
-
-        conn = self._get_conn()
+    @staticmethod
+    def _urgent_rollback(conn):
+        """실패한 실행의 트랜잭션 정리 여부. 실패 연결은 호출자가 폐기한다."""
         try:
-            cur = conn.cursor()
+            conn.rollback()
+            return not conn.closed
+        except Exception:
+            logger.warning("긴급주문 DB 연결 정리 실패 — 연결 폐기")
+            return False
 
-            # credentials 조회
-            cur.execute("""
-                SELECT m.credentials
-                FROM domae_cloud_monitors m
-                WHERE m.id = %s AND m."isActive" = true
-            """, (monitor_id,))
-            row = cur.fetchone()
-            if not row:
-                self._redis.lpush(response_key, json.dumps({"success": False, "message": "모니터 없음"}))
-                return
+    def _return_urgent_connection(self, conn):
+        if conn is None:
+            return
+        usable = self._urgent_rollback(conn)
+        try:
+            self._db_pool.putconn(conn, close=not usable)
+        except Exception:
+            logger.exception("긴급주문 DB 연결 반환 실패")
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-            raw_creds = row[0]
-            credentials = self._decrypt_creds(raw_creds)
-
-            if not self._crawlers_loaded:
-                self._load_crawlers(conn)
-
-            # 재고 확인용 검색 키워드. job payload 에 없으면 DB 에서 조회한다.
-            # (product_id 로 검색하면 백제처럼 복합키를 쓰는 도매는 항상 0건이 된다)
-            product_name = job.get("product_name") or ""
-            if not product_name:
-                cur.execute(
-                    'SELECT "productName" FROM domae_urgent_orders WHERE id = %s',
-                    (urgent_order_id,),
-                )
-                name_row = cur.fetchone()
-                product_name = (name_row[0] if name_row else "") or ""
-            if not product_name:
-                logger.error(
-                    "urgent_order_immediate: product_name 확보 실패 urgent=%s — 재고 확인 불가",
-                    urgent_order_id,
-                )
-
-            filled = 0
-            details = []
-
-            # 도매별 결과 수집 (합산 로그용)
-            supplier_results = {}  # {supplier_name: {"qty": int}}
-            any_success = False
-            first_scanned_at = None
-
-            for sup_info in suppliers_info:
-                if filled >= remaining_qty:
-                    break
-
-                supplier_name = sup_info["supplier"]
-                product_id_val = sup_info["product_id"]
-                need = remaining_qty - filled
-
-                cred = credentials.get(supplier_name)
-                if not cred:
-                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "계정 미등록"})
-                    supplier_results[supplier_name] = {"qty": 0}
-                    continue
-
-                crawler_cls = self._crawlers.get(supplier_name)
-                if not crawler_cls:
-                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "크롤러 없음"})
-                    supplier_results[supplier_name] = {"qty": 0}
-                    continue
-
-                try:
-                    crawler = crawler_cls()
-                    crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
-                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
-
-                    # 재고 확인
-                    scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    if first_scanned_at is None:
-                        first_scanned_at = scanned_at
-                    # product_name 으로 검색 후 product_id 로 매칭 (위 주석 참조)
-                    search_results = crawler.search(product_name)
-                    available = 0
-                    insurance_code = None
-                    for sr in search_results:
-                        if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
-                            available = sr.quantity
-                            insurance_code = sr.insurance_code
-                            break
-
-                    if available == 0:
-                        logger.info(
-                            "urgent immediate: 재고 없음 또는 매칭 실패 [%s] name=%r pid=%s (검색 %d건)",
-                            supplier_name, product_name, product_id_val, len(search_results),
-                        )
-                        details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": "재고 없음"})
-                        supplier_results[supplier_name] = {"qty": 0}
-                        continue
-
-                    # 주문 실행
-                    order_qty = min(need, available)
-                    _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
-                    if _reject:
-                        raise RuntimeError(_reject)
-                    result = crawler.order(product_id_val, order_qty, product_name=product_name,
-                                           insurance_code=insurance_code)
-
-                    if result.success:
-                        filled += order_qty
-                        details.append({"supplier": supplier_name, "quantity": order_qty, "success": True,
-                                        "message": getattr(result, "message", "주문 완료")})
-                        supplier_results[supplier_name] = {"qty": order_qty}
-                        any_success = True
-                    else:
-                        details.append({"supplier": supplier_name, "quantity": 0, "success": False,
-                                        "message": getattr(result, "message", "주문 실패")})
-                        supplier_results[supplier_name] = {"qty": 0}
-
-                except Exception as e:
-                    details.append({"supplier": supplier_name, "quantity": 0, "success": False, "message": str(e)})
-                    supplier_results.setdefault(supplier_name, {"qty": 0})
-                    logger.warning("urgent immediate [%s/%s]: %s", supplier_name, urgent_order_id, e)
-
-                time.sleep(0.5)
-
-            # 합산 로그 1건 INSERT
-            if supplier_results:
-                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
-                total_ordered = sum(r["qty"] for r in supplier_results.values())
-                cur.execute("""
-                    INSERT INTO domae_urgent_logs
-                    (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    _generate_cuid(), urgent_order_id, "",
-                    total_ordered, any_success,
-                    ", ".join(message_parts),
-                    first_scanned_at or utc_now, utc_now,
-                ))
-
-                # 오래된 로그 자동 삭제 (20건 초과 시)
-                cur.execute("""
-                    DELETE FROM domae_urgent_logs
-                    WHERE "urgentOrderId" = %s
-                    AND id NOT IN (
-                        SELECT id FROM domae_urgent_logs
-                        WHERE "urgentOrderId" = %s
-                        ORDER BY "orderedAt" DESC LIMIT 20
-                    )
-                """, (urgent_order_id, urgent_order_id))
-
+    def urgent_order_immediate(self, job: dict):
+        """잡의 식별자만 사용하고 실행 후 DB 상태를 정확히 한 번 응답한다."""
+        monitor_id, response_key, uo_id = job["monitor_id"], job["response_key"], job["urgent_order_id"]
+        conn, run = None, None
+        payload = {"success": False, "message": "처리 실패", "filled_quantity": 0}
+        try:
+            conn = self._get_conn()
+            with conn.cursor() as cur:
+                cur.execute('''SELECT m.credentials FROM domae_cloud_monitors m
+                    JOIN domae_urgent_orders uo ON uo."monitorId"=m.id
+                    WHERE m.id=%s AND m."isActive"=true AND uo.id=%s''', (monitor_id, uo_id))
+                row = cur.fetchone()
                 conn.commit()
-
-            # filledQuantity 업데이트
-            if filled > 0:
-                cur.execute("""
-                    UPDATE domae_urgent_orders
-                    SET "filledQuantity" = "filledQuantity" + %s
-                    WHERE id = %s
-                """, (filled, urgent_order_id))
-
-                # 목표 달성 체크
-                cur.execute(
-                    'SELECT "filledQuantity", "totalQuantity" FROM domae_urgent_orders WHERE id = %s',
-                    (urgent_order_id,)
-                )
-                uo_row = cur.fetchone()
-                total_filled = uo_row[0] if uo_row else filled
-                total_qty = uo_row[1] if uo_row else remaining_qty
-                completed = total_filled >= total_qty
-
-                if completed:
-                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    cur.execute(
-                        'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
-                        (utc_now, urgent_order_id)
-                    )
-                conn.commit()
-            else:
-                total_filled = 0
-                total_qty = remaining_qty
-                completed = False
-
-            self._redis.lpush(response_key, json.dumps({
-                "success": filled > 0,
-                "filled_quantity": filled,
-                "total_filled": total_filled,
-                "total_quantity": total_qty,
-                "completed": completed,
-                "details": details,
-            }))
-
-            logger.info("urgent_order_immediate 완료: urgent=%s filled=%d", urgent_order_id, filled)
-
-        except Exception as e:
-            logger.error("urgent_order_immediate 실패: %s", e, exc_info=True)
-            self._redis.lpush(response_key, json.dumps({"success": False, "message": str(e)}))
+                if row is None:
+                    payload["message"] = "활성 모니터 또는 해당 긴급주문 없음"
+                else:
+                    if not self._crawlers_loaded:
+                        self._load_crawlers(conn)
+                    self._recover_stale_urgent(conn, cur, monitor_id)
+                    run = self._urgent_fill(conn, cur, uo_id, self._decrypt_creds(row[0]))
+                    self._finish_urgent_run(conn, cur, monitor_id, uo_id, run)
+                    payload.update(success=run.filled > 0, filled_quantity=run.filled,
+                                   stock_alerts=run.stock_alerts, details=run.details,
+                                   message="실행 완료")
+        except Exception as error:
+            logger.exception("urgent_order_immediate 실패 urgent=%s", uo_id)
+            payload["message"] = str(error)[:200]
         finally:
-            self._db_pool.putconn(conn)
+            # C3 감사/rollback 복합 실패도 다음 상태 조회 연결로 전달하지 않는다.
+            self._return_urgent_connection(conn)
+            state_conn = None
+            try:
+                state_conn = self._get_conn()
+                payload.update(self._urgent_state(state_conn, uo_id, monitor_id))
+            except Exception:
+                logger.exception("긴급주문 상태 재조회 실패 urgent=%s", uo_id)
+                payload["state"] = "unknown"
+            finally:
+                self._return_urgent_connection(state_conn)
+            self._redis.lpush(response_key, json.dumps(payload))
+
+    def _urgent_state(self, conn, uo_id, monitor_id=None):
+        with conn.cursor() as cur:
+            cur.execute('''SELECT "filledQuantity","totalQuantity",active,"checkRequired","checkReason",
+                "sendingToken" IS NOT NULL,"completedAt" IS NOT NULL FROM domae_urgent_orders
+                WHERE id=%s AND (%s IS NULL OR "monitorId"=%s)''', (uo_id, monitor_id, monitor_id))
+            row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            return {"state": "not_found", "success": False, "message": "해당 긴급주문 없음"}
+        filled, total, active, check, reason, sending, done = row
+        state = ("check_required" if check else "sending" if sending else "completed" if done
+                 else "waiting" if active else "cancelled")
+        return {"state": state, "total_filled": filled, "total_quantity": total,
+                "completed": done, "needs_check": bool(check), "check_reason": reason}
 
     def verify_credentials(self, job: dict):
         """도매 계정 로그인 검증"""
@@ -3598,6 +3474,13 @@ class CloudScheduler:
                     finally:
                         notify(message)
                 break
+            except Exception:
+                confirmed = (step.qty if step.state == "filled" else step.fulfilled) if step else 0
+                if confirmed and not committed:
+                    # commit 결과가 불명일 수도 있다. 접수 증거만 보존하고 토큰·수량은 건드리지 않는다.
+                    logger.error("긴급주문 접수 확정 수량 DB 기록 불명 urgent=%s supplier=%s quantity=%s "
+                                 "— DB·도매몰 주문내역 수동 대조 필요", uo_id, supplier, confirmed)
+                raise
         if run.claimed and not run.halted and not run.lost:
             try:
                 _owned_update(conn, cur, uo_id, token,
@@ -3632,176 +3515,92 @@ class CloudScheduler:
                     logger.warning("긴급주문 회수 알림 실패 monitor=%s", monitor_id)
         return recovered
 
-    def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
-        """모니터링 주기 내 활성 긴급주문 처리"""
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT uo.id, uo."productName", uo."totalQuantity", uo."filledQuantity"
-            FROM domae_urgent_orders uo
-            WHERE uo."monitorId" = %s AND uo.active = true AND uo."filledQuantity" < uo."totalQuantity"
-        """, (monitor_id,))
-        urgent_orders = cur.fetchall()
-
-        if not urgent_orders:
+    def _finish_urgent_run(self, conn, cur, monitor_id, uo_id, run):
+        """C3가 커밋한 수량의 정상 감사·알림만 작성한다. 수량을 다시 가산하지 않는다."""
+        if not run.supplier_results:
             return
-
-        for uo_id, product_name, total_qty, filled_qty in urgent_orders:
-            remaining = total_qty - filled_qty
-
-            # 이 긴급주문에 등록된 도매상 조회
-            cur.execute(
-                'SELECT supplier, "productId" FROM domae_urgent_suppliers WHERE "urgentOrderId" = %s',
-                (uo_id,)
-            )
-            suppliers = cur.fetchall()
-            filled_this_round = 0
-
-            # 도매별 결과 수집 (합산 로그용)
-            supplier_results = {}  # {supplier_name: {"qty": int}}
-            any_success = False
-            first_scanned_at = None
-
-            for supplier_name, product_id_val in suppliers:
-                if filled_this_round >= remaining:
-                    supplier_results.setdefault(supplier_name, {"qty": 0})
-                    continue
-
-                cred = credentials.get(supplier_name)
-                if not cred:
-                    supplier_results[supplier_name] = {"qty": 0}
-                    continue
-
-                crawler_cls = self._crawlers.get(supplier_name)
-                if not crawler_cls:
-                    supplier_results[supplier_name] = {"qty": 0}
-                    continue
-
+        finish_conn = None
+        chat_id, product_name = None, ""
+        try:
+            # 실행 연결과 감사 트랜잭션을 분리하여 감사 실패가 체결 상태를 건드리지 않는다.
+            finish_conn = self._get_conn()
+            with finish_conn.cursor() as finish_cur:
+                finish_cur.execute('''SELECT m."telegramChatId",uo."productName"
+                    FROM domae_urgent_orders uo JOIN domae_cloud_monitors m ON m.id=uo."monitorId"
+                    WHERE uo.id=%s AND m.id=%s''', (uo_id, monitor_id))
+                row = finish_cur.fetchone()
+                if row is None:
+                    return
+                chat_id, product_name = row
+                finish_conn.commit()
                 try:
-                    crawler = crawler_cls()
-                    crawler.cart_snapshot = CartSnapshot(self._redis, monitor_id, supplier_name, account=cred.get("login_id", ""))
-                    crawler.login(cred.get("login_id", ""), cred.get("login_pw", ""))
+                    ordered_at = _utcnow()
+                    for supplier, result in run.supplier_results.items():
+                        quantity = result["quantity"]
+                        # 소유권을 잃은 이번 도매의 늦은 체결은 C3가 이미 감사·알림한다.
+                        if run.lost and quantity == 0:
+                            continue
+                        message = "; ".join(run.details)
+                        if run.halted:
+                            message += " — 확인 필요"
+                        finish_cur.execute('''INSERT INTO domae_urgent_logs
+                            (id,"urgentOrderId",supplier,"orderedQuantity",success,message,"scannedAt","orderedAt")
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+                            (_generate_cuid(), uo_id, supplier, quantity, quantity > 0, message,
+                             run.first_scanned_at or ordered_at, ordered_at))
+                    finish_cur.execute('''DELETE FROM domae_urgent_logs WHERE "urgentOrderId"=%s AND id NOT IN
+                        (SELECT id FROM domae_urgent_logs WHERE "urgentOrderId"=%s
+                         ORDER BY "orderedAt" DESC,id DESC LIMIT 20)''', (uo_id, uo_id))
+                    finish_conn.commit()
+                except Exception:
+                    logger.exception("긴급주문 정상 감사 기록 실패 urgent=%s", uo_id)
+                    self._urgent_rollback(finish_conn)
+        except Exception:
+            logger.exception("긴급주문 완료 정보 조회 실패 urgent=%s", uo_id)
+        finally:
+            self._return_urgent_connection(finish_conn)
+        if not chat_id:
+            return
+        current_filled = run.total_filled - run.filled
+        for receipt in run.successes:
+            current_filled += receipt["quantity"]
+            try:
+                Notifier.send_urgent_order_result(chat_id=chat_id, product_name=product_name,
+                    supplier=receipt["supplier"], quantity=receipt["quantity"], price=receipt["price"],
+                    filled=current_filled, total=run.total_qty)
+            except Exception:
+                logger.warning("긴급주문 체결 알림 실패 urgent=%s", uo_id)
+        warnings = []
+        if run.halted:
+            warnings.append(f"⚠ 긴급주문 확인 필요: {html.escape(product_name)}\n"
+                            + html.escape("; ".join(run.details)))
+        for stock in run.stock_alerts:
+            warnings.append(f"⚡ 긴급주문 재고 확인: {html.escape(stock['supplier'])} "
+                            f"{html.escape(product_name)} {stock['quantity']}개 — 직접 주문해 주세요")
+        for message in warnings:
+            try:
+                Notifier.send_telegram(chat_id, message)
+            except Exception:
+                logger.warning("긴급주문 확인·재고 알림 실패 urgent=%s", uo_id)
 
-                    scanned_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    if first_scanned_at is None:
-                        first_scanned_at = scanned_at
-                    # ⚠️ product_id 가 아니라 product_name 으로 검색한다.
-                    # product_id 는 도매별 내부 코드이며 검색 키워드가 아니다.
-                    # 예) 백제는 "ITEM_CD|ITEM_GB_CD" 복합키 → keyword 로 넘기면 0건 →
-                    #     available=0 으로 빠져 주문이 아예 시도되지 않았다.
-                    search_results = crawler.search(product_name)
-                    available = 0
-                    insurance_code = None
-                    for sr in search_results:
-                        if sr.product_id == product_id_val and sr.quantity and sr.quantity > 0:
-                            available = sr.quantity
-                            insurance_code = sr.insurance_code
-                            break
-
-                    if available == 0:
-                        logger.info(
-                            "urgent: 재고 없음 또는 매칭 실패 [%s] name=%r pid=%s (검색 %d건)",
-                            supplier_name, product_name, product_id_val, len(search_results),
-                        )
-                        supplier_results[supplier_name] = {"qty": 0}
-                        continue
-
-                    order_qty = min(remaining - filled_this_round, available)
-                    _reject = _reject_unreconciled(supplier_name, crawler_cls, "이 주문")
-                    if _reject:
-                        raise RuntimeError(_reject)
-                    result = crawler.order(product_id_val, order_qty, product_name=product_name,
-                                           insurance_code=insurance_code)
-
-                    if result.success:
-                        filled_this_round += order_qty
-                        supplier_results[supplier_name] = {"qty": order_qty}
-                        any_success = True
-
-                        # 긴급주문 체결 알림 (건별)
-                        try:
-                            cur.execute('SELECT "telegramChatId" FROM domae_cloud_monitors WHERE id = %s', (monitor_id,))
-                            tg_row = cur.fetchone()
-                            if tg_row and tg_row[0]:
-                                from domae_mcp.cloud.notifier import Notifier
-                                current_filled = (filled_qty or 0) + filled_this_round
-                                # 가격 조회
-                                price = 0
-                                try:
-                                    for sr in search_results:
-                                        if sr.product_id == product_id_val:
-                                            price = sr.price or 0
-                                            break
-                                except Exception:
-                                    pass
-                                Notifier.send_urgent_order_result(
-                                    chat_id=tg_row[0],
-                                    product_name=product_name,
-                                    supplier=supplier_name,
-                                    quantity=order_qty,
-                                    price=price,
-                                    filled=current_filled,
-                                    total=total_qty,
-                                )
-                        except Exception as e:
-                            logger.warning("긴급주문 알림 실패: %s", e)
-                    else:
-                        supplier_results[supplier_name] = {"qty": 0}
-
-                    conn.commit()
-                    time.sleep(0.5)
-
-                except Exception as e:
-                    supplier_results.setdefault(supplier_name, {"qty": 0})
-                    logger.warning("urgent process [%s/%s]: %s", uo_id, supplier_name, e)
-
-            # 합산 로그 1건 INSERT
-            if supplier_results:
-                utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                message_parts = [f"{s} {r['qty']}" for s, r in supplier_results.items()]
-                total_ordered = sum(r["qty"] for r in supplier_results.values())
-                cur.execute("""
-                    INSERT INTO domae_urgent_logs
-                    (id, "urgentOrderId", supplier, "orderedQuantity", success, message, "scannedAt", "orderedAt")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    _generate_cuid(), uo_id, "",
-                    total_ordered, any_success,
-                    ", ".join(message_parts),
-                    first_scanned_at or utc_now, utc_now,
-                ))
-
-                # 오래된 로그 자동 삭제 (20건 초과 시)
-                cur.execute("""
-                    DELETE FROM domae_urgent_logs
-                    WHERE "urgentOrderId" = %s
-                    AND id NOT IN (
-                        SELECT id FROM domae_urgent_logs
-                        WHERE "urgentOrderId" = %s
-                        ORDER BY "orderedAt" DESC LIMIT 20
-                    )
-                """, (uo_id, uo_id))
-
-                conn.commit()
-
-            if filled_this_round > 0:
-                cur.execute("""
-                    UPDATE domae_urgent_orders
-                    SET "filledQuantity" = "filledQuantity" + %s
-                    WHERE id = %s
-                """, (filled_this_round, uo_id))
-
-                cur.execute(
-                    'SELECT "filledQuantity", "totalQuantity" FROM domae_urgent_orders WHERE id = %s',
-                    (uo_id,)
-                )
-                row = cur.fetchone()
-                if row and row[0] >= row[1]:
-                    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    cur.execute(
-                        'UPDATE domae_urgent_orders SET active = false, "completedAt" = %s WHERE id = %s',
-                        (utc_now, uo_id)
-                    )
-
-                conn.commit()
-
-        logger.info("긴급주문 처리 완료: monitor=%s, %d건", monitor_id, len(urgent_orders))
+    def _process_urgent_orders(self, conn, monitor_id: str, credentials: dict):
+        """회수 후 DB 잔량이 있는 실행만 공통 실행기로 처리한다."""
+        with conn.cursor() as cur:
+            self._recover_stale_urgent(conn, cur, monitor_id)
+            cur.execute('''SELECT id FROM domae_urgent_orders WHERE "monitorId"=%s
+                AND active=true AND "checkRequired"=false AND "sendingToken" IS NULL
+                AND "filledQuantity" < "totalQuantity" ORDER BY "createdAt",id''', (monitor_id,))
+            urgent_ids = cur.fetchall()
+            conn.commit()
+        for (uo_id,) in urgent_ids:
+            run_conn = None
+            try:
+                # 각 실행이 자기 연결을 정리하므로 하나의 실패가 뒤의 실행을 막지 않는다.
+                run_conn = self._get_conn()
+                with run_conn.cursor() as run_cur:
+                    run = self._urgent_fill(run_conn, run_cur, uo_id, credentials)
+                    self._finish_urgent_run(run_conn, run_cur, monitor_id, uo_id, run)
+            except Exception:
+                logger.exception("urgent fill 실패 urgent=%s", uo_id)
+            finally:
+                self._return_urgent_connection(run_conn)

@@ -1,5 +1,6 @@
 """C3 real scoped PostgreSQL ownership and durable receipt tests; no live supplier calls."""
 import sys
+import json
 sys.path.insert(0, 'src')
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -484,3 +485,263 @@ def test_late_receipt_evidence_survives_audit_cleanup_and_notifier_failure(
     assert '인천' in notification_attempts[0] and f'{confirmed}개' in notification_attempts[0]
     assert any('supplier=인천' in record.getMessage() and f'quantity={confirmed}' in record.getMessage()
                and '수동 정산 필요' in record.getMessage() for record in caplog.records)
+
+
+def immediate(env, uo, mid):
+    sc = env[0]
+    key = 'urgent-response:' + uo
+    sc.urgent_order_immediate({'monitor_id': mid, 'action': 'urgent_order_immediate',
+        'response_key': key, 'urgent_order_id': uo, 'product_name': '오래된 다른 품목',
+        'remaining_quantity': 10, 'suppliers': [{'supplier': '없는 도매', 'product_id': 'STALE'}]})
+    assert sc._redis.llen(key) == 1
+    return json.loads(sc._redis.lpop(key))
+
+
+def periodic(env, mid, creds):
+    sc, pool, _, _ = env
+    connection = pool.getconn()
+    try:
+        sc._process_urgent_orders(connection, mid, creds)
+    finally:
+        connection.rollback()
+        pool.putconn(connection)
+
+
+def test_c4_immediate_ignores_stale_job_and_returns_current_state(env):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env, filled=4)
+    sc._crawlers = {'인천': make_crawler()}
+    payload = immediate(env, uo, mid)
+    assert sc._crawlers['인천'].orders == [('P1', 6)]
+    assert (payload['state'], payload['total_filled'], payload['filled_quantity']) == ('completed', 10, 6)
+    assert logs(db, uo)[0][:3] == ('인천', 6, True)
+    assert alerts and not pool._used
+
+
+@pytest.mark.parametrize('cols,state', [({'checkRequired':True,'active':False}, 'check_required'),
+    ({'sendingToken':'owner','active':False}, 'sending'), ({'active':False}, 'cancelled')])
+def test_c4_protected_immediate_responds_without_order(env, cols, state):
+    sc, _, db, _ = env
+    uo, mid, creds = setup(env, **cols)
+    sc._crawlers = {'인천': make_crawler()}
+    assert immediate(env, uo, mid)['state'] == state
+    assert not sc._crawlers['인천'].orders and logs(db, uo) == []
+
+
+@pytest.mark.parametrize('receipt,confirmed', [(OrderResult(success=True), 10),
+    (OrderResult(success=True, adjusted_quantity=4), 4),
+    (OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3), 3)])
+def test_c4_postclaim_database_failure_still_returns_sending(env, caplog, receipt, confirmed):
+    sc, pool, db, _ = env
+    uo, mid, creds = setup(env)
+    with db.connection() as connection, connection.cursor() as cur:
+        cur.execute("""CREATE FUNCTION refuse_receipt_update() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN IF NEW."filledQuantity" <> OLD."filledQuantity" THEN
+                RAISE EXCEPTION 'local receipt update failure'; END IF; RETURN NEW; END $$;
+            CREATE TRIGGER refuse_receipt BEFORE UPDATE ON domae_urgent_orders
+            FOR EACH ROW EXECUTE FUNCTION refuse_receipt_update();""")
+    sc._crawlers = {'인천': make_crawler(results=[receipt])}
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'sending' and payload['total_filled'] == 0
+    assert read_urgent(db, uo)[3] and not pool._used
+    assert any('supplier=인천' in record.getMessage() and f'quantity={confirmed}' in record.getMessage()
+               and 'DB' in record.getMessage() and '수동' in record.getMessage() for record in caplog.records)
+
+
+def test_c4_response_requeries_changes_made_during_notification(env, monkeypatch):
+    sc, _, db, _ = env
+    uo, mid, creds = setup(env)
+    sc._crawlers = {'인천': make_crawler()}
+    monkeypatch.setattr(Notifier, 'send_urgent_order_result', lambda **kw:
+        update(db, uo, '"checkRequired"=true,"checkReason"=%s', ('외부 확인 필요',)))
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'check_required' and payload['check_reason'] == '외부 확인 필요'
+
+
+@pytest.mark.parametrize('inactive', [False, True])
+def test_c4_wrong_monitor_or_inactive_monitor_never_orders(env, inactive):
+    sc, _, db, _ = env
+    uo, mid, creds = setup(env)
+    other = seed_monitor(db, ('인천',))
+    if inactive:
+        with db.connection() as connection, connection.cursor() as cur:
+            cur.execute('UPDATE domae_cloud_monitors SET "isActive"=false WHERE id=%s', (mid,))
+    sc._crawlers = {'인천': make_crawler()}
+    payload = immediate(env, uo, mid if inactive else other)
+    assert not payload['success'] and not sc._crawlers['인천'].orders
+    if not inactive:
+        assert payload['state'] == 'not_found' and payload['message'] == '해당 긴급주문 없음'
+    assert read_urgent(db, uo) == (0, True, False, None, False)
+
+
+def test_c4_periodic_logs_cumulative_once_without_double_increment(env):
+    sc, _, db, alerts = env
+    uo, mid, creds = setup(env, total=5, suppliers=(('인천','P1'),('인천','P2')))
+    sc._crawlers = {'인천': make_crawler(3, [OrderResult(success=True), OrderResult(success=True)])}
+    periodic(env, mid, creds)
+    assert read_urgent(db, uo) == (5, False, False, None, True)
+    assert [entry[:3] for entry in logs(db, uo)] == [('인천', 5, True)]
+    assert sum(kw['quantity'] for args, kw in alerts if 'quantity' in kw) == 5
+
+
+def test_c4_retains_latest_twenty_logs(env):
+    sc, _, db, _ = env
+    uo, mid, creds = setup(env)
+    with db.connection() as connection, connection.cursor() as cur:
+        for i in range(22):
+            cur.execute('''INSERT INTO domae_urgent_logs
+                (id,"urgentOrderId",supplier,"orderedQuantity",success,"orderedAt")
+                VALUES (%s,%s,'인천',0,false,now()-interval '1 day'+%s*interval '1 minute')''',
+                (f'old_{i}', uo, i))
+    sc._crawlers = {'인천': make_crawler()}
+    immediate(env, uo, mid)
+    assert len(logs(db, uo)) == 20 and any(q == 10 for _, q, _, _ in logs(db, uo))
+
+
+@pytest.mark.parametrize('phase', ['audit', 'notification'])
+def test_c4_finish_failures_keep_receipt_state_and_response(env, monkeypatch, phase):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    if phase == 'audit':
+        with db.connection() as connection, connection.cursor() as cur:
+            cur.execute("""CREATE FUNCTION refuse_log_c4() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'local audit failure'; END $$;
+                CREATE TRIGGER refuse_log BEFORE INSERT ON domae_urgent_logs
+                FOR EACH ROW EXECUTE FUNCTION refuse_log_c4();""")
+    else:
+        def fail(**kw):
+            raise RuntimeError('local notifier failure')
+        monkeypatch.setattr(Notifier, 'send_urgent_order_result', fail)
+    sc._crawlers = {'인천': make_crawler()}
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'completed' and payload['total_filled'] == 10
+    assert read_urgent(db, uo) == (10, False, False, None, True) and not pool._used
+    if phase == 'audit':
+        assert alerts, '감사 실패가 체결 알림을 막으면 안 된다'
+
+
+def test_c4_partial_unknown_notifies_and_logs_only_committed_receipt(env):
+    sc, _, db, alerts = env
+    uo, mid, creds = setup(env)
+    sc._crawlers = {'인천': make_crawler(9, [OrderResult(success=False,
+        reason_code='send_unknown', fulfilled_quantity=3)])}
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'check_required' and payload['total_filled'] == 3
+    assert [entry[:3] for entry in logs(db, uo)] == [('인천', 3, True)]
+    assert any('확인 필요' in str(a) for a in alerts)
+
+
+def test_c4_late_receipt_not_duplicated_by_finish(env):
+    sc, _, db, alerts = env
+    uo, mid, creds = setup(env)
+    sc._crawlers = {'인천': make_crawler(4, on_order=lambda c: update(db, uo,
+        '"checkRequired"=true,"sendingToken"=NULL,"sendingAt"=NULL'))}
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'check_required' and payload['total_filled'] == 0
+    assert len(logs(db, uo)) == 1 and logs(db, uo)[0][1] == 4
+    assert sum('수동 정산 필요' in str(a) for a in alerts) == 1
+
+
+@pytest.mark.parametrize('receipt,confirmed', [(OrderResult(success=True), 4),
+    (OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3), 3)])
+def test_c4_broken_execution_connection_discards_and_requeries_state(
+        env, monkeypatch, caplog, receipt, confirmed):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    with db.connection() as connection, connection.cursor() as cur:
+        cur.execute("""CREATE FUNCTION refuse_all_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'local audit failure'; END $$;
+            CREATE TRIGGER refuse_audit BEFORE INSERT ON domae_urgent_logs
+            FOR EACH ROW EXECUTE FUNCTION refuse_all_audit();""")
+    sc._crawlers = {'인천': make_crawler(4, [receipt], on_order=lambda c: update(db, uo,
+        '"checkRequired"=true,"sendingToken"=NULL,"sendingAt"=NULL'))}
+    original_get, original_put = sc._get_conn, pool.putconn
+    discarded, first = [], [True]
+    class BrokenCleanup:
+        def __init__(self, connection):
+            self.connection = connection
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+        def rollback(self):
+            raise RuntimeError('local caller cleanup failure')
+    def get():
+        connection = original_get()
+        if first[0]:
+            first[0] = False
+            return BrokenCleanup(connection)
+        return connection
+    def put(connection, *args, **kwargs):
+        if isinstance(connection, BrokenCleanup):
+            discarded.append(kwargs.get('close'))
+            connection = connection.connection
+        original_put(connection, *args, **kwargs)
+    def notifier_failure(*args, **kwargs):
+        raise RuntimeError('local notifier failure')
+    monkeypatch.setattr(sc, '_get_conn', get)
+    monkeypatch.setattr(pool, 'putconn', put)
+    monkeypatch.setattr(Notifier, 'send_telegram', notifier_failure)
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'check_required' and payload['total_filled'] == 0
+    assert discarded == [True] and not pool._used
+    assert any(f'quantity={confirmed}' in record.getMessage() for record in caplog.records)
+
+
+def test_c4_periodic_failure_does_not_block_next_run(env):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    other = seed_urgent(db, mid, total=2)
+    with db.connection() as connection, connection.cursor() as cur:
+        cur.execute("""CREATE FUNCTION refuse_first_run() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN IF NEW.id=%s AND NEW."filledQuantity" <> OLD."filledQuantity" THEN
+                RAISE EXCEPTION 'local first-run failure'; END IF; RETURN NEW; END $$;
+            CREATE TRIGGER fail_first BEFORE UPDATE ON domae_urgent_orders
+            FOR EACH ROW EXECUTE FUNCTION refuse_first_run();""", (uo,))
+    sc._crawlers = {'인천': make_crawler(results=[OrderResult(success=True), OrderResult(success=True)])}
+    periodic(env, mid, creds)
+    assert read_urgent(db, uo)[3] and read_urgent(db, other) == (2, False, False, None, True)
+    assert not pool._used
+
+
+def test_c4_periodic_recovers_stale_and_skips_protected_rows(env):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env, active=False, sendingToken='old',
+        sendingAt=datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(minutes=31))
+    protected = seed_urgent(db, mid, checkRequired=True)
+    sc._crawlers = {'인천': make_crawler()}
+    periodic(env, mid, creds)
+    assert read_urgent(db, uo) == (0, False, True, None, False)
+    assert not sc._crawlers['인천'].orders and logs(db, protected) == []
+    assert any('재시작' in str(a) for a in alerts)
+
+
+def test_c4_stock_only_warning_is_deduplicated_and_html_safe(env, monkeypatch):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    with db.connection() as connection, connection.cursor() as cur:
+        cur.execute('UPDATE domae_urgent_orders SET "productName"=%s WHERE id=%s', ('<약&품>', uo))
+    sc._crawlers = {'인천': make_crawler(safe=False)}
+    first, second = immediate(env, uo, mid), immediate(env, uo, mid)
+    assert first['stock_alerts'] and not second['stock_alerts']
+    assert first['state'] == 'waiting' and not sc._crawlers['인천'].orders
+    warnings = [str(a) for a in alerts if '직접 주문' in str(a)]
+    assert len(warnings) == 1 and '&lt;약&amp;품&gt;' in warnings[0]
+
+
+def test_c4_missing_urgent_row_still_has_one_response(env):
+    sc, pool, db, alerts = env
+    mid = seed_monitor(db, ('인천',))
+    payload = immediate(env, 'missing-urgent', mid)
+    assert not payload['success'] and payload['state'] == 'not_found' and not pool._used
+
+
+def test_c4_failed_final_state_query_is_unknown_without_losing_receipt(env, monkeypatch):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    def disable_state_query(**kw):
+        with db.connection() as connection, connection.cursor() as cur:
+            cur.execute('ALTER TABLE domae_urgent_orders RENAME COLUMN "checkReason" TO "unavailableReason"')
+    monkeypatch.setattr(Notifier, 'send_urgent_order_result', disable_state_query)
+    sc._crawlers = {'인천': make_crawler()}
+    payload = immediate(env, uo, mid)
+    assert payload['state'] == 'unknown' and payload['filled_quantity'] == 10
+    assert read_urgent(db, uo) == (10, False, False, None, True) and not pool._used
