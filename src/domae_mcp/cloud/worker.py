@@ -80,7 +80,10 @@ class CloudWorker:
 
         while self._running:
             try:
-                self._scheduler.recover_cart_releases()
+                try:
+                    self._scheduler.recover_cart_releases()
+                except Exception as error:
+                    logger.warning("감사 복구 실패 — 일반 잡 소비 계속: %s", type(error).__name__)
                 self._drain_delayed()
                 result = self._redis.brpop(["domae:jobs:urgent", "domae:jobs"], timeout=5)
                 if result is None:

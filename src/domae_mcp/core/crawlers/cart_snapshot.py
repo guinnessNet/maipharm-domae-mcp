@@ -224,6 +224,19 @@ class CartSnapshot:
             return True
         return redis_client.transaction(fn, key, value_from_callable=True)
 
+    @staticmethod
+    def defer_release(redis_client, key):
+        """실패한 영수증은 내용·시각을 유지하고 대기열 맨 뒤로 옮긴다."""
+        def fn(pipe):
+            if not pipe.exists(key) or pipe.zscore(RELEASE_PENDING_KEY, key) is None:
+                return False
+            tail = pipe.zrevrange(RELEASE_PENDING_KEY, 0, 0, withscores=True)
+            score = max(time.time(), tail[0][1] + 1) if tail else time.time()
+            pipe.multi()
+            pipe.zadd(RELEASE_PENDING_KEY, {key: score})
+            return True
+        return redis_client.transaction(fn, key, RELEASE_PENDING_KEY, value_from_callable=True)
+
     def release(self, rev: int) -> str:
         """해제와 영구 감사 영수증을 한 Redis 트랜잭션으로 저장한다."""
         receipt_key = self.release_key(rev)

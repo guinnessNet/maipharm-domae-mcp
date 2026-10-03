@@ -124,3 +124,70 @@ def test_interruption_before_release_transaction_exec_keeps_snapshot_and_no_rece
     assert store.load() == original
     assert not redis.get(store.release_key(rev))
     assert redis.zcard('domae:cart_release_pending') == 0
+
+def test_permanent_first_ten_failures_do_not_starve_eleventh_receipt():
+    redis = fakeredis.FakeRedis()
+    healthy_id = None
+    for i in range(11):
+        store = CartSnapshot(redis, f'monitor{i}', '백제', account=f'fair{i}')
+        store.lock(); rev = store.save({}); store.unlock(); store.release(rev)
+        if i == 10: healthy_id = store.release_receipt(redis, store.release_key(rev))['id']
+    conn, cur, pool = Mock(), Mock(), Mock()
+    conn.cursor.return_value = cur; pool.getconn.return_value = conn
+    attempted = []
+    def execute(sql, args=None):
+        if 'INSERT INTO domae_order_audit_events' in sql:
+            attempted.append(args[0])
+            if args[0] != healthy_id: raise RuntimeError('per-receipt permanent failure')
+    cur.execute.side_effect = execute
+    scheduler = CloudScheduler(pool, redis)
+    for _ in range(3):
+        before = len(attempted)
+        scheduler.recover_cart_releases()
+        assert len(attempted) - before <= 10
+    assert healthy_id in attempted
+    assert redis.zcard('domae:cart_release_pending') == 10
+
+@pytest.mark.parametrize('failure', ['parse', 'rollback', 'poolreturn'])
+def test_recovery_failure_does_not_block_normal_dequeue(monkeypatch, failure):
+    redis = fakeredis.FakeRedis()
+    store = CartSnapshot(redis, 'monitor1', '백제', account='broken')
+    store.lock(); rev = store.save({}); store.unlock(); store.release(rev)
+    key = store.release_key(rev)
+    if failure == 'parse': redis.set(key, 'invalid-json')
+    conn, cur, pool = Mock(), Mock(), Mock()
+    conn.cursor.return_value = cur; pool.getconn.return_value = conn
+    cur.execute.side_effect = lambda sql, args=None: (_ for _ in ()).throw(RuntimeError('DB lost')) if 'INSERT INTO domae_order_audit_events' in sql else None
+    if failure == 'rollback': conn.rollback.side_effect = RuntimeError('rollback disconnected')
+    if failure == 'poolreturn': pool.putconn.side_effect = RuntimeError('pool return disconnected')
+    scheduler = CloudScheduler(pool, redis)
+    scheduler.execute = Mock()
+    worker = CloudWorker.__new__(CloudWorker)
+    worker._running = True; worker._redis = redis; worker._scheduler = scheduler
+    worker._db_pool = pool; worker._executor = Mock(); worker._drain_delayed = lambda: None
+    def take(*a, **k):
+        worker._running = False
+        return 'domae:jobs', json.dumps({'action': 'monitor', 'monitor_id': 'm'})
+    redis.brpop = take
+    # Stop on error to avoid an infinite test run when the pre-fix worker skips dequeue.
+    monkeypatch.setattr('domae_mcp.cloud.worker.time.sleep', lambda *_: setattr(worker, '_running', False))
+    scheduler.recover_cart_releases()  # must contain per-receipt failures itself
+    worker.run()
+    scheduler.execute.assert_called_once()
+    assert redis.get(key) and redis.zcard('domae:cart_release_pending') == 1
+    if failure == 'rollback': pool.putconn.assert_any_call(conn, close=True)
+    if failure == 'poolreturn': assert conn.close.call_count == 2
+
+def test_unexpected_recovery_exception_still_dequeues_job():
+    worker = CloudWorker.__new__(CloudWorker)
+    worker._running = True
+    worker._redis, worker._scheduler, worker._db_pool, worker._executor = Mock(), Mock(), Mock(), Mock()
+    worker._drain_delayed = lambda: None
+    def fail():
+        worker._running = False
+        raise RuntimeError('unexpected recovery failure')
+    worker._scheduler.recover_cart_releases.side_effect = fail
+    job = {'action': 'monitor', 'monitor_id': 'm'}
+    worker._redis.brpop.return_value = 'domae:jobs', json.dumps(job)
+    worker.run()
+    worker._scheduler.execute.assert_called_once_with(job)

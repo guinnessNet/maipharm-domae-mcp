@@ -531,3 +531,40 @@ def test_cart_release_audit_recovers_after_failure_and_interruption(database, mo
     from datetime import datetime
     cur.execute('SELECT id, "createdAt" FROM domae_order_audit_events')
     assert cur.fetchone() == (receipt['id'], datetime.fromisoformat(receipt['releasedAt']).replace(tzinfo=None))
+
+def test_audit_recovery_rotates_permanent_pg_failures_without_starving(database):
+    import fakeredis
+    from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot
+    origin, observer = database
+    cur = origin.cursor()
+    cur.execute('''CREATE TABLE domae_order_audit_events (
+        id text PRIMARY KEY, "monitorId" text CHECK ("monitorId" = 'healthy'), supplier text,
+        "eventType" text, source text, payload jsonb, "createdAt" timestamp)''')
+    origin.commit()
+    redis = fakeredis.FakeRedis()
+    originals = {}
+    for i in range(11):
+        store = CartSnapshot(redis, 'healthy' if i == 10 else f'failed{i}', '백제', account=f'pg-fair{i}')
+        store.lock(); rev = store.save({}); store.unlock(); store.release(rev)
+        key = store.release_key(rev)
+        originals[key] = redis.get(key)
+    class Pool:
+        def getconn(self): return origin
+        def putconn(self, conn, close=False): conn.rollback()
+    scheduler = sch.CloudScheduler(Pool(), redis)
+    persisted = scheduler._persist_cart_release
+    attempted = []
+    def persist(conn, key, receipt):
+        attempted.append(receipt['id'])
+        return persisted(conn, key, receipt)
+    scheduler._persist_cart_release = persist
+    for _ in range(3):
+        before = len(attempted)
+        scheduler.recover_cart_releases()
+        assert len(attempted) - before <= 10
+    cur = observer.cursor()
+    cur.execute('SELECT "monitorId" FROM domae_order_audit_events')
+    assert cur.fetchall() == [('healthy',)]
+    assert redis.zcard('domae:cart_release_pending') == 10
+    for key in redis.zrange('domae:cart_release_pending', 0, -1):
+        assert redis.get(key) == originals[key.decode()] and redis.ttl(key) == -1

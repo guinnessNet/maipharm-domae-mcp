@@ -3092,28 +3092,55 @@ class CloudScheduler:
         CartSnapshot.ack_release(self._redis, key, receipt)
 
     def recover_cart_releases(self):
-        """워커의 정상 잡 대기 루프에서 오래된 영수증 최대 10건을 복구한다.
+        """정상 잡 대기 루프에서 최대 10건을 복구하고 실패는 대기열 뒤로 보낸다.
 
-        승인이 끝난 영수증을 사용하므로 모니터 비활성화·계정 변경 이후에도 감사 기록한다.
-        전역 SCAN 없이 전용 pending ZSET의 첫 10건만 읽는다. 실패 시 영수증은 남는다.
+        승인된 영수증을 사용해 계정 변경 이후에도 복구한다. 전역 SCAN 없이 전용 ZSET만
+        읽고, 파싱·DB·rollback 실패를 이 배치 안에 가둬 일반 잡 소비를 막지 않는다.
         """
-        for key in self._redis.zrange(RELEASE_PENDING_KEY, 0, 9):
-            key = key.decode() if isinstance(key, bytes) else key
-            receipt = CartSnapshot.release_receipt(self._redis, key)
-            if receipt is None:
-                # 정상 ACK가 같은 트랜잭션에서 pending 항목도 지운다.
-                continue
+        try:
+            keys = self._redis.zrange(RELEASE_PENDING_KEY, 0, 9)
+        except Exception as error:
+            logger.warning("장바구니 해제 감사 대기열 조회 실패: %s", type(error).__name__)
+            return
+        failures = 0
+        for key in keys:
             conn = None
+            discard_conn = False
             try:
+                receipt = CartSnapshot.release_receipt(self._redis, key)
+                if receipt is None:
+                    # 정상 ACK가 같은 트랜잭션에서 pending 항목도 지운다.
+                    continue
                 conn = self._get_conn()
                 self._persist_cart_release(conn, key, receipt)
-            except Exception:
+            except Exception as error:
+                failures += 1
+                discard_conn = isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError))
                 if conn is not None:
-                    conn.rollback()
-                logger.exception("장바구니 해제 감사 복구 실패 id=%s", receipt["id"])
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        discard_conn = True
+                try:
+                    CartSnapshot.defer_release(self._redis, key)
+                except Exception:
+                    # Redis 장애에도 영수증을 ACK하지 않는다. 다음 정상 루프에서 재시도한다.
+                    pass
             finally:
                 if conn is not None:
-                    self._db_pool.putconn(conn)
+                    try:
+                        if discard_conn:
+                            self._db_pool.putconn(conn, close=True)
+                        else:
+                            self._db_pool.putconn(conn)
+                    except Exception:
+                        failures += 1
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+        if failures:
+            logger.warning("장바구니 해제 감사 복구 오류 %s건 — 영수증 보존, 다음 루프 재시도", failures)
 
     def cart_release(self, job: dict):
         """확인 버튼의 소유권을 다시 확인하고 해당 계정·차수만 해제한다."""
