@@ -441,3 +441,46 @@ def test_late_receipt_audit_failure_still_alerts_and_keeps_protected_state(env):
     r = run(env, uo, creds)
     assert r.lost and read_urgent(db, uo) == (0, False, True, None, False)
     assert any('수동 정산 필요' in str(alert) and '4개' in str(alert) for alert in alerts)
+
+
+@pytest.mark.parametrize('receipt,confirmed', [
+    (OrderResult(success=True), 4),
+    (OrderResult(success=False, reason_code='send_unknown', fulfilled_quantity=3), 3),
+])
+def test_late_receipt_evidence_survives_audit_cleanup_and_notifier_failure(
+        env, monkeypatch, caplog, receipt, confirmed):
+    sc, pool, db, alerts = env
+    uo, mid, creds = setup(env)
+    with db.connection() as connection, connection.cursor() as cur:
+        cur.execute("""CREATE FUNCTION refuse_urgent_log() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'local audit failure'; END $$;
+            CREATE TRIGGER refuse_log BEFORE INSERT ON domae_urgent_logs
+            FOR EACH ROW EXECUTE FUNCTION refuse_urgent_log();""")
+    sc._crawlers = {'인천': make_crawler(4, [receipt], on_order=lambda c: update(db, uo,
+        '"checkRequired"=true,"sendingToken"=NULL,"sendingAt"=NULL'))}
+    notification_attempts, rollback_attempts = [], []
+    def notifier_failure(chat_id, message, **kw):
+        notification_attempts.append(message)
+        raise RuntimeError('local notifier failure')
+    monkeypatch.setattr(Notifier, 'send_telegram', notifier_failure)
+    class BrokenCleanup:
+        # Claims, token-conditioned updates and the rejected INSERT use real PostgreSQL.
+        # Only connection cleanup failure is injected at the DB connection boundary.
+        def __init__(self, connection):
+            self.connection = connection
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+        def rollback(self):
+            rollback_attempts.append(True)
+            raise RuntimeError('local connection cleanup failure')
+    with db.connection() as connection, connection.cursor() as cur:
+        try:
+            r = sc._urgent_fill(BrokenCleanup(connection), cur, uo, creds)
+        finally:
+            connection.rollback()  # caller-owned cleanup is separate from C3's failure handler
+    assert r.lost and rollback_attempts == [True]
+    assert read_urgent(db, uo) == (0, False, True, None, False) and logs(db, uo) == []
+    assert len(notification_attempts) == 1
+    assert '인천' in notification_attempts[0] and f'{confirmed}개' in notification_attempts[0]
+    assert any('supplier=인천' in record.getMessage() and f'quantity={confirmed}' in record.getMessage()
+               and '수동 정산 필요' in record.getMessage() for record in caplog.records)

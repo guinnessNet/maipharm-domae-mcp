@@ -3588,9 +3588,13 @@ class CloudScheduler:
                     try:
                         late_receipt_log(supplier, confirmed, True, message)
                     except Exception:
-                        conn.rollback()
+                        # 감사 DB와 연결 정리가 함께 실패해도 실제 체결 증거부터 남긴다.
                         logger.error("늦은 체결 감사 기록 실패 urgent=%s supplier=%s quantity=%s — 수동 정산 필요",
                                      uo_id, supplier, confirmed)
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            logger.error("늦은 체결 감사 연결 정리 실패 urgent=%s — 호출부에서 연결 폐기 필요", uo_id)
                     finally:
                         notify(message)
                 break
