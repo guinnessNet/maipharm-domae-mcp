@@ -758,3 +758,62 @@ def test_tj_second_guard_success_keeps_single_submit_body_and_restores_original_
     assert result.success and guard_calls[0] == 2
     assert site.sends == [{"A": 2}] and site.basket == {"Z": 3}
     assert submits == [{"data": {"ip": "", "memo": ""}, "headers": tj.TjPharmCrawler._ORDER_HEADERS}]
+
+
+@pytest.mark.parametrize('bad', [True, False, 1.5, '1.5', -1, None, 'garbage', 'missing'])
+@pytest.mark.parametrize('position', [0, 1, 2])
+def test_tj_bad_search_stock_skips_only_offending_row_preserving_cache(bad, position):
+    site = Site({'A': 9, 'B': 9})
+    original = site.post
+    rows = [{'ItemCode': code, 'InvQty': 9, 'Cst': 1000, 'ItemToken': 't'+code, 'ItemName': code}
+            for code in ('A', 'B')]
+    damaged = {'ItemCode': 'A', 'InvQty': bad, 'Cst': 9999, 'ItemToken': 'damaged-token'}
+    if bad == 'missing':
+        damaged.pop('InvQty')
+    rows.insert(position, damaged)
+    def post(url, **kwargs):
+        if url.endswith('item_api.php'):
+            return Resp(json.dumps({'ResultSet': rows}))
+        return original(url, **kwargs)
+    site.post = post
+    c = crawler(site)
+    c._item_tokens['A'], c._item_prices['A'] = 'tA', 1000
+    found = c.search('broad-query')
+    assert [(r.product_id, r.quantity) for r in found] == [('A', 9), ('B', 9)]
+    assert c._item_tokens == {'A': 'tA', 'B': 'tB'}
+    assert c._item_prices == {'A': 1000, 'B': 1000}
+    assert c.presend_stock({'product_id': 'B'}) == 9
+    result = c.order('B', 2)
+    assert result.success and result.fulfilled_quantity == 2 and site.sends == [{'B': 2}]
+
+
+@pytest.mark.parametrize('entry', ['order', '_order_bare', 'order_batch'])
+@pytest.mark.parametrize('stock,adjusted,fulfilled,failed,reason', [(9, None, 4, 0, 'ok'), (2, 2, 2, 2, 'stock_adjusted')])
+def test_tj_confirmed_full_and_partial_adjustment_contract(entry, stock, adjusted, fulfilled, failed, reason):
+    site = Site({'A': stock})
+    c = crawler(site)
+    result = c.order_batch([{'product_id': 'A', 'quantity': 4}])[0] if entry == 'order_batch' else getattr(c, entry)('A', 4)
+    assert result.success and result.reason_code == reason
+    assert (result.original_quantity, result.adjusted_quantity, result.fulfilled_quantity, result.failed_quantity) == (4, adjusted, fulfilled, failed)
+    assert site.sends == [{'A': fulfilled}]
+
+
+@pytest.mark.parametrize('bad', [True, 1.5, -1, None, 'bad'])
+def test_tj_damaged_target_stock_does_not_select_valid_unrelated_pid_or_pollute_cache(bad):
+    site = Site({'A': 9, 'B': 9}, basket={'Z': 2})
+    original = site.post
+    def post(url, **kwargs):
+        if url.endswith('item_api.php'):
+            return Resp(json.dumps({'ResultSet': [
+                {'ItemCode': 'A', 'InvQty': bad, 'Cst': 9999, 'ItemToken': 'damaged-token'},
+                {'ItemCode': 'B', 'InvQty': 9, 'Cst': 1000, 'ItemToken': 'tB'},
+            ]}))
+        return original(url, **kwargs)
+    site.post = post
+    c = crawler(site)
+    c._item_tokens['A'], c._item_prices['A'] = 'original-token', 700
+    assert [row.product_id for row in c.search('A')] == ['B']
+    assert c._item_tokens['A'] == 'original-token' and c._item_prices['A'] == 700
+    assert c.presend_stock({'product_id': 'A'}) is None
+    result = c.order('A', 2)
+    assert result.reason_code == 'not_sent' and site.sends == [] and site.basket == {'Z': 2}

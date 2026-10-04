@@ -649,3 +649,58 @@ def test_geo_cold_metadata_uses_full_item_candidates_before_pid(entrypoint, with
     assert r.success and r.fulfilled_quantity == 2
     assert queries == ['123456789' if with_insurance else '가상정M30T']
     assert c._names['A'] == NAMES['A'] and site.sends == [{('A',''):2}]
+
+
+EMPTY_NOTICE = '<tr><td>검색된 제품이 없습니다.</td></tr>'
+
+
+def test_geo_exact_empty_notice_does_not_hide_later_product_or_center():
+    html = search_html().replace('<table>', '<table>'+EMPTY_NOTICE)
+    site = with_search(Site({'A': 9}, {'A': 4}), html)
+    original = site.post
+    def post(url, **kw):
+        response = original(url, **kw)
+        if 'PartialProductInfo/' in url:
+            response.text = response.text.replace('<div class="another_center_pop"><table><tbody>',
+                                                  '<div class="another_center_pop"><table><tbody>'+EMPTY_NOTICE)
+        return response
+    site.post = post
+    c = crawler(site)
+    rows = c.search('A')
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row.product_id, row.local_stock, row.other_stock, row.other_move_code, row.quantity) == ('A', 9, 4, 'MV', 13)
+    assert c._names['A'] == NAMES['A']
+    assert c._order_bare('A', 2).success and site.sends == [{('A', ''): 2}]
+
+
+@pytest.mark.parametrize('damaged', [
+    '<tr><td colspan="7">검색된 제품이 없습니다.</td></tr>',
+    '<tr><td>검색된 제품이 없습니다.</td><td>bad</td></tr>',
+    '<tr><td>잠시 후 다시 시도</td></tr>',
+    search_html().replace('<td>x</td>', '<td>검색된 제품이 없습니다.</td>').replace('<td>9</td>', '<td>bad</td>'),
+])
+def test_geo_notice_text_or_short_cells_do_not_exempt_damaged_real_row(damaged):
+    c = crawler(with_search(Site({'A': 9}, {}), damaged))
+    with pytest.raises(ValueError):
+        c.search('A')
+
+
+@pytest.mark.parametrize('price,expected', [('1200', 1200), ('1,200', 1200), ('1,200원', 0), ('', 0), ('broken-secret-session', 0), ('1,2', 0)])
+def test_geo_price_fallback_preserves_stock_identity_and_order(price, expected, caplog):
+    site = with_search(Site({'A': 9}, {'A': 4}))
+    original = site.post
+    def post(url, **kw):
+        response = original(url, **kw)
+        if 'PartialProductInfo/' in url:
+            response.text = response.text.replace('<td>1000</td>', '<td>'+price+'</td>')
+        return response
+    site.post = post
+    c = crawler(site)
+    row = c.search('A')[0]
+    assert row.price == expected
+    assert (row.product_id, row.quantity, row.local_stock, row.other_stock, row.other_move_code) == ('A', 13, 9, 4, 'MV')
+    assert c._names['A'] == NAMES['A'] and c._stock_cache['A'] == (9, 4, 'MV')
+    if expected == 0:
+        assert '가격' in caplog.text and 'broken-secret-session' not in caplog.text
+    assert c._order_bare('A', 2).success and site.sends == [{('A', ''): 2}]

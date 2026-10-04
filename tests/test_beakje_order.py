@@ -277,7 +277,7 @@ def test_duplicate_product_uses_one_stock_budget_and_confirmed_quantities():
     rows = crawler(site).order_batch([{'product_id': 'A|01', 'quantity': 4, 'product_name': 'n'},
                                     {'product_id': 'A|01', 'quantity': 4, 'product_name': 'n'}])
     assert site.sends == [{'A|01': 5}]
-    assert [(r.fulfilled_quantity, r.adjusted_quantity, r.original_quantity) for r in rows] == [(4, 4, 4), (1, 1, 4)]
+    assert [(r.fulfilled_quantity, r.adjusted_quantity, r.original_quantity) for r in rows] == [(4, None, 4), (1, 1, 4)]
 
 
 def test_retained_requested_basket_is_warning_and_2xx_is_accepted(caplog):
@@ -475,3 +475,14 @@ def test_second_guard_timeout_restores_only_verified_owned_cart(race):
         assert c.cart_snapshot.load() is not None
         if race == 'replace':
             assert c.cart_snapshot._r.get(c.cart_snapshot.lock_key) == b'new-owner'
+
+
+@pytest.mark.parametrize('entry', ['order', '_order_bare', 'order_batch'])
+@pytest.mark.parametrize('stock,adjusted,fulfilled,failed,reason', [(9, None, 4, 0, 'ok'), (2, 2, 2, 2, 'stock_adjusted')])
+def test_bj_confirmed_full_and_partial_adjustment_contract(entry, stock, adjusted, fulfilled, failed, reason):
+    site = Site({'A|01': stock})
+    c = crawler(site)
+    result = c.order_batch([{'product_id': 'A|01', 'quantity': 4}])[0] if entry == 'order_batch' else getattr(c, entry)('A|01', 4)
+    assert result.success and result.reason_code == reason
+    assert (result.original_quantity, result.adjusted_quantity, result.fulfilled_quantity, result.failed_quantity) == (4, adjusted, fulfilled, failed)
+    assert site.sends == [{'A|01': fulfilled}]
