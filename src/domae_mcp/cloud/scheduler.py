@@ -158,7 +158,11 @@ def _quick_order_message(supplier, product_name, quantity, result, db_success) -
         return f"⚠ [{supplier}] {product_name} 전송 결과 확인 필요 — 도매몰 주문내역을 확인하세요"
     if db_success:
         got = getattr(result, "adjusted_quantity", None) or quantity
-        short = f" (요청 {quantity}개, 재고 부족)" if got < quantity else ""
+        if got < quantity:
+            short = (f" (요청 {quantity}개, 나머지는 확인 실패로 주문 안 함)"
+                     if getattr(result, "shortfall_reason", None) == "stopped" else f" (요청 {quantity}개, 재고 부족)")
+        else:
+            short = ""
         return f"✅ [{supplier}] {product_name} {got}개 주문 완료{short}{_retry_tag(result)}"
     return f"❌ [{supplier}] {product_name} 주문 실패: {getattr(result, 'message', '')}"
 
@@ -1810,8 +1814,10 @@ class CloudScheduler:
                     if rcode == "stock_adjusted" and adjusted_qty is not None:
                         missing_qty_total += max(0, original_qty - int(adjusted_qty))
                         adjusted_count += 1
+                        _why = ("나머지 확인 실패로 주문 안 함"
+                                if getattr(result, "shortfall_reason", None) == "stopped" else f"재고 {avail_stock}")
                         _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
-                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} (재고 {avail_stock})"
+                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} ({_why})"
                                     f"{_retry_tag(result)}")
                         adjusted_lines.append(_tg_line)
                     else:

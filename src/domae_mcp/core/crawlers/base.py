@@ -51,6 +51,9 @@ class OrderResult:
     # 첫 전송이 아니라 재전송(Phase 2·3, 수량 조정, 품목별 재시도)으로 나온 결과인가 — 알림 표시용
     retried: bool = False
     no_retry: bool = False
+    # 성공(stock_adjusted)인데 남은 수량을 재고가 아닌 이유로 보내지 않았을 때 'stopped'.
+    # 상위 문구가 '재고 부족' 으로 쓰지 않도록 구분한다(None = 재고 부족 또는 해당 없음).
+    shortfall_reason: Optional[str] = None
 
 
 class CrawlerError(Exception):

@@ -81,7 +81,8 @@ def arrange(env, monkeypatch, module, *, partial=False):
         site.post = post
     else:
         supplier, product_id = '지오영', 'A'
-        site = geoweb.with_search(geoweb.Site({'A': 3 if partial else 9}, {'A': 9} if partial else {}))
+        # 검색 행 재고는 Site 의 자기센터·타센터 재고로 만들어진다(실측 구조 2026-10-04).
+        site = geoweb.Site({'A': 3 if partial else 9}, {'A': 9} if partial else {})
         original = site.post
 
         def post(url, **kwargs):

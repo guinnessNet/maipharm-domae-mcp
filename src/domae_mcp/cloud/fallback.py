@@ -235,6 +235,8 @@ def cart_action_after_order(item: dict, result):
     if result.success:
         remain = fallback_need_qty(item, result)
         if remain > 0:
+            if getattr(result, "shortfall_reason", None) == "stopped":
+                return ("keep_failed", remain, f"{qty - remain}개만 주문 — 남은 {remain}개는 확인 실패로 주문 안 함")
             return ("keep_failed", remain, f"재고 부족으로 {qty - remain}개만 주문 — 남은 {remain}개")
         return ("delete", 0, "")
     if getattr(result, "reason_code", None) == "send_unknown":

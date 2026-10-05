@@ -136,7 +136,12 @@ class SearchLoginSession:
         if url.endswith('/Order/item_api.php'):
             return Resp(json.dumps({'ResultSet':[{'ItemCode':'A','ItemName':'n','InvQty':2,'Cst':100,'ItemToken':'tA'}]}))
         if url.endswith('/Home/PartialSearchProduct'):
-            return Resp('<table><tr><td>x</td><td>1</td><td>m</td><td>n</td><td>u</td><td>2</td><td><li>A</li></td></tr></table>')
+            # 실측 검색 행 구조(2026-10-04): 8칸, 제품코드는 div.div-product-detail 의 첫 li.
+            return Resp('<tr class="tr-product-list"><td class="check"></td><td class="code">1</td>'
+                        '<td class="phaCompany">m</td><td class="proName">n</td><td class="standard">u</td>'
+                        '<td class="stock">2</td><td class="stock">0</td><td class="return">'
+                        '<div class="div-product-detail"><ul><li>A</li><li>u</li><li>0</li><li>0</li><li>2</li></ul>'
+                        '</div></td></tr>')
         if '/Home/PartialProductInfo/' in url:
             return Resp('<table><tbody><tr></tr><tr></tr><tr><td>100</td></tr></tbody></table>')
         raise AssertionError('Unexpected mutation/order request')
