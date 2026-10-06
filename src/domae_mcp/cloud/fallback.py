@@ -64,6 +64,18 @@ def pack_signature(unit: Optional[str]):
     return tuple(sorted(tokens))
 
 
+def is_stopped(result) -> bool:
+    """재고가 아닌 이유(전송 전 확인 실패·장바구니 고정·잠금 상실·타센터 확인 불가)로 일부만 주문한 결과."""
+    return bool(getattr(result, "success", False)) and getattr(result, "shortfall_reason", None) == "stopped"
+
+
+def stopped_detail(result) -> str:
+    """stopped 결과의 남은 수량 설명. 크롤러 메시지 "{n}개 주문 — 남은 …[, m개는 재고 부족]" 의 뒷부분."""
+    message = getattr(result, "message", "") or ""
+    detail = message.split(" — ", 1)[1] if " — " in message else ""
+    return detail if detail.startswith("남은 ") else "나머지는 확인 실패로 주문 안 함"
+
+
 def fallback_need_qty(item: dict, result) -> int:
     """대체 주문할 수량. 재고 0이 확인된 품목은 전량, 수량 조정 성공은 부족분, 나머지 0."""
     qty = int(item.get("quantity") or 1)
@@ -235,10 +247,8 @@ def cart_action_after_order(item: dict, result):
     if result.success:
         remain = fallback_need_qty(item, result)
         if remain > 0:
-            if getattr(result, "shortfall_reason", None) == "stopped":
-                message = getattr(result, "message", "") or ""
-                detail = message if message.startswith("남은 ") else f"남은 {remain}개는 확인 실패로 주문 안 함"
-                return ("keep_failed", remain, f"{qty - remain}개만 주문 — {detail}")
+            if is_stopped(result):
+                return ("keep_failed", remain, f"{qty - remain}개만 주문 — {stopped_detail(result)} — 확인 후 다시 주문하세요")
             return ("keep_failed", remain, f"재고 부족으로 {qty - remain}개만 주문 — 남은 {remain}개")
         return ("delete", 0, "")
     if getattr(result, "reason_code", None) == "send_unknown":
@@ -266,7 +276,9 @@ def format_ordered_line(item: dict) -> str:
     req = int(item.get("requested_quantity") or qty)
     total = (item.get("price") or 0) * qty
     line = f"• {item.get('product_name', '')} — {qty}개 — {total:,}원"
-    if req > qty:
+    if req > qty and item.get("shortfall_detail"):
+        line += f" (요청 {req}개 — {item['shortfall_detail']}, 장바구니에 남김)"
+    elif req > qty:
         line += f" (요청 {req}개, 부족 {req - qty}개는 장바구니에 남김)"
     if item.get("retried"):
         line += " (재시도 후 주문)"

@@ -1119,7 +1119,7 @@ def test_geo_stopped_message_splits_check_failure_and_stock_shortage():
     r = c._order_bare('A', 10)
     assert site.sends == [{('A', ''): 3}]
     assert r.success and r.fulfilled_quantity == 3 and r.shortfall_reason == 'stopped'
-    assert r.message == '남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
+    assert r.message == '3개 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
     assert r.available_stock is None                  # 계획 시점 재고를 '재고 N' 으로 보이지 않는다
 
 
@@ -1127,16 +1127,30 @@ def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
     site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 4]]})
     _detail_override(site, lambda r: setattr(r, 'status_code', 500))
     r = crawler(site)._order_bare('A', 10)
-    assert r.message == '남은 7개는 확인 실패로 주문 안 함' and r.available_stock is None
+    assert r.message == '3개 주문 — 남은 7개는 확인 실패로 주문 안 함' and r.available_stock is None
 
 
 @pytest.mark.parametrize('mark', ['style="display: none"', 'style="visibility:hidden"', 'hidden',
-                                  'class="row disabled"', 'input_disabled'])
+                                  'class="row disabled"', 'class="d-none"', 'class="hide"', 'input_disabled',
+                                  'input_readonly', 'input_hidden_type', 'td_hidden', 'button_disabled',
+                                  'tbody_hidden', 'popup_hidden'])
 def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
     def fn(r):
         if mark == 'input_disabled':
             r.text = r.text.replace('<input data-code="c1"', '<input disabled data-code="c1"')
+        elif mark == 'input_readonly':
+            r.text = r.text.replace('<input data-code="c1"', '<input readonly data-code="c1"')
+        elif mark == 'input_hidden_type':
+            r.text = r.text.replace('<input data-code="c1" type="text"', '<input data-code="c1" type="hidden"')
+        elif mark == 'td_hidden':
+            r.text = r.text.replace('<td>C1</td><td>4</td>', '<td>C1</td><td style="display:none">4</td>')
+        elif mark == 'button_disabled':
+            r.text = r.text.replace('<input data-code="c1" type="text">', '<input data-code="c1" type="text"><button disabled>담기</button>')
+        elif mark == 'tbody_hidden':
+            r.text = r.text.replace('<div class="another_center_pop"><table><tbody>', '<div class="another_center_pop"><table><tbody style="display:none">')
+        elif mark == 'popup_hidden':
+            r.text = r.text.replace('<div class="another_center_pop">', '<div class="another_center_pop" style="display:none">')
         else:
             r.text = r.text.replace('<tr style="" class="">', f'<tr {mark}>', 1)
     _detail_override(site, fn)
@@ -1166,7 +1180,7 @@ def test_geo_exception_after_accepted_stage_marks_stopped():
     r = c._order_bare('A', 6)
     assert site.sends == [{('A', ''): 2}]
     assert r.success and r.fulfilled_quantity == 2 and r.shortfall_reason == 'stopped'
-    assert r.message == '남은 4개는 확인 실패로 주문 안 함'
+    assert r.message == '2개 주문 — 남은 4개는 확인 실패로 주문 안 함'
 
 
 def _count_calls(site):
@@ -1238,4 +1252,44 @@ def test_quick_order_and_cart_text_carry_split_message():
     r = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=5)
     assert _quick_order_message('지오영', 'X', 10, r, True).endswith(
         '3개 주문 완료 (요청 10개, 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족)')
-    assert cart_action_after_order({'quantity': 10}, r)[2] == '3개만 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
+    assert cart_action_after_order({'quantity': 10}, r)[2] == ('3개만 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
+                                                         ' — 확인 후 다시 주문하세요')
+
+
+def test_geo_live_popup_row_shape_is_accepted_by_allowlist():
+    """허용 목록이 실측 팝업 행(style=""·class=""·type=text·담기 버튼 활성·넷째 칸 숨김 div)을 받아들인다."""
+    if not (_LIVE_ENV is not None or os.path.isdir(LIVE)):
+        pytest.skip('비공개 실측 픽스처 없음')
+    E = _expected()
+    from bs4 import BeautifulSoup
+    pid = E['roles']['multi_center']
+    centers = gw.GeoWebCrawler._centers(BeautifulSoup(_live(f'info_{pid}.html'), 'html.parser'))
+    assert sum(q for _, _, q in centers if q) == E['search_rows'][pid][1]
+
+
+def test_geo_remaining_all_stock_shortage_is_not_stopped():
+    r = gw.GeoWebCrawler._result(10, 5, 'stock_adjusted', 5, stopped=True, stock_short=5)
+    assert r.shortfall_reason is None and r.message == '주문 완료' and r.available_stock == 5
+
+
+def test_geo_run_with_cart_exception_after_accepted_stage_marks_stopped():
+    site = Site({'A': 2}, {}, centers={'A': [['C1', 'c1', 5]]})
+    c = crawler(site)
+    def order_one(pid, qty, item):
+        c._item_requested, c._item_stock, c._item_short = qty, 7, 0
+        assert c._stage(pid, 2, '') == 'accepted'
+        raise RuntimeError('단계 뒤 예외')
+    c._order_one = order_one
+    r = c._order_bare('A', 6)
+    assert site.sends == [{('A', ''): 2}]
+    assert r.success and r.fulfilled_quantity == 2 and r.shortfall_reason == 'stopped'
+    assert r.message == '2개 주문 — 남은 4개는 확인 실패로 주문 안 함' and r.available_stock is None
+
+
+def test_auto_order_line_carries_stopped_detail():
+    from domae_mcp.cloud.fallback import format_ordered_line
+    line = format_ordered_line({'product_name': 'X', 'quantity': 3, 'requested_quantity': 10, 'price': 1000,
+                                'shortfall_detail': '남은 7개는 확인 실패로 주문 안 함'})
+    assert line == '• X — 3개 — 3,000원 (요청 10개 — 남은 7개는 확인 실패로 주문 안 함, 장바구니에 남김)'
+    assert '부족' not in line
+    assert '부족 7개' in format_ordered_line({'product_name': 'X', 'quantity': 3, 'requested_quantity': 10, 'price': 1000})

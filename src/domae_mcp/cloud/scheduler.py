@@ -22,7 +22,7 @@ import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, checked_qty, confirmed_quantity, _as_unknown_if_unspecified
 from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
-from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, next_suppliers, run_fallback, format_ordered_line)
+from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 from domae_mcp.cloud.notifier import Notifier
@@ -152,15 +152,9 @@ def _retry_tag(result) -> str:
     return " (재시도 후 주문)" if getattr(result, "retried", False) else ""
 
 
-def _stopped_detail(result) -> str:
-    """shortfall_reason == "stopped" 결과의 남은 수량 설명. 크롤러 메시지가 확인 실패분·재고 부족분을 나눠 적는다."""
-    message = getattr(result, "message", "") or ""
-    return message if message.startswith("남은 ") else "나머지는 확인 실패로 주문 안 함"
-
-
 def _adjusted_line(supplier, item, original_qty, adjusted_qty, avail_stock, result) -> str:
     """배치 알림의 수량 조정 줄. 확인 실패로 남긴 수량은 '재고 N' 으로 적지 않는다."""
-    why = (_stopped_detail(result) if getattr(result, "shortfall_reason", None) == "stopped"
+    why = (stopped_detail(result) if is_stopped(result)
            else f"재고 {avail_stock}")
     return (f" · [{supplier}] {item.get('product_name', '')}"
             f" — 요청 {original_qty} → 주문 {adjusted_qty} ({why}){_retry_tag(result)}")
@@ -173,8 +167,8 @@ def _quick_order_message(supplier, product_name, quantity, result, db_success) -
     if db_success:
         got = getattr(result, "adjusted_quantity", None) or quantity
         if got < quantity:
-            short = (f" (요청 {quantity}개, {_stopped_detail(result)})"
-                     if getattr(result, "shortfall_reason", None) == "stopped" else f" (요청 {quantity}개, 재고 부족)")
+            short = (f" (요청 {quantity}개, {stopped_detail(result)})"
+                     if is_stopped(result) else f" (요청 {quantity}개, 재고 부족)")
         else:
             short = ""
         return f"✅ [{supplier}] {product_name} {got}개 주문 완료{short}{_retry_tag(result)}"
@@ -2198,7 +2192,8 @@ class CloudScheduler:
                     req = int(item.get("quantity", 1))
                     got = getattr(result, "adjusted_quantity", None) or req
                     success_items.append({**item, "quantity": got, "requested_quantity": req,
-                                          "retried": bool(getattr(result, "retried", False))})
+                                          "retried": bool(getattr(result, "retried", False)),
+                                          "shortfall_detail": stopped_detail(result) if is_stopped(result) else None})
                 elif unconfirmed:
                     unconfirmed_items.append(item)
                 else:
@@ -2220,7 +2215,8 @@ class CloudScheduler:
                             'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
                             (utc_now, why, cart_item_id))
 
-                need = fallback_need_qty(item, result) if auto_fallback else 0
+                # 재고가 아닌 이유로 남긴 수량은 자동 대체주문하지 않는다 — 장바구니에 남겨 약사 확인을 받는다.
+                need = fallback_need_qty(item, result) if auto_fallback and not is_stopped(result) else 0
                 if need > 0:
                     fallback_needs.append((item, need))
 
@@ -2313,7 +2309,9 @@ class CloudScheduler:
                     "count": len(success_items),
                     "totalPrice": sum((i.get("price") or 0) * int(i.get("quantity", 0)) for i in success_items),
                     "shortfall": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
-                                     for i in success_items),
+                                     for i in success_items if not i.get("shortfall_detail")),
+                    "unsent": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
+                                  for i in success_items if i.get("shortfall_detail")),
                     "unconfirmed": len(unconfirmed_items),
                     "fallbackOrdered": sum(1 for o in fallback_outcomes if o.state == "ordered"),
                 }))

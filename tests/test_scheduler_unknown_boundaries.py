@@ -215,3 +215,38 @@ def test_failed_positive_adjustment_preserves_receipt_without_resend(env, path, 
         ('order' if path == 'order' else 'batch', 15)]
     assert env.calls == expected and not env.alternatives
     assert any('확인 필요' in str(n) for n in env.notices)
+
+
+def _stopped(done=10, detail='남은 5개는 확인 실패로 주문 안 함'):
+    r = OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=done, fulfilled_quantity=done,
+                    message=f'{done}개 주문 — {detail}')
+    r.shortfall_reason = 'stopped'
+    return r
+
+
+def test_quick_order_payload_carries_shortfall_reason_and_detail(env):
+    run_reported_result(env, 'order', _stopped())
+    payload = json.loads(env.scheduler._redis.rpop('response'))
+    assert payload['shortfall_reason'] == 'stopped' and payload['available_stock'] is None
+    assert payload['message'] == '10개 주문 — 남은 5개는 확인 실패로 주문 안 함'
+    assert env.read()[0] == (True, 'stock_adjusted', 10, 10)
+    assert any('요청 15개, 남은 5개는 확인 실패로 주문 안 함' in str(n) for n in env.notices)
+    assert not any('재고 부족' in str(n) for n in env.notices)
+
+
+def test_auto_order_stopped_remainder_stays_in_cart_without_fallback(env):
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    run_reported_result(env, 'auto_order', _stopped())
+    order, cart, batch = env.read()
+    assert env.alternatives == []                          # 재고 외 사유 미주문분은 대체주문하지 않는다
+    assert cart[0] == 5 and '확인 실패로 주문 안 함' in cart[1] and '재고 부족' not in cart[1]
+    text = ' '.join(str(n) for n in env.notices)
+    assert '남은 5개는 확인 실패로 주문 안 함, 장바구니에 남김' in text and '부족 5개' not in text
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    assert sse['unsent'] == 5 and sse['shortfall'] == 0
+
+
+def test_auto_order_stock_shortage_remainder_still_falls_back(env):
+    run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    assert 'search' in env.alternatives                    # 재고 부족분은 다음 순번 도매에서 찾는다
