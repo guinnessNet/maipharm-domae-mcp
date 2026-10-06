@@ -152,6 +152,20 @@ def _retry_tag(result) -> str:
     return " (재시도 후 주문)" if getattr(result, "retried", False) else ""
 
 
+def _stopped_detail(result) -> str:
+    """shortfall_reason == "stopped" 결과의 남은 수량 설명. 크롤러 메시지가 확인 실패분·재고 부족분을 나눠 적는다."""
+    message = getattr(result, "message", "") or ""
+    return message if message.startswith("남은 ") else "나머지는 확인 실패로 주문 안 함"
+
+
+def _adjusted_line(supplier, item, original_qty, adjusted_qty, avail_stock, result) -> str:
+    """배치 알림의 수량 조정 줄. 확인 실패로 남긴 수량은 '재고 N' 으로 적지 않는다."""
+    why = (_stopped_detail(result) if getattr(result, "shortfall_reason", None) == "stopped"
+           else f"재고 {avail_stock}")
+    return (f" · [{supplier}] {item.get('product_name', '')}"
+            f" — 요청 {original_qty} → 주문 {adjusted_qty} ({why}){_retry_tag(result)}")
+
+
 def _quick_order_message(supplier, product_name, quantity, result, db_success) -> str:
     """바로주문 텔레그램 문구. 수량 조정으로 덜 주문됐으면 실제 주문 수량을 적는다."""
     if db_success is None:
@@ -159,7 +173,7 @@ def _quick_order_message(supplier, product_name, quantity, result, db_success) -
     if db_success:
         got = getattr(result, "adjusted_quantity", None) or quantity
         if got < quantity:
-            short = (f" (요청 {quantity}개, 나머지는 확인 실패로 주문 안 함)"
+            short = (f" (요청 {quantity}개, {_stopped_detail(result)})"
                      if getattr(result, "shortfall_reason", None) == "stopped" else f" (요청 {quantity}개, 재고 부족)")
         else:
             short = ""
@@ -1239,7 +1253,8 @@ class CloudScheduler:
         def _finalize(success: bool | None, order_id: str | None, message: str,
                       adjusted_quantity: int | None = None,
                       available_stock: int | None = None,
-                      reason_code: str | None = None, confirmed_qty: int | None = None):
+                      reason_code: str | None = None, confirmed_qty: int | None = None,
+                      shortfall_reason: str | None = None):
             if reason_code == "send_unknown":
                 success = None
             elif success is False and not may_have_sent:
@@ -1313,6 +1328,7 @@ class CloudScheduler:
                 "adjusted_quantity": adjusted_quantity,
                 "available_stock": available_stock,
                 "reason_code": reason_code,
+                "shortfall_reason": shortfall_reason,
             }
             try:
                 self._redis.lpush(response_key, json.dumps(payload))
@@ -1453,6 +1469,7 @@ class CloudScheduler:
                 available_stock=getattr(result, "available_stock", None),
                 reason_code=getattr(result, "reason_code", None),
                 confirmed_qty=confirmed_quantity(result, quantity),
+                shortfall_reason=getattr(result, "shortfall_reason", None),
             )
 
             # 텔레그램 알림
@@ -1814,12 +1831,8 @@ class CloudScheduler:
                     if rcode == "stock_adjusted" and adjusted_qty is not None:
                         missing_qty_total += max(0, original_qty - int(adjusted_qty))
                         adjusted_count += 1
-                        _why = ("나머지 확인 실패로 주문 안 함"
-                                if getattr(result, "shortfall_reason", None) == "stopped" else f"재고 {avail_stock}")
-                        _tg_line = (f" · [{supplier_name}] {item.get('product_name', '')}"
-                                    f" — 요청 {original_qty} → 주문 {adjusted_qty} ({_why})"
-                                    f"{_retry_tag(result)}")
-                        adjusted_lines.append(_tg_line)
+                        adjusted_lines.append(_adjusted_line(supplier_name, item, original_qty, adjusted_qty,
+                                                             avail_stock, result))
                     else:
                         success_lines.append(_batch_success_line(supplier_name, item, result))
                     cart_item_id = item.get("cart_item_id")

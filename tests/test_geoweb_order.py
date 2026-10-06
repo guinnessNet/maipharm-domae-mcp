@@ -172,7 +172,7 @@ def crawler(site):
     c = gw.GeoWebCrawler.__new__(gw.GeoWebCrawler)
     c.session, c._stock_cache, c._login_id, c._login_pw, c._logged_in = site, {}, "", "", True
     c._names, c._history_wait = dict(NAMES), 0
-    c._dates = ("2026-10-01", "2026-10-02")
+    c._from_day = "2026-10-01"
     c.ensure_login = lambda *a: True
     c.login = lambda *a: site.logged_in
     c.cart_snapshot = CartSnapshot(fakeredis.FakeRedis(), "m", "지오영")
@@ -636,7 +636,8 @@ def test_geo_search_malformed_rows_not_stock_zero(html):
     assert c.presend_stock({'product_id':'A'}) is None   # 주문: 대상 손상·식별 불가는 주문 안 함
 
 
-def test_geo_history_fixed_kst_dates():
+def test_geo_history_range_follows_midnight():
+    """시작일은 실행 시작 전날로 고정, 종료일은 읽을 때마다 오늘(KST) — 자정을 넘긴 주문도 접수로 판정."""
     from datetime import datetime as real_datetime
     from unittest.mock import patch
     class Clock:
@@ -645,7 +646,9 @@ def test_geo_history_fixed_kst_dates():
         def now(cls, zone):
             cls.calls += 1
             assert zone == gw.KST
-            return real_datetime(2026,10,3,23,59,59,tzinfo=zone)
+            if cls.calls <= 2:                                  # 실행 시작·전송 전 주문내역
+                return real_datetime(2026,10,3,23,59,59,tzinfo=zone)
+            return real_datetime(2026,10,4,0,0,1,tzinfo=zone)
     site = Site({'A':3}, {'A':9})
     urls = []
     original = site.get
@@ -654,9 +657,10 @@ def test_geo_history_fixed_kst_dates():
         return original(url, **kw)
     site.get = get
     with patch.object(gw,'datetime',Clock):
-        assert crawler(site)._order_bare('A',5).success
-    assert Clock.calls == 1 and len(urls) == 4
-    assert all('dtpFrom=2026-10-02&dtpTo=2026-10-03&dateSel=1&categorySel=1&txtitem=' in u for u in urls)
+        r = crawler(site)._order_bare('A',3)
+    assert r.success and r.reason_code == 'ok'
+    assert len(urls) >= 2 and all('dtpFrom=2026-10-02&' in u and '&dateSel=1&categorySel=1&txtitem=' in u for u in urls)
+    assert 'dtpTo=2026-10-03&' in urls[0] and 'dtpTo=2026-10-04&' in urls[-1]
 
 @pytest.mark.parametrize('loss', ['account','claim'])
 def test_geo_final_cart_read_ownership_loss_prevents_send(loss):
@@ -773,14 +777,15 @@ import json
 from bs4 import BeautifulSoup as _bs
 
 _LIVE_ENV = os.environ.get("GEOWEB_LIVE_FIXTURES")
-LIVE = _LIVE_ENV or os.path.expanduser(
+LIVE = _LIVE_ENV if _LIVE_ENV is not None else os.path.expanduser(
     "~/.config/superpowers/worktrees/pharmsquare-server-main/order-resilience/prisma/seeds/domae-crawlers/"
     "fixtures/geoweb_live_20261004")
-live = pytest.mark.skipif(not _LIVE_ENV and not os.path.isdir(LIVE),
+live = pytest.mark.skipif(_LIVE_ENV is None and not os.path.isdir(LIVE),
                           reason="비공개 실측 픽스처 없음(GEOWEB_LIVE_FIXTURES 미지정)")
 
 
 def _live(name):
+    assert LIVE.strip(), "GEOWEB_LIVE_FIXTURES 가 빈 값 — 경로를 지정하거나 변수를 지우세요"
     with open(os.path.join(LIVE, name), encoding="utf-8") as f:
         return f.read()
 
@@ -792,9 +797,9 @@ def _expected():
 class LiveSite(Site):
     """실측 검색·상세 원문 + 실제 사이트처럼 상세 '재고수량' 은 요청 num 을 돌려준다.
     장바구니·주문내역은 Site 대역. 상세 원문이 없는 pid 는 404."""
-    def __init__(self, search_file='search_4rows.html', local=None, other=None):
+    def __init__(self, search_file=None, local=None, other=None):
         super().__init__(local or {}, other or {})
-        self.body, self.nums = _live(search_file), []
+        self.body, self.nums = _live(search_file or _expected()['files']['search_4rows']), []
 
     def post(self, url, data=None, **k):
         if url.endswith('PartialSearchProduct'):
@@ -819,7 +824,7 @@ def _live_crawler(site=None):
 
 @live
 def test_geo_live_empty_search_is_empty_not_error():
-    c, _ = _live_crawler(LiveSite('search_empty.html'))
+    c, _ = _live_crawler(LiveSite(_expected()['files']['search_empty']))
     assert c.search('없는품목') == []
 
 
@@ -1078,3 +1083,159 @@ def test_stopped_shortfall_is_not_described_as_stock_shortage():
     assert '재고 부족' in _quick_order_message('지오영', 'X', 5, stock, True)
     assert '재고 부족' not in cart_action_after_order({'quantity': 5}, stopped)[2]
     assert '재고 부족' in cart_action_after_order({'quantity': 5}, stock)[2]
+
+
+# ── 4차 검수 반영: 재고 확정 0·문구 분리·숨김 행·예외 뒤 stopped·재조회 경계 ─────
+
+def test_geo_confirmed_zero_other_with_detail_failure_is_stock_shortage_not_check_failure():
+    """검색 행이 타센터 0 을 확정하면 상세 실패여도 '확인 불가' 가 아니다 — 남은 수량은 재고 부족."""
+    site = Site({'A': 3}, {})
+    _detail_override(site, lambda r: setattr(r, 'status_code', 404))
+    c = crawler(site)
+    assert c._get_product_stocks('A') == (3, 0, '')
+    r = c._order_bare('A', 5)
+    assert site.sends == [{('A', ''): 3}] and r.reason_code == 'stock_adjusted'
+    assert r.shortfall_reason is None and r.available_stock == 3
+
+
+def test_geo_confirmed_zero_everywhere_with_detail_failure_is_stock_zero():
+    site = Site({'A': 0}, {})
+    _detail_override(site, lambda r: setattr(r, 'status_code', 404))
+    c = crawler(site)
+    assert c.presend_stock({'product_id': 'A'}) == 0
+    r = c._order_bare('A', 2)
+    assert r.reason_code == 'stock_zero' and site.sends == []
+
+
+def test_geo_stopped_message_splits_check_failure_and_stock_shortage():
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 2]]})
+    c = crawler(site)
+    calls = []
+    def guard():
+        calls.append(1)
+        if len(calls) == 3:                          # 2단계 첫 guard 에서 실패
+            raise RuntimeError('소유권 상실')
+    c.send_guard = guard
+    r = c._order_bare('A', 10)
+    assert site.sends == [{('A', ''): 3}]
+    assert r.success and r.fulfilled_quantity == 3 and r.shortfall_reason == 'stopped'
+    assert r.message == '남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
+    assert r.available_stock is None                  # 계획 시점 재고를 '재고 N' 으로 보이지 않는다
+
+
+def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 4]]})
+    _detail_override(site, lambda r: setattr(r, 'status_code', 500))
+    r = crawler(site)._order_bare('A', 10)
+    assert r.message == '남은 7개는 확인 실패로 주문 안 함' and r.available_stock is None
+
+
+@pytest.mark.parametrize('mark', ['style="display: none"', 'style="visibility:hidden"', 'hidden',
+                                  'class="row disabled"', 'input_disabled'])
+def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
+    site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
+    def fn(r):
+        if mark == 'input_disabled':
+            r.text = r.text.replace('<input data-code="c1"', '<input disabled data-code="c1"')
+        else:
+            r.text = r.text.replace('<tr style="" class="">', f'<tr {mark}>', 1)
+    _detail_override(site, fn)
+    c = crawler(site)
+    assert c._get_product_stocks('A') == (1, 0, '')
+    r = c._order_bare('A', 3)
+    assert site.sends == [{('A', ''): 1}] and r.shortfall_reason == 'stopped'
+
+
+def test_geo_hidden_zero_stock_popup_row_is_ignored():
+    site = Site({'A': 1}, {}, centers={'A': [['C0', 'c0', 0], ['C1', 'c1', 4]]})
+    _detail_override(site, lambda r: setattr(r, 'text', r.text.replace(
+        '<tr style="" class=""><td>C0', '<tr style="display:none"><td>C0', 1)))
+    assert crawler(site)._get_product_stocks('A') == (1, 4, 'c1')
+
+
+def test_geo_exception_after_accepted_stage_marks_stopped():
+    site = Site({'A': 2}, {}, centers={'A': [['C1', 'c1', 5]]})
+    c = crawler(site)
+    original, calls = c._stage, []
+    def stage(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError('전송 전 예외')
+        return original(*a, **k)
+    c._stage = stage
+    r = c._order_bare('A', 6)
+    assert site.sends == [{('A', ''): 2}]
+    assert r.success and r.fulfilled_quantity == 2 and r.shortfall_reason == 'stopped'
+    assert r.message == '남은 4개는 확인 실패로 주문 안 함'
+
+
+def _count_calls(site):
+    counts = {'search': 0, 'detail': 0}
+    original = site.post
+    def post(url, **kw):
+        if url.endswith('PartialSearchProduct'):
+            counts['search'] += 1
+        if 'PartialProductInfo/' in url:
+            counts['detail'] += 1
+        return original(url, **kw)
+    site.post = post
+    return counts
+
+
+def test_geo_mismatch_reread_is_bounded_and_remembers_once():
+    site = with_search(Site({'A': 2}, {}, centers={'A': [['C1', 'c1', 4]]}), search_html(stock='2', other='5'))
+    counts = _count_calls(site)
+    c = crawler(site)
+    remembered = []
+    original = c._remember
+    c._remember = lambda row, centers: (remembered.append(centers), original(row, centers))
+    c._order_listing({'product_id': 'A', 'insurance_code': CODES['A']})
+    assert counts == {'search': 2, 'detail': 2} and remembered == [None]
+
+
+def test_geo_mismatch_reread_target_vanished_is_not_sent():
+    site = Site({'A': 0}, {}, centers={'A': [['C1', 'c1', 5]]})
+    searches = []
+    original = site.post
+    def post(url, **kw):
+        if url.endswith('PartialSearchProduct'):
+            searches.append(1)
+            return Resp(search_html(stock='0', other='9') if len(searches) == 1 else EMPTY_SEARCH)
+        return original(url, **kw)
+    site.post = post
+    c = crawler(site)
+    assert c._order_bare('A', 2).reason_code == 'not_sent' and site.sends == [] and len(searches) == 2
+
+
+def test_geo_mismatch_reread_uses_second_local_stock():
+    site = Site({'A': 4}, {}, centers={'A': [['C1', 'c1', 5]]})
+    searches = []
+    original = site.post
+    def post(url, **kw):
+        if url.endswith('PartialSearchProduct'):
+            searches.append(1)
+            return Resp(search_html(stock='9', other='7') if len(searches) == 1 else search_html(stock='4', other='5'))
+        return original(url, **kw)
+    site.post = post
+    r = crawler(site)._order_bare('A', 6)
+    assert site.sends == [{('A', ''): 4}, {('A', 'c1'): 2}] and r.reason_code == 'ok'
+
+
+def test_batch_adjusted_line_wording():
+    from domae_mcp.cloud.scheduler import _adjusted_line
+    item = {'product_name': 'X'}
+    stopped = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=5)
+    stock = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 3)
+    line = _adjusted_line('지오영', item, 10, 3, stopped.available_stock, stopped)
+    assert line.endswith('요청 10 → 주문 3 (남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족)')
+    assert '재고 None' not in line
+    assert _adjusted_line('지오영', item, 10, 3, 3, stock).endswith('요청 10 → 주문 3 (재고 3)')
+
+
+def test_quick_order_and_cart_text_carry_split_message():
+    from domae_mcp.cloud.scheduler import _quick_order_message
+    from domae_mcp.cloud.fallback import cart_action_after_order
+    r = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=5)
+    assert _quick_order_message('지오영', 'X', 10, r, True).endswith(
+        '3개 주문 완료 (요청 10개, 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족)')
+    assert cart_action_after_order({'quantity': 10}, r)[2] == '3개만 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
