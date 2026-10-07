@@ -1551,15 +1551,9 @@ class CloudScheduler:
                 self._load_crawlers(conn)
 
             # 4. 도매상별 그룹핑 → 일괄 주문
-            success_count = 0
-            fail_count = 0
-            adjusted_count = 0          # 수량 자동 조정된 품목 수 (부분 재고)
-            missing_qty_total = 0       # 요청 - 실제 주문된 총 수량 (누락 수량)
-            success_lines = []          # 텔레그램 알림용 — 정상 성공
-            adjusted_lines = []         # 수량 조정 성공 (⚠️ 섹션)
-            missing_lines = []          # 재고 0 누락 (❌ 섹션)
-            fail_lines = []             # 기타 실패
-            unconfirmed_lines = []      # 전송 결과 확인 필요 (실패 아님)
+            # 집계·알림 줄(success_count, fail_count, adjusted_count=수량 자동 조정 품목 수,
+            # missing_qty_total=요청−실제 주문 누락 수량, success/adjusted/missing/fail/unconfirmed_lines)은
+            # 바깥 except 도 쓰므로 try 진입 전에 초기화했다.
             logged_in_crawlers = {}     # 도매상별 로그인 캐시
 
             # 4-1. 사전 검증 + 도매상별 그룹핑
@@ -1651,7 +1645,8 @@ class CloudScheduler:
                 # _sent_any 는 커밋 전에 True 가 되므로 전송 여부 판정에 쓰면 안 된다.
                 _send_committed = False
                 pending_supplier = {
-                    "name": supplier_name, "items": [it for _, it in group_items],
+                    # group_items 리스트 자체를 참조한다 — cart-sync 대조가 뒤에서 덧붙이는 편입 품목(함께 전송됨)도 포함.
+                    "name": supplier_name, "group": group_items,
                     "marks": {k: len(v) for k, v in (("success", success_lines), ("adjusted", adjusted_lines),
                                                      ("missing", missing_lines), ("fail", fail_lines),
                                                      ("unconfirmed", unconfirmed_lines))},
@@ -1945,8 +1940,10 @@ class CloudScheduler:
                     if unconfirmed_lines:
                         parts.append("")
                         parts.append(f"⚠ 전송 결과 확인 필요 {len(unconfirmed_lines)}건 "
-                                     "(실패 아님 — 도매몰 주문내역을 확인해 주세요)")
+                                     "(실패 아님 — 도매몰 주문내역 확인 전 재주문 금지)")
                         parts.extend(unconfirmed_lines[:10])
+                        if len(unconfirmed_lines) > 10:
+                            parts.append(f" ... 외 {len(unconfirmed_lines) - 10}건")
                     msg = "\n".join(parts)
                     Notifier.send_telegram(telegram_chat_id, msg)
                 except Exception as e:
@@ -1972,7 +1969,7 @@ class CloudScheduler:
                 success_count, fail_count, adjusted_count, missing_qty_total = pending_supplier["counts"]
                 unconfirmed_lines.extend(
                     f" · [{pending_supplier['name']}] {it.get('product_name', '')} ×{it.get('quantity', 1)}"
-                    for it in pending_supplier["items"])
+                    for _, it in pending_supplier["group"])
             try:
                 cur = conn.cursor()
                 # 서버가 만든 pending 주문행을 마감하지 않으면 success=null 로 영구 잔존한다.

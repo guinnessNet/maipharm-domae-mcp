@@ -397,3 +397,81 @@ def test_connection_loss_during_result_recording_still_notifies_check(env, monke
     assert '주문 10' not in text and '장바구니에 남김' not in text
     order, cart, batch = env.read()
     assert order[:2] == (None, 'send_unknown') and cart[0] == 15
+
+
+def _q(env, sql, args=()):
+    conn = env.pool.getconn()
+    try:
+        cur = conn.cursor(); cur.execute(sql, args)
+        rows = cur.fetchall() if cur.description else None
+        conn.commit(); return rows
+    finally:
+        env.pool.putconn(conn)
+
+
+def test_batch_order_rollback_reports_cart_sync_absorbed_items(env, monkeypatch):
+    """cart-sync 대조로 편입돼 함께 전송된 품목도 롤백 시 '전송 결과 확인 필요'에 포함된다."""
+    from domae_mcp.cloud.reconcile import ReconcileResult
+    mid = _q(env, 'SELECT "monitorId" FROM domae_order_batches WHERE id=%s', ('batch',))[0][0]
+    _q(env, '''INSERT INTO domae_cart_items (id,"monitorId",supplier,"productName",quantity,"productId")
+              VALUES ('cartQ',%s,'인천','편입약',3,'Q')''', (mid,))
+    Crawler = env.scheduler._crawlers['인천']
+    monkeypatch.setattr(sch, '_acquire_cart_lock', lambda *a, **k: 'tok')
+    monkeypatch.setattr(sch, '_renew_cart_lock', lambda *a, **k: True)
+    monkeypatch.setattr(sch, '_release_cart_lock', lambda *a, **k: None)
+    monkeypatch.setattr(Crawler, 'SUPPORTS_CART_SYNC', True, raising=False)
+    monkeypatch.setattr(Crawler, 'order_batch', lambda self, items: [
+        OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10), OrderResult(success=True)], raising=False)
+    monkeypatch.setattr(sch, 'reconcile_cart', lambda *a, **k: ReconcileResult(web_items=[
+        {'product_id': 'P', 'quantity': 15, 'product_name': '약품', 'cart_item_id': 'cart'},
+        {'product_id': 'Q', 'quantity': 3, 'product_name': '편입약', 'cart_item_id': 'cartQ'}]))
+    monkeypatch.setattr(sch, 'cart_action_after_order', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db down')))
+    env.run('batch_order')
+    rows = _q(env, 'SELECT "productId",success,"reasonCode" FROM domae_cloud_orders ORDER BY "productId"')
+    text = ' '.join(str(n) for n in env.notices)
+    assert ('Q', None, 'send_unknown') in rows
+    assert '전송 결과 확인 필요 2건' in text and '[인천] 편입약 ×3' in text and '[인천] 약품 ×15' in text
+    assert '주문 10' not in text
+
+
+class _Second:
+    def login(self, *a): return True
+    def search(self, k): return []
+    def order_batch(self, items):
+        return [OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=4) for _ in items]
+
+
+@pytest.mark.parametrize('failure', ['exception', 'connection_loss'])
+def test_batch_order_keeps_committed_supplier_and_checks_rolled_back_one(env, monkeypatch, failure):
+    """앞 공급사 결과는 커밋돼 그대로 알리고, 뒤 공급사만 '확인 필요'로 바꾼다(연결 끊김 포함, 풀 누수 없음)."""
+    env.state['first'] = OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10)
+    mid = _q(env, 'SELECT "monitorId" FROM domae_order_batches WHERE id=%s', ('batch',))[0][0]
+    _q(env, '''INSERT INTO domae_cloud_orders (id,"monitorId","batchId",supplier,"productName",quantity,"productId")
+              VALUES ('order2',%s,'batch','백제','약품B',8,'PB')''', (mid,))
+    _q(env, '''INSERT INTO domae_cart_items (id,"monitorId",supplier,"productName",quantity,"productId")
+              VALUES ('cart2',%s,'백제','약품B',8,'PB')''', (mid,))
+    env.scheduler._crawlers['백제'] = _Second
+    if failure == 'exception':
+        orig = sch.cart_action_after_order
+        def hook(item, result):
+            if item.get('supplier') == '백제':
+                raise RuntimeError('boom on 백제')
+            return orig(item, result)
+        monkeypatch.setattr(sch, 'cart_action_after_order', hook)
+    else:
+        orig = sch._record_order_result
+        def hook(cur, monitor_id, batch_id, supplier, *a, **k):
+            if supplier == '백제':
+                cur.execute('SELECT pg_terminate_backend(pg_backend_pid())')
+            return orig(cur, monitor_id, batch_id, supplier, *a, **k)
+        monkeypatch.setattr(sch, '_record_order_result', hook)
+    item1 = {'supplier': '인천', 'product_id': 'P', 'product_name': '약품', 'quantity': 15,
+             'price': 700, 'db_order_id': 'order', 'cart_item_id': 'cart'}
+    item2 = {'supplier': '백제', 'product_id': 'PB', 'product_name': '약품B', 'quantity': 8,
+             'price': 100, 'db_order_id': 'order2', 'cart_item_id': 'cart2'}
+    env.scheduler.batch_order({'monitor_id': mid, 'batch_id': 'batch', 'items': [item1, item2]})
+    text = ' '.join(str(n) for n in env.notices)
+    assert '[인천] 약품 — 요청 15 → 주문 10' in text
+    assert '요청 8 → 주문 4' not in text and '[백제] 약품B ×8' in text and '재주문 금지' in text
+    assert _q(env, 'SELECT "reasonCode" FROM domae_cloud_orders WHERE id=%s', ('order2',))[0][0] == 'send_unknown'
+    assert not env.pool._used
