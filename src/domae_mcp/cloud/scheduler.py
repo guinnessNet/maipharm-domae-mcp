@@ -22,7 +22,7 @@ import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, checked_qty, confirmed_quantity, _as_unknown_if_unspecified
 from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
-from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, auto_fallback_need, auto_order_shortfall_counts, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail, unsent_qty)
+from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, apply_fallback_to_success_items, auto_fallback_need, auto_order_shortfall_counts, cart_action_after_fallback, left_in_cart_qty, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail, unsent_qty)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 from domae_mcp.cloud.notifier import Notifier
@@ -2194,7 +2194,7 @@ class CloudScheduler:
                     success_items.append({**item, "quantity": got, "requested_quantity": req,
                                           "retried": bool(getattr(result, "retried", False)),
                                           "shortfall_detail": stopped_detail(result) if is_stopped(result) else None,
-                                          "unsent_quantity": unsent_qty(item, result)})
+                                          "unsent_quantity": unsent_qty(item, result), "_src": item})
                 elif unconfirmed:
                     unconfirmed_items.append(item)
                 else:
@@ -2276,12 +2276,15 @@ class CloudScheduler:
                     if fconn is not None:
                         self._db_pool.putconn(fconn)
 
+            # 대체주문으로 채운 수량은 '장바구니에 남김'·부분 완료로 알리지 않는다(약사 재주문 → 과다 주문 방지).
+            apply_fallback_to_success_items(success_items, fallback_outcomes)
+
             # 6-1. 배치 마감 — 원 주문·대체주문 행 기준 재집계. 미확정이 남으면 processing.
             _close_batch(cur, batch_id, "completed")
             conn.commit()
 
             # 7. DomaeAutoOrderLog 상태 업데이트. 미확정은 실패가 아니라 '확인 필요'다.
-            has_shortfall = any(i["requested_quantity"] > i["quantity"] for i in success_items)
+            has_shortfall = any(left_in_cart_qty(i) > 0 for i in success_items)
             needs_check = bool(unconfirmed_items) or any(
                 o.state in NEEDS_CHECK_STATES for o in fallback_outcomes)
             if fail_count == 0 and not has_shortfall:
@@ -2301,6 +2304,7 @@ class CloudScheduler:
                 )
 
             # 9. SSE 결과 알림 (Redis publish)
+            shortfall_qty, unsent_total = auto_order_shortfall_counts(success_items)
             try:
                 self._redis.publish(f"domae:notifications:{monitor_id}", json.dumps({
                     "type": "auto_order_result",
@@ -2308,8 +2312,8 @@ class CloudScheduler:
                     "status": log_status,
                     "count": len(success_items),
                     "totalPrice": sum((i.get("price") or 0) * int(i.get("quantity", 0)) for i in success_items),
-                    "shortfall": auto_order_shortfall_counts(success_items)[0],
-                    "unsent": auto_order_shortfall_counts(success_items)[1],
+                    "shortfall": shortfall_qty,
+                    "unsent": unsent_total,
                     "unconfirmed": len(unconfirmed_items),
                     "fallbackOrdered": sum(1 for o in fallback_outcomes if o.state == "ordered"),
                 }))
@@ -2390,7 +2394,7 @@ class CloudScheduler:
                     if row:
                         keyboard.append(row)
             # 미확정은 실패가 아니다 — 확정 실패·부족분이 없으면 '확인 필요'로만 알린다
-            partial = bool(failed_items or any(i.get("requested_quantity", i.get("quantity", 0)) > i.get("quantity", 0) for i in success_items))
+            partial = bool(failed_items or any(left_in_cart_qty(i) > 0 for i in success_items))
             needs_check = bool(unconfirmed_items) or any(o.state in NEEDS_CHECK_STATES for o in fallback_outcomes)
             if partial:
                 title = "⚠️ 자동주문 부분 완료" if success_items else "❌ 자동주문 실패"
@@ -2592,8 +2596,12 @@ class CloudScheduler:
             self._notify_unknown(chat_id,message_id,original_text,supplier,product_name,result,quantity)
         elif db_ok:
             total = f"\n주문금액 {price * confirmed:,}원" if price else ""
+            left = ""
+            if confirmed < quantity:                       # 인라인 버튼 주문은 장바구니에 남기지 않는다
+                why = stopped_detail(result) if is_stopped(result) else f"부족 {quantity - confirmed}개는 재고 부족"
+                left = f" (요청 {quantity}개, {why} — 남은 수량은 다시 주문해야 합니다)"
             self._notify_callback(chat_id,message_id,original_text,
-                                  f"✅ [{supplier}] {product_name} {confirmed}개 주문 완료{_retry_tag(result)}{total}")
+                                  f"✅ [{supplier}] {product_name} {confirmed}개 주문 완료{left}{_retry_tag(result)}{total}")
         else:
             buttons = None
             if result.reason_code in ("not_sent", "stock_zero"):

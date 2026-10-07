@@ -263,3 +263,24 @@ def test_auto_order_mixed_stopped_keeps_all_in_cart_and_splits_counts(env):
     assert '남은 3개는 확인 실패로 주문 안 함, 2개는 재고 부족' in cart[1]
     sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
     assert sse['unsent'] == 3 and sse['shortfall'] == 2
+
+
+@pytest.mark.parametrize('filled', [5, 3])
+def test_auto_order_fallback_filled_shortage_is_not_reported_as_left_in_cart(env, monkeypatch, filled):
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    monkeypatch.setattr(sch, 'run_fallback', lambda needs, *a, **k: [
+        FallbackOutcome(item, need, '백제', filled, 'ordered', '') for item, need in needs])
+    run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    text = ' '.join(str(n) for n in env.notices)
+    assert sse['fallbackOrdered'] == 1 and sse['shortfall'] == 5 - filled and sse['unsent'] == 0
+    if filled == 5:
+        assert sse['status'] in ('success', 'unconfirmed')
+        assert '부족 5개 중 백제에 5개 대체주문)' in text and '장바구니에 남김' not in text
+        assert env.read()[1] is None                             # 장바구니 행 삭제
+    else:
+        assert sse['status'] == 'partial_fail'
+        assert '부족 5개 중 백제에 3개 대체주문, 2개는 장바구니에 남김)' in text
+        assert env.read()[1][0] == 2

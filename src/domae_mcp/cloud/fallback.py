@@ -91,14 +91,30 @@ def auto_fallback_need(item: dict, result, enabled: bool) -> int:
     return fallback_need_qty(item, result) if enabled and not is_stopped(result) else 0
 
 
+def left_in_cart_qty(item: dict) -> int:
+    """자동주문 성공 품목에서 대체주문 뒤에도 장바구니에 남은 수량(요청 − 주문 − 대체주문 접수)."""
+    missing = max(int(item.get("requested_quantity", 0)) - int(item.get("quantity", 0)), 0)
+    return max(missing - int(item.get("fallback_quantity") or 0), 0)
+
+
+def apply_fallback_to_success_items(success_items: list, outcomes: list) -> None:
+    """대체주문으로 접수된 수량을 원 품목(_src 동일 객체)에 fallback_quantity·fallback_supplier 로 붙인다."""
+    for it in success_items:
+        src = it.get("_src")
+        done = [o for o in outcomes if o.item is src and o.state == "ordered" and o.ordered_qty > 0]
+        it["fallback_quantity"] = sum(o.ordered_qty for o in done)
+        it["fallback_supplier"] = ", ".join(dict.fromkeys(o.supplier for o in done if o.supplier)) or None
+
+
 def auto_order_shortfall_counts(success_items: list) -> tuple:
-    """자동주문 알림용 (재고 부족으로 덜 주문된 수량, 확인 실패로 보내지 않은 수량)."""
+    """자동주문 알림용 (재고 부족으로 장바구니에 남은 수량, 확인 실패로 보내지 않은 수량).
+    대체주문으로 접수된 수량은 어느 쪽에도 넣지 않는다."""
     short = unsent = 0
     for it in success_items:
-        missing = max(int(it.get("requested_quantity", 0)) - int(it.get("quantity", 0)), 0)
-        u = min(int(it.get("unsent_quantity") or 0), missing)
+        left = left_in_cart_qty(it)
+        u = min(int(it.get("unsent_quantity") or 0), left)
         unsent += u
-        short += missing - u
+        short += left - u
     return short, unsent
 
 
@@ -302,8 +318,13 @@ def format_ordered_line(item: dict) -> str:
     req = int(item.get("requested_quantity") or qty)
     total = (item.get("price") or 0) * qty
     line = f"• {item.get('product_name', '')} — {qty}개 — {total:,}원"
+    fb = int(item.get("fallback_quantity") or 0)
+    left = left_in_cart_qty(item)
     if req > qty and item.get("shortfall_detail"):
         line += f" (요청 {req}개 — {item['shortfall_detail']}, 장바구니에 남김)"
+    elif req > qty and fb:
+        moved = f"{item.get('fallback_supplier') or '다른 도매'}에 {fb}개 대체주문"
+        line += f" (요청 {req}개, 부족 {req - qty}개 중 {moved}" + (f", {left}개는 장바구니에 남김)" if left else ")")
     elif req > qty:
         line += f" (요청 {req}개, 부족 {req - qty}개는 장바구니에 남김)"
     if item.get("retried"):

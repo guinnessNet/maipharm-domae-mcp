@@ -319,3 +319,20 @@ def test_failed_fulfillment_evidence_blocks_alternatives(env, monkeypatch, reaso
     assert not searches and not buttons(env)
     env.run()
     assert len(env.calls) == 1 and not searches
+
+
+def test_partial_callback_order_names_the_remainder(env):
+    r = OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=3, fulfilled_quantity=3,
+                    message='3개 주문 — 남은 2개는 확인 실패로 주문 안 함')
+    r.shortfall_reason = 'stopped'
+    env.state['result'] = r
+    env.run()
+    text = env.sent[-1]['text']
+    assert '3개 주문 완료 (요청 5개, 남은 2개는 확인 실패로 주문 안 함 — 남은 수량은 다시 주문해야 합니다)' in text
+    assert '재고 부족' not in text
+
+
+def test_partial_callback_order_stock_shortage(env):
+    env.state['result'] = OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=3)
+    env.run()
+    assert '3개 주문 완료 (요청 5개, 부족 2개는 재고 부족 — 남은 수량은 다시 주문해야 합니다)' in env.sent[-1]['text']

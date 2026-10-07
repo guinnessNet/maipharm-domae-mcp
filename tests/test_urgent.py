@@ -192,3 +192,12 @@ def test_claim_failure_propagates_without_order():
     with pytest.raises(RuntimeError):
         urgent_supplier_step(c, "P", ["k"], 5, before_send=boom)
     assert c.orders == []
+
+
+def test_stopped_partial_fill_passes_remainder_to_next_supplier():
+    """사용자 정책 4(2026-10-07): 긴급주문은 확인 실패로 남긴 수량도 다음 도매로 넘긴다(그 도매에 보내지 않은 수량)."""
+    r = OrderResult(success=True, reason_code="stock_adjusted", adjusted_quantity=3, fulfilled_quantity=3,
+                    message="3개 주문 — 남은 7개는 확인 실패로 주문 안 함")
+    r.shortfall_reason = "stopped"
+    s, calls = _step(Crawler({"k": [sr("P", 10)]}, r), need=10)
+    assert s.state == "filled" and s.qty == 3 and calls == ["claim"]

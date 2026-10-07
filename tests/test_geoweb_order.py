@@ -1123,6 +1123,7 @@ def test_geo_stopped_message_splits_check_failure_and_stock_shortage():
     assert r.success and r.fulfilled_quantity == 3 and r.shortfall_reason == 'stopped'
     assert r.message == '3개 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
     assert r.available_stock is None                  # 계획 시점 재고를 '재고 N' 으로 보이지 않는다
+    assert r.unsent_quantity == 2                     # 실제 주문 흐름에서도 재고 부족분을 뺀 미주문 수량
 
 
 def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
@@ -1137,7 +1138,10 @@ def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
                                   'input_readonly', 'input_hidden_type', 'td_hidden', 'button_disabled',
                                   'tbody_hidden', 'popup_hidden', 'no_add_button', 'input_style_hidden',
                                   'qty_span_hidden', 'name_span_hidden', 'td_opacity', 'tr_aria_hidden',
-                                  'input_aria_disabled', 'tr_extra_attr_class'])
+                                  'input_aria_disabled', 'tr_extra_attr_class', 'td_class_soldout', 'group_inert',
+                                  'add_pointer_events', 'td_opacity_important', 'td_opacity_percent', 'td_opacity_dot',
+                                  'td_visibility_collapse', 'fieldset_disabled', 'td_disabled_attr',
+                                  'add_with_plus_class_hidden'])
 def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
     def fn(r):
@@ -1165,6 +1169,23 @@ def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailabl
             r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="" aria-hidden="true">', 1)
         elif mark == 'input_aria_disabled':
             r.text = r.text.replace('<input data-code="c1" type="text"', '<input aria-disabled="true" data-code="c1" type="text"')
+        elif mark == 'td_class_soldout':
+            r.text = r.text.replace('<td>C1</td>', '<td class="soldout">C1</td>')
+        elif mark == 'group_inert':
+            r.text = r.text.replace('<div class="amount_group">', '<div class="amount_group" inert>', 1)
+        elif mark == 'add_pointer_events':
+            r.text = r.text.replace('class="btn_basic btn_darkBlue btn_tran_center_add">', 'class="btn_basic btn_darkBlue btn_tran_center_add" style="pointer-events:none">', 1)
+        elif mark in ('td_opacity_important', 'td_opacity_percent', 'td_opacity_dot'):
+            v = {'td_opacity_important': '0 !important', 'td_opacity_percent': '0%', 'td_opacity_dot': '.0'}[mark]
+            r.text = r.text.replace('<td>C1</td>', f'<td><span style="opacity:{v}">C1</span></td>')
+        elif mark == 'td_visibility_collapse':
+            r.text = r.text.replace('<td>C1</td>', '<td><span style="visibility: collapse">C1</span></td>')
+        elif mark == 'fieldset_disabled':
+            r.text = r.text.replace('<div class="amount_group">', '<fieldset disabled><div class="amount_group">', 1).replace('</div></td></tr>', '</div></fieldset></td></tr>', 1)
+        elif mark == 'td_disabled_attr':
+            r.text = r.text.replace('<td>C1</td>', '<td disabled>C1</td>')
+        elif mark == 'add_with_plus_class_hidden':
+            r.text = r.text.replace('class="btn_basic btn_darkBlue btn_tran_center_add">', 'class="btn_basic btn_plus btn_tran_center_add" style="display:none">', 1)
         elif mark == 'tr_extra_attr_class':
             r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="soldout">', 1)
         elif mark == 'tbody_hidden':
@@ -1315,6 +1336,20 @@ def test_auto_order_line_carries_stopped_detail():
     assert '부족 7개' in format_ordered_line({'product_name': 'X', 'quantity': 3, 'requested_quantity': 10, 'price': 1000})
 
 
+def test_geo_hidden_icon_inside_plus_button_does_not_block_other_centers():
+    site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
+    _detail_override(site, lambda r: setattr(r, 'text', r.text.replace(
+        'btn_tran_center_plus">+</button>', 'btn_tran_center_plus"><i class="hidden" aria-hidden="true"></i>+</button>', 1)))
+    assert crawler(site)._get_product_stocks('A') == (1, 4, 'c1')
+
+
+def test_geo_opacity_nonzero_is_not_hidden():
+    from bs4 import BeautifulSoup
+    for v in ('0.5', '1', '50%', '.5'):
+        node = BeautifulSoup(f'<span style="opacity:{v}">x</span>', 'html.parser').span
+        assert not gw.GeoWebCrawler._hidden_node(node), v
+
+
 def test_geo_disabled_plus_button_does_not_block_other_centers():
     """'증가' 버튼 상태는 보지 않는다 — 담기 버튼이 활성이면 타센터를 쓴다."""
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
@@ -1348,3 +1383,34 @@ def test_auto_fallback_policy_and_counts_without_db():
     items = [{'requested_quantity': 10, 'quantity': 3, 'unsent_quantity': 4},
              {'requested_quantity': 5, 'quantity': 2, 'unsent_quantity': 0}]
     assert auto_order_shortfall_counts(items) == (6, 4)
+
+
+def test_geo_live_all_stocked_popup_rows_pass_allowlist():
+    if not (_LIVE_ENV is not None or os.path.isdir(LIVE)):
+        pytest.skip('비공개 실측 픽스처 없음')
+    from bs4 import BeautifulSoup
+    E = _expected()
+    for pid in (E['roles']['multi_center'], E['roles']['other_only']):
+        centers = gw.GeoWebCrawler._centers(BeautifulSoup(_live(f'info_{pid}.html'), 'html.parser'))
+        assert sum(q for _, _, q in centers if q) == E['search_rows'][pid][1], pid
+
+
+def test_geo_runtime_guard_closes_order_path_on_old_worker_result():
+    """OrderResult 에 shortfall_reason·unsent_quantity 가 없는 구 워커에서는 새 seed 주문 경로가 닫힌다."""
+    import dataclasses
+    import domae_mcp.core.crawlers.base as base
+    original = base.OrderResult
+    for drop in ('unsent_quantity', 'shortfall_reason'):
+        fields = [(f.name, f.type, dataclasses.field(default=f.default)) for f in dataclasses.fields(original)
+                  if f.name != drop]
+        base.OrderResult = dataclasses.make_dataclass('OrderResult', fields)
+        try:
+            spec_old = importlib.util.spec_from_file_location(f"geoweb_old_{drop}", PATH)
+            old = importlib.util.module_from_spec(spec_old)
+            spec_old.loader.exec_module(old)
+            assert old._ORDER_RUNTIME_SAFE is False and old.GeoWebCrawler.URGENT_ORDER_SAFE is False
+            r = old.GeoWebCrawler().order('A', 1)
+            assert r.success is False and r.reason_code == 'not_sent'
+        finally:
+            base.OrderResult = original
+    assert gw._ORDER_RUNTIME_SAFE is True
