@@ -128,8 +128,9 @@ def auto_order_status(success_items: list, failed_items: list, unconfirmed_items
     남은 수량이 없으면 success(확인 필요가 있으면 unconfirmed), 남았는데 접수분이 있으면 partial_fail, 없으면 failed."""
     items = list(success_items) + list(failed_items)
     left_any = any(int(i.get("left_quantity", 0)) > 0 for i in items)
-    check_items = [i for i in items if int(i.get("check_quantity", 0)) > 0 or int(i.get("blocked_left", 0)) > 0]
-    needs_check = bool(unconfirmed_items) or bool(check_items)
+    check_items = [i for i in items if int(i.get("check_quantity", 0)) > 0]
+    blocked_items = [i for i in items if int(i.get("blocked_left", 0)) > 0]
+    needs_check = bool(unconfirmed_items) or bool(check_items) or bool(blocked_items)
     if not left_any:
         status = "unconfirmed" if needs_check else "success"
     elif any(int(i.get("ordered_now", 0)) + int(i.get("fallback_quantity", 0)) > 0 for i in items):
@@ -144,6 +145,9 @@ def auto_order_status(success_items: list, failed_items: list, unconfirmed_items
         "shortfall": sum(int(i.get("short_left", 0)) for i in items if i.get("origin_ok") or i.get("had_fallback")),
         "unsent": sum(int(i.get("unsent_left", 0)) for i in items if i.get("origin_ok") or i.get("had_fallback")),
         "fallback_unconfirmed": len(check_items),
+        # 이전 미확정 주문 때문에 대체주문을 보내지 않고 장바구니에 남긴 품목·수량(확인 필요와 다르다)
+        "fallback_blocked": len(blocked_items),
+        "fallback_blocked_qty": sum(int(i.get("blocked_left", 0)) for i in blocked_items),
         "failed_left": sum(1 for i in failed_items if int(i.get("left_quantity", 0)) > 0),
     }
 
@@ -259,15 +263,18 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
 
 
 def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, release_lock,
-                 record_pending, record_result, record_unconfirmed, check_unconfirmed=None) -> list:
+                 record_pending, record_result, record_unconfirmed, check_unconfirmed=None, outcomes=None) -> list:
     """check_unconfirmed(supplier, product_id) → None | "same_product" | "other_product".
 
     같은 약국·도매에 결과 미확정 주문이 있는지 전송(pending 생성) 전에 확인한다.
       same_product   그 품목의 대체주문을 멈춘다(blocked). 다음 순번으로도 넘기지 않는다.
       other_product  장바구니 전체를 보내는 도매(SUPPORTS_CART_SYNC)면 그 도매만 건너뛴다.
       확인 실패      그 도매는 건너뛴다(아무것도 보내지 않았으므로 안전).
+
+    outcomes 를 넘기면 결과를 그 리스트에 바로 쌓는다 — 도중에 예외가 나도 이미 접수된 대체주문 결과를
+    호출자가 잃지 않는다(잃으면 접수된 품목이 실패로 보이고 재주문 버튼이 떠 이중 주문이 된다).
     """
-    outcomes = []
+    outcomes = [] if outcomes is None else outcomes
     for item, need in needs:
         code = (item.get("insurance_code") or "").strip()
         if not _INS_CODE.match(code) or pack_signature(item.get("unit")) is None:
@@ -284,7 +291,11 @@ def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, rele
                 continue
             if not pick:
                 continue
-            token = acquire_lock(sup)
+            try:
+                token = acquire_lock(sup)
+            except Exception as e:                          # 락 저장소 장애는 전송 전 — 그 도매만 건너뛴다
+                logger.warning("대체주문 락 획득 오류 — %s 건너뜀: %s", sup, e)
+                continue
             if token is None:
                 logger.warning("대체주문 락 획득 실패 — %s 건너뜀", sup)
                 continue
@@ -305,7 +316,10 @@ def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, rele
                 outcome = _attempt(item, need, sup, pick, crawler, token, renew_lock,
                                    record_pending, record_result, record_unconfirmed)
             finally:
-                release_lock(sup, token)
+                try:
+                    release_lock(sup, token)
+                except Exception as e:
+                    logger.warning("대체주문 락 해제 오류 [%s]: %s", sup, e)
             if outcome is not None:
                 break
         outcomes.append(outcome or FallbackOutcome(item, need, None, 0, "failed",

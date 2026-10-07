@@ -2011,6 +2011,7 @@ class CloudScheduler:
         failed_items = []
         unconfirmed_items = []
         fallback_outcomes = []
+        send_committed = False   # 보호 커밋 성공 후에만 True (그 전 예외는 전송 전)
 
         try:
             cur = conn.cursor()
@@ -2226,6 +2227,7 @@ class CloudScheduler:
             fallback_outcomes = []
             if fallback_needs:
                 fconn = None
+                rec = None
                 try:
                     fconn = self._get_conn()
                     rec = FallbackRecorder(
@@ -2259,20 +2261,24 @@ class CloudScheduler:
                         if token and token != "nolock":
                             _release_cart_lock(self._redis, monitor_id, sup, token)
 
-                    fallback_outcomes = run_fallback(
+                    returned = run_fallback(
                         fallback_needs, candidates, _open, _lock, _renew, _unlock,
                         rec.pending, rec.result, rec.unconfirmed,
-                        check_unconfirmed=rec.check_unconfirmed)
-                    for o in fallback_outcomes:
-                        action, keep_qty, why = cart_action_after_fallback(o)
-                        try:
-                            rec.apply_cart(o.item.get("cart_item_id"), action, keep_qty, why)
-                        except Exception as e:
-                            logger.error("대체주문 장바구니 반영 실패 cart=%s: %s", o.item.get("cart_item_id"), e)
-                        logger.info("대체주문 %s: %s → %s (%s)", o.state, supplier_name, o.supplier or "-", o.message)
+                        check_unconfirmed=rec.check_unconfirmed, outcomes=fallback_outcomes)
+                    if returned is not None and returned is not fallback_outcomes:
+                        fallback_outcomes.extend(returned)
                 except Exception as e:
                     logger.error("대체주문 처리 실패 — 원 주문 결과에는 영향 없음: %s", e, exc_info=True)
                 finally:
+                    # 도중에 예외가 나도 이미 나온 대체주문 결과는 장바구니에 반영한다(접수분을 실패로 남기지 않는다).
+                    if rec is not None:
+                        for o in fallback_outcomes:
+                            action, keep_qty, why = cart_action_after_fallback(o)
+                            try:
+                                rec.apply_cart(o.item.get("cart_item_id"), action, keep_qty, why)
+                            except Exception as e:
+                                logger.error("대체주문 장바구니 반영 실패 cart=%s: %s", o.item.get("cart_item_id"), e)
+                            logger.info("대체주문 %s: %s → %s (%s)", o.state, supplier_name, o.supplier or "-", o.message)
                     if fconn is not None:
                         self._db_pool.putconn(fconn)
 
@@ -2308,6 +2314,8 @@ class CloudScheduler:
                     "shortfall": summary["shortfall"],
                     "unsent": summary["unsent"],
                     "fallbackUnconfirmed": summary["fallback_unconfirmed"],
+                    "fallbackBlocked": summary["fallback_blocked"],
+                    "fallbackBlockedQty": summary["fallback_blocked_qty"],
                     "unconfirmed": len(unconfirmed_items),
                     "fallbackOrdered": sum(1 for o in fallback_outcomes if o.state == "ordered"),
                 }))
@@ -2329,12 +2337,18 @@ class CloudScheduler:
             except Exception:
                 pass
             self._update_auto_order_log(conn, monitor_id, batch_id, "failed", str(e)[:200])
+            # 전송 뒤 결과 처리 중 예외: 아직 분류하지 못한 품목은 접수됐을 수 있다 — '전송 결과 확인 필요'로 알린다.
+            if send_committed:
+                seen = ({id(i.get("_src", i)) for i in [*success_items, *failed_items]}
+                        | {id(i) for i in unconfirmed_items})
+                unconfirmed_items.extend(i for i in items if id(i) not in seen)
             # 부분 성공이라도 텔레그램 알림
             if telegram_chat_id and (success_items or failed_items or unconfirmed_items):
                 self._send_auto_order_telegram(
                     telegram_chat_id, supplier_name, success_items, failed_items,
                     conn=conn, monitor_id=monitor_id, credentials=credentials,
                     scheduled_at=scheduled_at, unconfirmed_items=unconfirmed_items, fallback_outcomes=fallback_outcomes,
+                    interrupted=True,
                 )
         finally:
             self._db_pool.putconn(conn)
@@ -2360,7 +2374,8 @@ class CloudScheduler:
     def _send_auto_order_telegram(self, chat_id: str, supplier: str, success_items: list,
                                   failed_items: list, global_error: str = None,
                                   conn=None, monitor_id: str = None, credentials: dict = None,
-                                  scheduled_at: str = "", unconfirmed_items=None, fallback_outcomes=None):
+                                  scheduled_at: str = "", unconfirmed_items=None, fallback_outcomes=None,
+                                  interrupted: bool = False):
         """실제 주문 수량과 미확정 결과를 알린다. 미확정 품목에는 재주문 버튼을 제공하지 않는다."""
         try:
             from domae_mcp.cloud.notifier import Notifier
@@ -2394,6 +2409,8 @@ class CloudScheduler:
             summary = auto_order_status(success_items, failed_items, unconfirmed_items)
             title = {"failed": "❌ 자동주문 실패", "partial_fail": "⚠️ 자동주문 부분 완료",
                      "unconfirmed": "⚠️ 자동주문 결과 확인 필요"}.get(summary["status"], "✅ 자동주문 완료")
+            if interrupted and summary["status"] in ("success", "unconfirmed"):
+                title = "⚠️ 자동주문 처리 중 오류 — 결과 확인 필요"      # 결과 처리가 끊긴 실행은 완료로 알리지 않는다
             lines = [f"{title} ({supplier}, {now_str})\n"]
             if success_items:
                 lines.append("✅ 성공:")

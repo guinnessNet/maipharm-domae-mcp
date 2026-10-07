@@ -312,3 +312,44 @@ def test_auto_order_unconfirmed_fallback_is_not_reported_as_left_in_cart(env, mo
     assert sse['status'] == 'unconfirmed' and sse['shortfall'] == 0 and sse['fallbackUnconfirmed'] == 1
     assert '백제 대체주문 5개 결과 확인 필요 — 도매몰 주문내역 확인 전 재주문 금지' in text
     assert '장바구니에 남김' not in text and '자동주문 부분 완료' not in text
+
+
+def test_auto_order_fallback_exception_keeps_accepted_fallback_and_cart(env, monkeypatch):
+    """대체주문 도중 예외가 나도 이미 접수된 대체주문 결과는 장바구니·알림에 반영된다(실패·재주문 버튼 금지)."""
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    def boom(needs, *a, outcomes=None, **k):
+        item, need = needs[0]
+        outcomes.append(FallbackOutcome(item, need, '백제', need, 'ordered', ''))
+        raise ConnectionError('redis down')
+    monkeypatch.setattr(sch, 'run_fallback', boom)
+    run_reported_result(env, 'auto_order', OrderResult(reason_code='stock_zero', adjusted_quantity=0))
+    text = ' '.join(str(n) for n in env.notices)
+    assert env.read()[1] is None                               # 접수분 반영 → 장바구니 행 삭제
+    assert '자동주문 실패' not in text and '백제 15개 주문 완료' in text and "'inline_keyboard'" not in text
+
+
+def test_auto_order_blocked_fallback_sse_is_not_unconfirmed(env, monkeypatch):
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    monkeypatch.setattr(sch, 'run_fallback', lambda needs, *a, outcomes=None, **k: outcomes.extend(
+        FallbackOutcome(item, need, '백제', 0, 'blocked', '') for item, need in needs) or outcomes)
+    run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    assert sse['fallbackUnconfirmed'] == 0 and sse['fallbackBlocked'] == 1 and sse['fallbackBlockedQty'] == 5
+
+
+def test_auto_order_midloop_exception_reports_unprocessed_sent_items_as_check(env, monkeypatch):
+    """전송 뒤 결과 기록 중 예외: 남은 품목은 '전송 결과 확인 필요', 제목은 완료가 아니다."""
+    calls = {'n': 0}
+    original = sch._record_order_result
+    def flaky(*a, **k):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('db down')
+        return original(*a, **k)
+    monkeypatch.setattr(sch, '_record_order_result', flaky)
+    run_reported_result(env, 'auto_order', OrderResult(success=True))
+    text = ' '.join(str(n) for n in env.notices)
+    assert '✅ 자동주문 완료' not in text
+    assert '전송 결과 확인 필요' in text and '약품 15개' in text

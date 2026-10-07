@@ -269,3 +269,52 @@ def test_unknown_preserves_confirmed_part():
         lambda *a: 'row', lambda *a: None,
         lambda row, message, confirmed=None: recorded.append(confirmed))
     assert out[0].ordered_qty == 3 and recorded == [3]
+
+
+def _two_items_run(acquire_lock, release_lock=lambda s, t: None, outcomes=None):
+    a = dict(ITEM, product_name="A")
+    b = dict(ITEM, product_name="B")
+    out = run_fallback(
+        [(a, 5), (b, 5)], ["복산"],
+        open_crawler=lambda s: _ok("복산"),
+        acquire_lock=acquire_lock, renew_lock=lambda s, t: True, release_lock=release_lock,
+        record_pending=lambda it, s, p, q: "row", record_result=lambda *a: None,
+        record_unconfirmed=lambda *a, **k: None, outcomes=outcomes)
+    return a, b, out
+
+
+def test_lock_store_error_skips_supplier_without_losing_earlier_outcomes():
+    calls = []
+    def lock(s):
+        calls.append(s)
+        if len(calls) == 2:
+            raise ConnectionError("redis down")
+        return "tok"
+    collected = []
+    a, b, out = _two_items_run(lock, outcomes=collected)
+    assert out is collected
+    assert [(o.item["product_name"], o.state) for o in out] == [("A", "ordered"), ("B", "failed")]
+
+
+def test_release_error_does_not_drop_outcome():
+    def release(s, t):
+        raise ConnectionError("redis down")
+    a, b, out = _two_items_run(lambda s: "tok", release)
+    assert [o.state for o in out] == ["ordered", "ordered"]
+
+
+def test_outcomes_list_keeps_results_when_run_fallback_raises():
+    collected = []
+    calls = []
+    def open_crawler(s):
+        calls.append(s)
+        if len(calls) == 2:
+            raise KeyboardInterrupt  # 예상 밖 예외(Exception 밖)로 run_fallback 이 중단되는 경우
+        return _ok("복산")
+    a = dict(ITEM, product_name="A"); b = dict(ITEM, product_name="B")
+    with pytest.raises(KeyboardInterrupt):
+        run_fallback([(a, 5), (b, 5)], ["복산"], open_crawler=open_crawler,
+                     acquire_lock=lambda s: "tok", renew_lock=lambda s, t: True, release_lock=lambda s, t: None,
+                     record_pending=lambda *x: "row", record_result=lambda *x: None,
+                     record_unconfirmed=lambda *x, **k: None, outcomes=collected)
+    assert [(o.item["product_name"], o.state) for o in collected] == [("A", "ordered")]

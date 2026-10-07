@@ -1142,7 +1142,8 @@ def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
                                   'add_pointer_events', 'td_opacity_important', 'td_opacity_percent', 'td_opacity_dot',
                                   'td_visibility_collapse', 'fieldset_disabled', 'td_disabled_attr',
                                   'add_with_plus_class_hidden', 'opacity_twice', 'filter_opacity', 'font_size_zero',
-                                  'name_child_soldout', 'add_faint', 'add_nested_in_plus', 'tr_data_attr'])
+                                  'name_child_soldout', 'add_faint', 'add_nested_in_plus', 'tr_data_attr',
+                                  'opacity_sci', 'font_size_vw', 'font_size_calc'])
 def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
     def fn(r):
@@ -1200,6 +1201,9 @@ def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailabl
         elif mark == 'add_nested_in_plus':
             r.text = (r.text.replace('<button type="button" class="btn_basic btn_darkBlue btn_tran_center_add">담기</button>', '', 1)
                       .replace('btn_tran_center_plus">+</button>', 'btn_tran_center_plus">+<button class="btn_tran_center_add" style="display:none">담기</button></button>', 1))
+        elif mark in ('opacity_sci', 'font_size_vw', 'font_size_calc'):
+            st = {'opacity_sci': 'opacity:1e-3', 'font_size_vw': 'font-size:0vw', 'font_size_calc': 'font-size:calc(0px)'}[mark]
+            r.text = r.text.replace('<div class="amount_group">', f'<div class="amount_group"><span style="{st}">x</span>', 1)
         elif mark == 'tr_data_attr':
             r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="" data-soldout="1">', 1)
         elif mark == 'tr_extra_attr_class':
@@ -1517,7 +1521,8 @@ def test_telegram_blocked_fallback_is_not_called_unconfirmed_order(monkeypatch):
     outs = [_fo(src, 4, '백제', 0, 'blocked')]
     summarize_auto_order(ok, [], outs)
     st = auto_order_status(ok, [], [])
-    assert st['status'] == 'partial_fail' and st['shortfall'] == 0 and st['fallback_unconfirmed'] == 1
+    assert st['status'] == 'partial_fail' and st['shortfall'] == 0
+    assert (st['fallback_unconfirmed'], st['fallback_blocked'], st['fallback_blocked_qty']) == (0, 1, 4)
     line = format_ordered_line(ok[0])
     assert '결과 확인 필요' not in line and '4개는 백제에 이전 미확정 주문이 있어 보내지 않음' in line
     text = _telegram(monkeypatch, ok, [], outs)
