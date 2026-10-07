@@ -368,3 +368,32 @@ def test_auto_order_exception_after_classification_reports_all_as_check_matching
     assert '처리 중 오류 — 결과 확인 필요' in text
     assert '전송 결과 확인 필요 (도매몰 주문내역 확인 전 재주문 금지)' in text and '약품 15개' in text
     assert '장바구니에 남김' not in text and '주문 완료' not in text and "'inline_keyboard'" not in text
+
+
+def test_batch_order_exception_after_classification_reports_supplier_as_check(env, monkeypatch):
+    """일괄주문도 공급사 결과가 커밋 전에 되돌려지면 그 공급사 품목을 처리된 것처럼 알리지 않는다."""
+    def boom(*a, **k):
+        raise RuntimeError('db down after classification')
+    monkeypatch.setattr(sch, 'cart_action_after_order', boom)
+    run_reported_result(env, 'batch_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    order, cart, batch = env.read()
+    text = ' '.join(str(n) for n in env.notices)
+    assert order[:2] == (None, 'send_unknown') and cart[0] == 15
+    assert '요청 15 → 주문 10' not in text and '주문 누락' not in text
+    assert '전송 결과 확인 필요 1건' in text and '도매몰 주문내역 확인 전 재주문 금지' in text and '[인천] 약품 ×15' in text
+
+
+@pytest.mark.parametrize('path', ['auto_order', 'batch_order'])
+def test_connection_loss_during_result_recording_still_notifies_check(env, monkeypatch, path):
+    """결과 기록 중 DB 연결이 실제로 끊겨 rollback 도 실패해도 '전송 결과 확인 필요' 알림은 나간다."""
+    original = sch._record_order_result
+    def kill(cur, *a, **k):
+        cur.execute('SELECT pg_terminate_backend(pg_backend_pid())')   # 전송 뒤 첫 결과 기록에서 연결을 끊는다
+        return original(cur, *a, **k)
+    monkeypatch.setattr(sch, '_record_order_result', kill)
+    run_reported_result(env, path, OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    text = ' '.join(str(n) for n in env.notices)
+    assert '전송 결과 확인 필요' in text and '재주문 금지' in text
+    assert '주문 10' not in text and '장바구니에 남김' not in text
+    order, cart, batch = env.read()
+    assert order[:2] == (None, 'send_unknown') and cart[0] == 15

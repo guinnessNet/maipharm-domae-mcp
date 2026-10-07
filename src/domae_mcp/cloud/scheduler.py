@@ -1494,6 +1494,13 @@ class CloudScheduler:
 
         conn = self._get_conn()
         cart_locks = {}   # 바깥 finally 에서 해제하려면 try 진입 전에 있어야 한다
+        # 바깥 except 가 참조하는 값은 try 진입 전에 둔다(초기 예외에서도 NameError 없이 알림 판단).
+        telegram_chat_id = None
+        success_count = fail_count = adjusted_count = missing_qty_total = 0
+        success_lines, adjusted_lines, missing_lines, fail_lines, unconfirmed_lines = [], [], [], [], []
+        # 현재 공급사의 결과가 아직 커밋되지 않았다면 그 공급사 처리 시작 시점의 알림 상태.
+        # 롤백되면 그 뒤에 쌓은 줄은 DB·장바구니와 어긋난다(§16 과 같은 이중 주문 경로).
+        pending_supplier = None
         try:
             cur = conn.cursor()
 
@@ -1643,6 +1650,14 @@ class CloudScheduler:
                 # 보호 커밋(_mark_sending)이 성공한 뒤에만 True — 그 전 예외는 전송 전이다.
                 # _sent_any 는 커밋 전에 True 가 되므로 전송 여부 판정에 쓰면 안 된다.
                 _send_committed = False
+                pending_supplier = {
+                    "name": supplier_name, "items": [it for _, it in group_items],
+                    "marks": {k: len(v) for k, v in (("success", success_lines), ("adjusted", adjusted_lines),
+                                                     ("missing", missing_lines), ("fail", fail_lines),
+                                                     ("unconfirmed", unconfirmed_lines))},
+                    "counts": (success_count, fail_count, adjusted_count, missing_qty_total),
+                    "sent": lambda: _send_committed,
+                }
 
                 if supplier_name not in logged_in_crawlers:
                     crawler = crawler_cls()
@@ -1874,6 +1889,7 @@ class CloudScheduler:
 
                 # 각 supplier 처리 후 부분 커밋 (row 기록만 확정)
                 conn.commit()
+                pending_supplier = None   # 이 공급사의 결과·장바구니 반영이 확정됐다
 
                 time.sleep(1)  # 도매상 간 딜레이
 
@@ -1939,8 +1955,24 @@ class CloudScheduler:
             logger.info("batch_order 완료: batch=%s success=%d fail=%d", batch_id, success_count, fail_count)
 
         except Exception as e:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception as rb:                       # 연결이 끊겼어도 알림 판단·발송은 계속한다
+                logger.error("batch_order 롤백 실패 [%s]: %s", batch_id, rb)
             logger.error("batch_order 실패 [%s]: %s", batch_id, e, exc_info=True)
+            if pending_supplier is not None and pending_supplier["sent"]():
+                # 전송한 공급사의 결과 기록이 커밋 전에 되돌려졌다 — DB·장바구니는 전송 직전 표시
+                # ('전송 결과 확인 중', 전체 수량)다. 그 공급사 줄을 처리된 것처럼 보내지 않고 전 품목을
+                # 확인 필요로 바꾼다(장바구니 재주문 → 이중 주문 방지).
+                marks = pending_supplier["marks"]
+                for key, lines in (("success", success_lines), ("adjusted", adjusted_lines),
+                                   ("missing", missing_lines), ("fail", fail_lines),
+                                   ("unconfirmed", unconfirmed_lines)):
+                    del lines[marks[key]:]
+                success_count, fail_count, adjusted_count, missing_qty_total = pending_supplier["counts"]
+                unconfirmed_lines.extend(
+                    f" · [{pending_supplier['name']}] {it.get('product_name', '')} ×{it.get('quantity', 1)}"
+                    for it in pending_supplier["items"])
             try:
                 cur = conn.cursor()
                 # 서버가 만든 pending 주문행을 마감하지 않으면 success=null 로 영구 잔존한다.
@@ -1979,8 +2011,11 @@ class CloudScheduler:
                         parts.extend(fail_lines[:10])
                     if unconfirmed_lines:
                         parts.append("")
-                        parts.append(f"⚠ 전송 결과 확인 필요 {len(unconfirmed_lines)}건 (실패 아님)")
+                        parts.append(f"⚠ 전송 결과 확인 필요 {len(unconfirmed_lines)}건 "
+                                     "(실패 아님 — 도매몰 주문내역 확인 전 재주문 금지)")
                         parts.extend(unconfirmed_lines[:10])
+                        if len(unconfirmed_lines) > 10:
+                            parts.append(f" ... 외 {len(unconfirmed_lines) - 10}건")
                     parts.append(f"\n⚠️ 오류: {str(e)[:100]}")
                     Notifier.send_telegram(telegram_chat_id, "\n".join(parts))
                 except Exception:
@@ -2328,7 +2363,10 @@ class CloudScheduler:
                         batch_id, supplier_name, success_count, fail_count)
 
         except Exception as e:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception as rb:                       # 연결이 끊겼어도 알림 판단·발송은 계속한다
+                logger.error("auto_order 롤백 실패 [%s/%s]: %s", batch_id, supplier_name, rb)
             logger.error("auto_order 실패 [%s/%s]: %s", batch_id, supplier_name, e, exc_info=True)
             try:
                 cur = conn.cursor()
@@ -2433,7 +2471,9 @@ class CloudScheduler:
                 lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개 — {it.get('message', '주문 실패')}" for it in button_items[:10])
             if unconfirmed_items:
                 lines.append("\n⚠ 전송 결과 확인 필요 (도매몰 주문내역 확인 전 재주문 금지):")
-                lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개" for it in unconfirmed_items)
+                lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개" for it in unconfirmed_items[:20])
+                if len(unconfirmed_items) > 20:            # 텔레그램 4096자 제한 — 넘으면 알림 전체가 사라진다
+                    lines.append(f"... 외 {len(unconfirmed_items) - 20}건 — 장바구니의 '전송 결과 확인' 품목 전체를 확인하세요")
             if fallback_outcomes:
                 lines.append("\n대체 주문:")
                 lines.extend(format_fallback_line(o) for o in fallback_outcomes)
