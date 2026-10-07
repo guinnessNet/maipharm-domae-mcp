@@ -22,7 +22,7 @@ import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, checked_qty, confirmed_quantity, _as_unknown_if_unspecified
 from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
-from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail)
+from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, auto_fallback_need, auto_order_shortfall_counts, cart_action_after_fallback, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail, unsent_qty)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 from domae_mcp.cloud.notifier import Notifier
@@ -2193,7 +2193,8 @@ class CloudScheduler:
                     got = getattr(result, "adjusted_quantity", None) or req
                     success_items.append({**item, "quantity": got, "requested_quantity": req,
                                           "retried": bool(getattr(result, "retried", False)),
-                                          "shortfall_detail": stopped_detail(result) if is_stopped(result) else None})
+                                          "shortfall_detail": stopped_detail(result) if is_stopped(result) else None,
+                                          "unsent_quantity": unsent_qty(item, result)})
                 elif unconfirmed:
                     unconfirmed_items.append(item)
                 else:
@@ -2215,8 +2216,7 @@ class CloudScheduler:
                             'UPDATE domae_cart_items SET "failedAt" = %s, "failReason" = %s WHERE id = %s',
                             (utc_now, why, cart_item_id))
 
-                # 재고가 아닌 이유로 남긴 수량은 자동 대체주문하지 않는다 — 장바구니에 남겨 약사 확인을 받는다.
-                need = fallback_need_qty(item, result) if auto_fallback and not is_stopped(result) else 0
+                need = auto_fallback_need(item, result, auto_fallback)
                 if need > 0:
                     fallback_needs.append((item, need))
 
@@ -2308,10 +2308,8 @@ class CloudScheduler:
                     "status": log_status,
                     "count": len(success_items),
                     "totalPrice": sum((i.get("price") or 0) * int(i.get("quantity", 0)) for i in success_items),
-                    "shortfall": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
-                                     for i in success_items if not i.get("shortfall_detail")),
-                    "unsent": sum(int(i.get("requested_quantity", 0)) - int(i.get("quantity", 0))
-                                  for i in success_items if i.get("shortfall_detail")),
+                    "shortfall": auto_order_shortfall_counts(success_items)[0],
+                    "unsent": auto_order_shortfall_counts(success_items)[1],
                     "unconfirmed": len(unconfirmed_items),
                     "fallbackOrdered": sum(1 for o in fallback_outcomes if o.state == "ordered"),
                 }))

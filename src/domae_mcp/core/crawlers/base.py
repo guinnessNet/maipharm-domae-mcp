@@ -54,6 +54,8 @@ class OrderResult:
     # 성공(stock_adjusted)인데 남은 수량을 재고가 아닌 이유로 보내지 않았을 때 'stopped'.
     # 상위 문구가 '재고 부족' 으로 쓰지 않도록 구분한다(None = 재고 부족 또는 해당 없음).
     shortfall_reason: Optional[str] = None
+    # shortfall_reason == "stopped" 일 때 확인 실패로 보내지 않은 수량(재고 부족분 제외)
+    unsent_quantity: Optional[int] = None
 
 
 class CrawlerError(Exception):

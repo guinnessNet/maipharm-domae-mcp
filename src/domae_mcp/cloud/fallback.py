@@ -76,6 +76,32 @@ def stopped_detail(result) -> str:
     return detail if detail.startswith("남은 ") else "나머지는 확인 실패로 주문 안 함"
 
 
+def unsent_qty(item: dict, result) -> int:
+    """stopped 결과에서 확인 실패로 보내지 않은 수량. 크롤러가 값을 주지 않으면 남은 수량 전체로 본다."""
+    if not is_stopped(result):
+        return 0
+    remain = fallback_need_qty(item, result)
+    value = getattr(result, "unsent_quantity", None)
+    return min(max(int(value), 0), remain) if isinstance(value, int) and not isinstance(value, bool) else remain
+
+
+def auto_fallback_need(item: dict, result, enabled: bool) -> int:
+    """자동주문 대체 수량. 재고가 아닌 이유로 남긴 품목(stopped)은 재고 부족분이 섞여 있어도
+    대체주문하지 않고 장바구니에 남긴다(사용자 정책 2026-10-07)."""
+    return fallback_need_qty(item, result) if enabled and not is_stopped(result) else 0
+
+
+def auto_order_shortfall_counts(success_items: list) -> tuple:
+    """자동주문 알림용 (재고 부족으로 덜 주문된 수량, 확인 실패로 보내지 않은 수량)."""
+    short = unsent = 0
+    for it in success_items:
+        missing = max(int(it.get("requested_quantity", 0)) - int(it.get("quantity", 0)), 0)
+        u = min(int(it.get("unsent_quantity") or 0), missing)
+        unsent += u
+        short += missing - u
+    return short, unsent
+
+
 def fallback_need_qty(item: dict, result) -> int:
     """대체 주문할 수량. 재고 0이 확인된 품목은 전량, 수량 조정 성공은 부족분, 나머지 0."""
     qty = int(item.get("quantity") or 1)

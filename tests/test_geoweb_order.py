@@ -141,7 +141,9 @@ class Site:
             # 실측: 팝업은 항상 있고(재고 0 센터도 일반 행), 타센터가 없으면 빈 tbody.
             pop = ('<div class="another_center_pop"><table><tbody>' + "".join(
                 f'<tr style="" class=""><td>{n}</td><td>{q}</td><td><div class="amount_group">'
-                f'<input data-code="{c}" type="text"></div></td></tr>' for n, c, q in centers)
+                f'<input data-code="{c}" type="text"><button type="button" class="btn_basic btn_plus btn_tran_center_plus">+</button>'
+                f'<button type="button" class="btn_basic btn_darkBlue btn_tran_center_add">담기</button></div></td></tr>'
+                for n, c, q in centers)
                 + '</tbody></table></div>')
             return Resp('<table><tbody><tr><th>제품비고</th><td></td></tr><tr><th>제품코드</th><td></td></tr>'
                         '<tr><th>주문단가</th><td>1000</td><th>박스입수</th><td></td></tr>'
@@ -1133,7 +1135,9 @@ def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
 @pytest.mark.parametrize('mark', ['style="display: none"', 'style="visibility:hidden"', 'hidden',
                                   'class="row disabled"', 'class="d-none"', 'class="hide"', 'input_disabled',
                                   'input_readonly', 'input_hidden_type', 'td_hidden', 'button_disabled',
-                                  'tbody_hidden', 'popup_hidden'])
+                                  'tbody_hidden', 'popup_hidden', 'no_add_button', 'input_style_hidden',
+                                  'qty_span_hidden', 'name_span_hidden', 'td_opacity', 'tr_aria_hidden',
+                                  'input_aria_disabled', 'tr_extra_attr_class'])
 def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
     def fn(r):
@@ -1146,7 +1150,23 @@ def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailabl
         elif mark == 'td_hidden':
             r.text = r.text.replace('<td>C1</td><td>4</td>', '<td>C1</td><td style="display:none">4</td>')
         elif mark == 'button_disabled':
-            r.text = r.text.replace('<input data-code="c1" type="text">', '<input data-code="c1" type="text"><button disabled>담기</button>')
+            r.text = r.text.replace('class="btn_basic btn_darkBlue btn_tran_center_add">', 'class="btn_basic btn_darkBlue btn_tran_center_add" disabled>', 1)
+        elif mark == 'no_add_button':
+            r.text = r.text.replace('<button type="button" class="btn_basic btn_darkBlue btn_tran_center_add">담기</button>', '', 1)
+        elif mark == 'input_style_hidden':
+            r.text = r.text.replace('<input data-code="c1" type="text"', '<input style="display:none" data-code="c1" type="text"')
+        elif mark == 'qty_span_hidden':
+            r.text = r.text.replace('<td>C1</td><td>4</td>', '<td>C1</td><td><span style="display:none">4</span></td>')
+        elif mark == 'name_span_hidden':
+            r.text = r.text.replace('<td>C1</td>', '<td><span class="hidden">C1</span></td>')
+        elif mark == 'td_opacity':
+            r.text = r.text.replace('<td>C1</td>', '<td style="opacity: 0">C1</td>')
+        elif mark == 'tr_aria_hidden':
+            r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="" aria-hidden="true">', 1)
+        elif mark == 'input_aria_disabled':
+            r.text = r.text.replace('<input data-code="c1" type="text"', '<input aria-disabled="true" data-code="c1" type="text"')
+        elif mark == 'tr_extra_attr_class':
+            r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="soldout">', 1)
         elif mark == 'tbody_hidden':
             r.text = r.text.replace('<div class="another_center_pop"><table><tbody>', '<div class="another_center_pop"><table><tbody style="display:none">')
         elif mark == 'popup_hidden':
@@ -1293,3 +1313,38 @@ def test_auto_order_line_carries_stopped_detail():
     assert line == '• X — 3개 — 3,000원 (요청 10개 — 남은 7개는 확인 실패로 주문 안 함, 장바구니에 남김)'
     assert '부족' not in line
     assert '부족 7개' in format_ordered_line({'product_name': 'X', 'quantity': 3, 'requested_quantity': 10, 'price': 1000})
+
+
+def test_geo_disabled_plus_button_does_not_block_other_centers():
+    """'증가' 버튼 상태는 보지 않는다 — 담기 버튼이 활성이면 타센터를 쓴다."""
+    site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
+    _detail_override(site, lambda r: setattr(r, 'text', r.text.replace(
+        'class="btn_basic btn_plus btn_tran_center_plus"', 'class="btn_basic btn_plus btn_tran_center_plus" disabled', 1)))
+    assert crawler(site)._get_product_stocks('A') == (1, 4, 'c1')
+
+
+def test_geo_unsent_quantity_excludes_stock_shortage():
+    r = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=3)
+    assert r.unsent_quantity == 4 and r.message == '3개 주문 — 남은 4개는 확인 실패로 주문 안 함, 3개는 재고 부족'
+    assert gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 3).unsent_quantity is None
+
+
+def test_geo_failure_messages_name_the_reason():
+    assert gw.GeoWebCrawler._result(5, 0, 'not_sent').message == '확인 실패로 주문 안 함'
+    assert gw.GeoWebCrawler._result(5, 0, 'stock_zero', 0).message == '재고 0 — 주문 안 함'
+
+
+def test_auto_fallback_policy_and_counts_without_db():
+    from domae_mcp.cloud.fallback import auto_fallback_need, auto_order_shortfall_counts, unsent_qty
+    item = {'quantity': 10}
+    mixed = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=3)
+    stock = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 3)
+    assert auto_fallback_need(item, mixed, True) == 0          # 혼재여도 재고 부족분 포함 대체주문 안 함
+    assert auto_fallback_need(item, stock, True) == 7 and auto_fallback_need(item, stock, False) == 0
+    assert unsent_qty(item, mixed) == 4 and unsent_qty(item, stock) == 0
+    legacy = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True)
+    legacy.unsent_quantity = None                               # 값이 없으면 남은 수량 전체를 확인 실패로
+    assert unsent_qty(item, legacy) == 7
+    items = [{'requested_quantity': 10, 'quantity': 3, 'unsent_quantity': 4},
+             {'requested_quantity': 5, 'quantity': 2, 'unsent_quantity': 0}]
+    assert auto_order_shortfall_counts(items) == (6, 4)

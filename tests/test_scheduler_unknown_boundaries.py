@@ -250,3 +250,16 @@ def test_auto_order_stopped_remainder_stays_in_cart_without_fallback(env):
 def test_auto_order_stock_shortage_remainder_still_falls_back(env):
     run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
     assert 'search' in env.alternatives                    # 재고 부족분은 다음 순번 도매에서 찾는다
+
+
+def test_auto_order_mixed_stopped_keeps_all_in_cart_and_splits_counts(env):
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    r = _stopped(detail='남은 3개는 확인 실패로 주문 안 함, 2개는 재고 부족')
+    r.unsent_quantity = 3
+    run_reported_result(env, 'auto_order', r)
+    order, cart, batch = env.read()
+    assert env.alternatives == [] and cart[0] == 5
+    assert '남은 3개는 확인 실패로 주문 안 함, 2개는 재고 부족' in cart[1]
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    assert sse['unsent'] == 3 and sse['shortfall'] == 2
