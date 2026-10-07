@@ -353,3 +353,18 @@ def test_auto_order_midloop_exception_reports_unprocessed_sent_items_as_check(en
     text = ' '.join(str(n) for n in env.notices)
     assert '✅ 자동주문 완료' not in text
     assert '전송 결과 확인 필요' in text and '약품 15개' in text
+
+
+def test_auto_order_exception_after_classification_reports_all_as_check_matching_cart(env, monkeypatch):
+    """결과 기록이 커밋 전에 되돌려지면 이미 분류한 품목도 '처리됨'으로 알리지 않는다 — 장바구니(전체 수량,
+    '전송 결과 확인 중')와 같은 상태로 알려 약사 재주문(이중 주문)을 막는다."""
+    def boom(*a, **k):
+        raise RuntimeError('db down after classification')
+    monkeypatch.setattr(sch, 'cart_action_after_order', boom)
+    run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    order, cart, batch = env.read()
+    text = ' '.join(str(n) for n in env.notices)
+    assert order[:2] == (None, 'send_unknown') and cart[0] == 15       # 롤백 → 전송 직전 표시 그대로
+    assert '처리 중 오류 — 결과 확인 필요' in text
+    assert '전송 결과 확인 필요 (도매몰 주문내역 확인 전 재주문 금지)' in text and '약품 15개' in text
+    assert '장바구니에 남김' not in text and '주문 완료' not in text and "'inline_keyboard'" not in text

@@ -2012,6 +2012,7 @@ class CloudScheduler:
         unconfirmed_items = []
         fallback_outcomes = []
         send_committed = False   # 보호 커밋 성공 후에만 True (그 전 예외는 전송 전)
+        results_committed = False   # 원 주문 결과·장바구니 반영이 커밋됐는가(6단계)
 
         try:
             cur = conn.cursor()
@@ -2223,6 +2224,7 @@ class CloudScheduler:
 
             # 6. 원 주문 결과·장바구니 반영을 먼저 확정한다 (배치 마감은 대체주문 뒤)
             conn.commit()
+            results_committed = True
 
             fallback_outcomes = []
             if fallback_needs:
@@ -2337,8 +2339,15 @@ class CloudScheduler:
             except Exception:
                 pass
             self._update_auto_order_log(conn, monitor_id, batch_id, "failed", str(e)[:200])
-            # 전송 뒤 결과 처리 중 예외: 아직 분류하지 못한 품목은 접수됐을 수 있다 — '전송 결과 확인 필요'로 알린다.
-            if send_committed:
+            if send_committed and not results_committed:
+                # 전송 뒤 결과 기록이 커밋 전에 되돌려졌다 — DB·장바구니는 모든 품목이 전송 직전 표시
+                # ('전송 결과 확인 중') 그대로다. 이미 분류한 품목도 처리된 것처럼 알리면 장바구니와 어긋나
+                # 약사 재주문 → 이중 주문이 된다. 알림도 전 품목을 '전송 결과 확인 필요'로 맞춘다.
+                success_items.clear()
+                failed_items.clear()
+                unconfirmed_items[:] = list(items)
+            elif send_committed:
+                # 결과는 커밋됐고 그 뒤(대체주문·마감 등)에서 예외 — 아직 분류 못 한 품목만 확인 필요로 넣는다.
                 seen = ({id(i.get("_src", i)) for i in [*success_items, *failed_items]}
                         | {id(i) for i in unconfirmed_items})
                 unconfirmed_items.extend(i for i in items if id(i) not in seen)
@@ -2423,7 +2432,7 @@ class CloudScheduler:
                 lines.append("\n❌ 실패:")
                 lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개 — {it.get('message', '주문 실패')}" for it in button_items[:10])
             if unconfirmed_items:
-                lines.append("\n⚠ 전송 결과 확인 필요 (도매몰 주문내역을 확인해 주세요):")
+                lines.append("\n⚠ 전송 결과 확인 필요 (도매몰 주문내역 확인 전 재주문 금지):")
                 lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개" for it in unconfirmed_items)
             if fallback_outcomes:
                 lines.append("\n대체 주문:")
