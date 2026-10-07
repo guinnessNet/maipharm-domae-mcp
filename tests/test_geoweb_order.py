@@ -1472,3 +1472,63 @@ def test_geo_runtime_guard_closes_order_path_on_old_worker_result():
         finally:
             base.OrderResult = original
     assert gw._ORDER_RUNTIME_SAFE is True
+
+
+def _telegram(monkeypatch, success_items, failed_items, outcomes=(), unconfirmed=()):
+    from domae_mcp.cloud import scheduler as sch
+    sent = []
+    monkeypatch.setattr(sch.Notifier, 'send_telegram', lambda chat, text, **k: sent.append(text), raising=False)
+    import domae_mcp.cloud.notifier as nt
+    monkeypatch.setattr(nt.Notifier, 'send_telegram', lambda chat, text, **k: sent.append(text))
+    s = sch.CloudScheduler.__new__(sch.CloudScheduler)
+    s._crawlers = {}
+    s._send_auto_order_telegram('c', '인천', list(success_items), list(failed_items),
+                                unconfirmed_items=list(unconfirmed), fallback_outcomes=list(outcomes))
+    return sent[-1]
+
+
+def test_telegram_title_without_summary_on_exception_path(monkeypatch):
+    """예외 경로(요약 전, 대체주문 결과 없음)에서도 제목이 품목별 상태를 따른다."""
+    src = {'quantity': 5}
+    text = _telegram(monkeypatch, [], [{'product_name': 'A', 'quantity': 5, 'message': '재고 0', '_src': src}])
+    assert text.startswith('❌ 자동주문 실패')
+    src2 = {'quantity': 10}
+    text = _telegram(monkeypatch, [{'product_name': 'B', 'requested_quantity': 10, 'quantity': 4, 'price': 1, '_src': src2}], [])
+    assert text.startswith('⚠️ 자동주문 부분 완료') and '부족 6개는 장바구니에 남김' in text
+
+
+def test_telegram_failed_item_partially_filled_by_fallback(monkeypatch):
+    from domae_mcp.cloud.fallback import auto_order_status, summarize_auto_order
+    src = {'product_name': 'C', 'quantity': 10}
+    failed = [{'product_name': 'C', 'quantity': 10, 'message': '재고 0', '_src': src}]
+    outs = [_fo(src, 10, '지오영', 6, 'ordered', unsent=4)]
+    summarize_auto_order([], failed, outs)
+    st = auto_order_status([], failed, [])
+    assert (st['status'], st['unsent'], st['shortfall']) == ('partial_fail', 4, 0)
+    text = _telegram(monkeypatch, [], failed, outs)
+    assert text.startswith('⚠️ 자동주문 부분 완료')
+    assert '↪ C — 지오영 6개 주문 완료, 4개는 확인 실패로 장바구니에 남김' in text
+
+
+def test_telegram_blocked_fallback_is_not_called_unconfirmed_order(monkeypatch):
+    from domae_mcp.cloud.fallback import auto_order_status, format_ordered_line, summarize_auto_order
+    src = {'product_name': 'F', 'quantity': 10}
+    ok = [{'product_name': 'F', 'requested_quantity': 10, 'quantity': 6, 'price': 1, '_src': src}]
+    outs = [_fo(src, 4, '백제', 0, 'blocked')]
+    summarize_auto_order(ok, [], outs)
+    st = auto_order_status(ok, [], [])
+    assert st['status'] == 'partial_fail' and st['shortfall'] == 0 and st['fallback_unconfirmed'] == 1
+    line = format_ordered_line(ok[0])
+    assert '결과 확인 필요' not in line and '4개는 백제에 이전 미확정 주문이 있어 보내지 않음' in line
+    text = _telegram(monkeypatch, ok, [], outs)
+    assert '⚠ F — 백제에 이전 미확정 주문이 있어 4개는 보내지 않음 — 그 주문 확인 전 재주문 금지(장바구니에 남김)' in text
+
+
+def test_telegram_unconfirmed_fallback_line_forbids_reorder(monkeypatch):
+    src = {'product_name': 'D', 'quantity': 5}
+    failed = [{'product_name': 'D', 'quantity': 5, 'message': '재고 0', '_src': src}]
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    outs = [FallbackOutcome(src, 5, '백제', 0, 'unconfirmed', '백제 주문 결과 불명 — 확인 필요')]
+    text = _telegram(monkeypatch, [], failed, outs)
+    assert text.startswith('⚠️ 자동주문 결과 확인 필요')
+    assert '⚠ D — 백제 주문 결과 불명 — 확인 필요 — 도매몰 주문내역 확인 전 재주문 금지' in text

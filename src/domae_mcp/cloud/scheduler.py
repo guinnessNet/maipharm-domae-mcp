@@ -22,7 +22,7 @@ import psycopg2
 
 from domae_mcp.core.crawlers.base import CrawlerError, OrderResult, checked_qty, confirmed_quantity, _as_unknown_if_unspecified
 from domae_mcp.core.crawlers.cart_snapshot import CartSnapshot, RELEASE_PENDING_KEY
-from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, auto_fallback_need, auto_order_status, cart_action_after_fallback, summarize_auto_order, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail, unsent_qty)
+from domae_mcp.cloud.fallback import (NEEDS_CHECK_STATES, auto_fallback_need, auto_order_status, cart_action_after_fallback, format_fallback_line, summarize_auto_order, cart_action_after_order, fallback_need_qty, is_stopped, next_suppliers, run_fallback, format_ordered_line, stopped_detail, unsent_qty)
 from domae_mcp.cloud.fallback_db import FallbackRecorder
 from domae_mcp.cloud.reconcile import reconcile_cart
 from domae_mcp.cloud.notifier import Notifier
@@ -2388,16 +2388,12 @@ class CloudScheduler:
                     if row:
                         keyboard.append(row)
             # 미확정은 실패가 아니다 — 확정 실패·부족분이 없으면 '확인 필요'로만 알린다
-            if fallback_outcomes and not all("left_quantity" in i for i in [*success_items, *failed_items]):
+            # 예외 경로처럼 요약 전에 불렸으면(대체주문 결과가 없어도) 여기서 요약한다 — 제목은 품목별 최종 상태에서만 만든다.
+            if not all("left_quantity" in i for i in [*success_items, *failed_items]):
                 summarize_auto_order(success_items, failed_items, fallback_outcomes)
             summary = auto_order_status(success_items, failed_items, unconfirmed_items)
-            partial, needs_check = summary["partial"], summary["needs_check"]
-            if partial:
-                title = "⚠️ 자동주문 부분 완료" if success_items else "❌ 자동주문 실패"
-            elif needs_check:
-                title = "⚠️ 자동주문 결과 확인 필요"
-            else:
-                title = "✅ 자동주문 완료"
+            title = {"failed": "❌ 자동주문 실패", "partial_fail": "⚠️ 자동주문 부분 완료",
+                     "unconfirmed": "⚠️ 자동주문 결과 확인 필요"}.get(summary["status"], "✅ 자동주문 완료")
             lines = [f"{title} ({supplier}, {now_str})\n"]
             if success_items:
                 lines.append("✅ 성공:")
@@ -2414,10 +2410,7 @@ class CloudScheduler:
                 lines.extend(f"• {it.get('product_name', '')} {it.get('quantity', 1)}개" for it in unconfirmed_items)
             if fallback_outcomes:
                 lines.append("\n대체 주문:")
-                for o in fallback_outcomes:
-                    mark = {"ordered": "↪", "unconfirmed": "⚠", "blocked": "⚠"}.get(o.state, "✗")
-                    text = f"{o.supplier} {o.ordered_qty}개 주문 완료" if o.state == "ordered" else o.message
-                    lines.append(f"{mark} {o.item.get('product_name', '')} — {text}")
+                lines.extend(format_fallback_line(o) for o in fallback_outcomes)
             if keyboard:
                 lines.append("\n대체 도매에서 주문하려면 아래 버튼을 누르세요:")
             Notifier.send_telegram(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": keyboard} if keyboard else None)
