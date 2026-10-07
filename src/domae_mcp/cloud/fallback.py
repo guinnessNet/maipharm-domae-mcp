@@ -91,31 +91,55 @@ def auto_fallback_need(item: dict, result, enabled: bool) -> int:
     return fallback_need_qty(item, result) if enabled and not is_stopped(result) else 0
 
 
-def left_in_cart_qty(item: dict) -> int:
-    """자동주문 성공 품목에서 대체주문 뒤에도 장바구니에 남은 수량(요청 − 주문 − 대체주문 접수)."""
-    missing = max(int(item.get("requested_quantity", 0)) - int(item.get("quantity", 0)), 0)
-    return max(missing - int(item.get("fallback_quantity") or 0), 0)
+def summarize_auto_order(success_items: list, failed_items: list, outcomes: list) -> None:
+    """원 주문 결과와 대체주문 결과를 합쳐 품목마다 최종 수량을 한 번만 계산해 품목 dict 에 붙인다.
 
-
-def apply_fallback_to_success_items(success_items: list, outcomes: list) -> None:
-    """대체주문으로 접수된 수량을 원 품목(_src 동일 객체)에 fallback_quantity·fallback_supplier 로 붙인다."""
-    for it in success_items:
+    ordered_now   원 도매 접수 수량
+    fallback_quantity / fallback_supplier   대체주문 접수 수량·도매
+    check_quantity / check_supplier         대체주문 결과 확인 필요 수량(접수됐을 수 있다 — 남김으로 세지 않는다)
+    left_quantity  장바구니에 남은 수량 = 요청 − 원 접수 − 대체 접수 − 확인 필요
+    unsent_left    left 중 재고가 아닌 이유(확인 실패)로 남긴 수량, short_left 는 나머지(재고 부족·실패)
+    품목은 원 품목 객체(_src)로 대체주문 결과와 맞춘다."""
+    for it, origin_ok in [(i, True) for i in success_items] + [(i, False) for i in failed_items]:
         src = it.get("_src")
-        done = [o for o in outcomes if o.item is src and o.state == "ordered" and o.ordered_qty > 0]
-        it["fallback_quantity"] = sum(o.ordered_qty for o in done)
-        it["fallback_supplier"] = ", ".join(dict.fromkeys(o.supplier for o in done if o.supplier)) or None
+        outs = [o for o in outcomes if o.item is src]
+        done = [o for o in outs if o.state == "ordered" and o.ordered_qty > 0]
+        chk = [o for o in outs if o.state in NEEDS_CHECK_STATES]
+        requested = int(it.get("requested_quantity") or it.get("quantity") or 0)
+        ordered_now = int(it.get("quantity") or 0) if origin_ok else 0
+        fb = sum(o.ordered_qty for o in done)
+        check = sum(o.need_qty for o in chk)
+        left = max(requested - ordered_now - fb - check, 0)
+        unsent = min(int(it.get("unsent_quantity") or 0) + sum(o.unsent_qty for o in done), left)
+        it.update(origin_ok=origin_ok, ordered_now=ordered_now, fallback_quantity=fb,
+                  fallback_supplier=", ".join(dict.fromkeys(o.supplier for o in done if o.supplier)) or None,
+                  check_quantity=check,
+                  check_supplier=", ".join(dict.fromkeys(o.supplier for o in chk if o.supplier)) or None,
+                  left_quantity=left, unsent_left=unsent, short_left=left - unsent)
 
 
-def auto_order_shortfall_counts(success_items: list) -> tuple:
-    """자동주문 알림용 (재고 부족으로 장바구니에 남은 수량, 확인 실패로 보내지 않은 수량).
-    대체주문으로 접수된 수량은 어느 쪽에도 넣지 않는다."""
-    short = unsent = 0
-    for it in success_items:
-        left = left_in_cart_qty(it)
-        u = min(int(it.get("unsent_quantity") or 0), left)
-        unsent += u
-        short += left - u
-    return short, unsent
+def auto_order_status(success_items: list, failed_items: list, unconfirmed_items: list) -> dict:
+    """summarize_auto_order 뒤의 품목들로 자동주문 상태와 알림 집계를 만든다.
+    남은 수량이 없으면 success(확인 필요가 있으면 unconfirmed), 남았는데 접수분이 있으면 partial_fail, 없으면 failed."""
+    items = list(success_items) + list(failed_items)
+    left_any = any(int(i.get("left_quantity", 0)) > 0 for i in items)
+    check_items = [i for i in items if int(i.get("check_quantity", 0)) > 0]
+    needs_check = bool(unconfirmed_items) or bool(check_items)
+    if not left_any:
+        status = "unconfirmed" if needs_check else "success"
+    elif any(int(i.get("ordered_now", 0)) + int(i.get("fallback_quantity", 0)) > 0 for i in items):
+        status = "partial_fail"
+    else:
+        status = "failed"
+    return {
+        "status": status,
+        "partial": left_any,
+        "needs_check": needs_check,
+        "shortfall": sum(int(i.get("short_left", 0)) for i in success_items),
+        "unsent": sum(int(i.get("unsent_left", 0)) for i in success_items),
+        "fallback_unconfirmed": len(check_items),
+        "failed_left": sum(1 for i in failed_items if int(i.get("left_quantity", 0)) > 0),
+    }
 
 
 def fallback_need_qty(item: dict, result) -> int:
@@ -160,6 +184,7 @@ class FallbackOutcome:
     ordered_qty: int
     state: str          # ordered | failed | unconfirmed | blocked | skipped
     message: str
+    unsent_qty: int = 0  # ordered 인데 대체 도매가 재고가 아닌 이유(확인 실패)로 남긴 수량
 
     @property
     def success(self) -> bool:
@@ -217,7 +242,12 @@ def _attempt(item, need, sup, pick, crawler, token, renew_lock,
         return FallbackOutcome(item, need, sup, ordered or 0, "unconfirmed",
                                f"{sup} 주문 결과 기록 실패 — 접수 여부 확인 필요")
     if result.success:
-        return FallbackOutcome(item, need, sup, ordered, "ordered", f"{sup}에 {ordered}개 대체 주문")
+        unsent = 0
+        if is_stopped(result):
+            value = getattr(result, "unsent_quantity", None)
+            left = max(need - ordered, 0)
+            unsent = min(max(value, 0), left) if isinstance(value, int) and not isinstance(value, bool) else left
+        return FallbackOutcome(item, need, sup, ordered, "ordered", f"{sup}에 {ordered}개 대체 주문", unsent)
     logger.info("대체주문 거부 [%s] %s: %s — 다음 순번", sup, reason, result.message)
     return None
 
@@ -304,7 +334,10 @@ def cart_action_after_fallback(outcome: FallbackOutcome):
         left = outcome.need_qty - outcome.ordered_qty
         if left <= 0:
             return ("delete", 0, "")
-        return ("keep_failed", left, f"{outcome.supplier}에 {outcome.ordered_qty}개 대체주문 — 남은 {left}개")
+        why = f"{outcome.supplier}에 {outcome.ordered_qty}개 대체주문 — 남은 {left}개"
+        if outcome.unsent_qty:
+            why += f"(그중 {min(outcome.unsent_qty, left)}개는 확인 실패로 주문 안 함)"
+        return ("keep_failed", left, why)
     if outcome.state == "unconfirmed":
         return ("note", 0, f"대체주문 결과 확인 필요({outcome.supplier}) — 도매몰 주문내역을 확인하세요")
     if outcome.state == "blocked":
@@ -313,18 +346,31 @@ def cart_action_after_fallback(outcome: FallbackOutcome):
 
 
 def format_ordered_line(item: dict) -> str:
-    """성공 품목 알림 한 줄. 실제 주문 수량 기준이며, 부족분이 있으면 함께 적는다."""
+    """성공 품목 알림 한 줄. 실제 주문 수량 기준이며, 부족분이 어디로 갔는지(대체주문·확인 필요·장바구니) 적는다."""
     qty = int(item.get("quantity") or 0)
     req = int(item.get("requested_quantity") or qty)
     total = (item.get("price") or 0) * qty
     line = f"• {item.get('product_name', '')} — {qty}개 — {total:,}원"
     fb = int(item.get("fallback_quantity") or 0)
-    left = left_in_cart_qty(item)
-    if req > qty and item.get("shortfall_detail"):
+    check = int(item.get("check_quantity") or 0)
+    if "left_quantity" in item:
+        left, unsent = int(item["left_quantity"]), int(item.get("unsent_left") or 0)
+    else:
+        left, unsent = max(req - qty, 0), 0
+    if req > qty and item.get("shortfall_detail") and not (fb or check):
         line += f" (요청 {req}개 — {item['shortfall_detail']}, 장바구니에 남김)"
-    elif req > qty and fb:
-        moved = f"{item.get('fallback_supplier') or '다른 도매'}에 {fb}개 대체주문"
-        line += f" (요청 {req}개, 부족 {req - qty}개 중 {moved}" + (f", {left}개는 장바구니에 남김)" if left else ")")
+    elif req > qty and (fb or check):
+        segs = []
+        if fb:
+            segs.append(f"{item.get('fallback_supplier') or '다른 도매'}에 {fb}개 대체주문")
+        if check:
+            segs.append(f"{item.get('check_supplier') or '다른 도매'} 대체주문 {check}개 결과 확인 필요"
+                        " — 도매몰 주문내역 확인 전 재주문 금지")
+        if unsent:
+            segs.append(f"{unsent}개는 확인 실패로 장바구니에 남김")
+        if left - unsent:
+            segs.append(f"{left - unsent}개는 장바구니에 남김")
+        line += f" (요청 {req}개, 부족 {req - qty}개 중 " + ", ".join(segs) + ")"
     elif req > qty:
         line += f" (요청 {req}개, 부족 {req - qty}개는 장바구니에 남김)"
     if item.get("retried"):

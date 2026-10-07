@@ -277,10 +277,38 @@ def test_auto_order_fallback_filled_shortage_is_not_reported_as_left_in_cart(env
     text = ' '.join(str(n) for n in env.notices)
     assert sse['fallbackOrdered'] == 1 and sse['shortfall'] == 5 - filled and sse['unsent'] == 0
     if filled == 5:
-        assert sse['status'] in ('success', 'unconfirmed')
+        assert sse['status'] == 'success'
         assert '부족 5개 중 백제에 5개 대체주문)' in text and '장바구니에 남김' not in text
         assert env.read()[1] is None                             # 장바구니 행 삭제
     else:
         assert sse['status'] == 'partial_fail'
         assert '부족 5개 중 백제에 3개 대체주문, 2개는 장바구니에 남김)' in text
         assert env.read()[1][0] == 2
+
+
+def test_auto_order_stock_zero_fully_filled_by_fallback_reports_success(env, monkeypatch):
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    monkeypatch.setattr(sch, 'run_fallback', lambda needs, *a, **k: [
+        FallbackOutcome(item, need, '백제', need, 'ordered', '') for item, need in needs])
+    run_reported_result(env, 'auto_order', OrderResult(reason_code='stock_zero', adjusted_quantity=0))
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    text = ' '.join(str(n) for n in env.notices)
+    assert sse['status'] == 'success' and sse['fallbackOrdered'] == 1
+    assert '자동주문 실패' not in text and '백제 15개 주문 완료' in text
+    assert env.read()[1] is None
+
+
+def test_auto_order_unconfirmed_fallback_is_not_reported_as_left_in_cart(env, monkeypatch):
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    published = []
+    env.scheduler._redis.publish = lambda ch, msg: published.append(json.loads(msg))
+    monkeypatch.setattr(sch, 'run_fallback', lambda needs, *a, **k: [
+        FallbackOutcome(item, need, '백제', 0, 'unconfirmed', '백제 주문 결과 불명 — 확인 필요') for item, need in needs])
+    run_reported_result(env, 'auto_order', OrderResult(success=True, reason_code='stock_adjusted', adjusted_quantity=10))
+    sse = [p for p in published if p.get('type') == 'auto_order_result'][-1]
+    text = ' '.join(str(n) for n in env.notices)
+    assert sse['status'] == 'unconfirmed' and sse['shortfall'] == 0 and sse['fallbackUnconfirmed'] == 1
+    assert '백제 대체주문 5개 결과 확인 필요 — 도매몰 주문내역 확인 전 재주문 금지' in text
+    assert '장바구니에 남김' not in text and '자동주문 부분 완료' not in text

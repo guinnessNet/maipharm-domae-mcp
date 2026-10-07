@@ -1141,7 +1141,8 @@ def test_geo_stopped_when_other_unavailable_does_not_claim_stock_shortage():
                                   'input_aria_disabled', 'tr_extra_attr_class', 'td_class_soldout', 'group_inert',
                                   'add_pointer_events', 'td_opacity_important', 'td_opacity_percent', 'td_opacity_dot',
                                   'td_visibility_collapse', 'fieldset_disabled', 'td_disabled_attr',
-                                  'add_with_plus_class_hidden'])
+                                  'add_with_plus_class_hidden', 'opacity_twice', 'filter_opacity', 'font_size_zero',
+                                  'name_child_soldout', 'add_faint', 'add_nested_in_plus', 'tr_data_attr'])
 def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailable(mark):
     site = Site({'A': 1}, {}, centers={'A': [['C1', 'c1', 4]]})
     def fn(r):
@@ -1186,6 +1187,21 @@ def test_geo_hidden_or_disabled_stocked_popup_row_makes_other_centers_unavailabl
             r.text = r.text.replace('<td>C1</td>', '<td disabled>C1</td>')
         elif mark == 'add_with_plus_class_hidden':
             r.text = r.text.replace('class="btn_basic btn_darkBlue btn_tran_center_add">', 'class="btn_basic btn_plus btn_tran_center_add" style="display:none">', 1)
+        elif mark == 'opacity_twice':
+            r.text = r.text.replace('<div class="amount_group">', '<div class="amount_group"><span style="opacity:1;opacity:0">!</span>', 1)
+        elif mark == 'filter_opacity':
+            r.text = r.text.replace('<div class="amount_group">', '<div class="amount_group" style="filter: opacity(0)">', 1)
+        elif mark == 'font_size_zero':
+            r.text = r.text.replace('<div class="amount_group">', '<div class="amount_group"><span style="font-size:0">x</span>', 1)
+        elif mark == 'name_child_soldout':
+            r.text = r.text.replace('<td>C1</td>', '<td><span class="soldout">C1</span></td>')
+        elif mark == 'add_faint':
+            r.text = r.text.replace('class="btn_basic btn_darkBlue btn_tran_center_add">', 'class="btn_basic btn_darkBlue btn_tran_center_add" style="opacity:0.001">', 1)
+        elif mark == 'add_nested_in_plus':
+            r.text = (r.text.replace('<button type="button" class="btn_basic btn_darkBlue btn_tran_center_add">담기</button>', '', 1)
+                      .replace('btn_tran_center_plus">+</button>', 'btn_tran_center_plus">+<button class="btn_tran_center_add" style="display:none">담기</button></button>', 1))
+        elif mark == 'tr_data_attr':
+            r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="" data-soldout="1">', 1)
         elif mark == 'tr_extra_attr_class':
             r.text = r.text.replace('<tr style="" class="">', '<tr style="" class="soldout">', 1)
         elif mark == 'tbody_hidden':
@@ -1370,7 +1386,7 @@ def test_geo_failure_messages_name_the_reason():
 
 
 def test_auto_fallback_policy_and_counts_without_db():
-    from domae_mcp.cloud.fallback import auto_fallback_need, auto_order_shortfall_counts, unsent_qty
+    from domae_mcp.cloud.fallback import auto_fallback_need, auto_order_status, summarize_auto_order, unsent_qty
     item = {'quantity': 10}
     mixed = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True, stock_short=3)
     stock = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 3)
@@ -1380,9 +1396,51 @@ def test_auto_fallback_policy_and_counts_without_db():
     legacy = gw.GeoWebCrawler._result(10, 3, 'stock_adjusted', 9, stopped=True)
     legacy.unsent_quantity = None                               # 값이 없으면 남은 수량 전체를 확인 실패로
     assert unsent_qty(item, legacy) == 7
-    items = [{'requested_quantity': 10, 'quantity': 3, 'unsent_quantity': 4},
-             {'requested_quantity': 5, 'quantity': 2, 'unsent_quantity': 0}]
-    assert auto_order_shortfall_counts(items) == (6, 4)
+    a, b = {'quantity': 10}, {'quantity': 5}
+    ok = [{'requested_quantity': 10, 'quantity': 3, 'unsent_quantity': 4, '_src': a},
+          {'requested_quantity': 5, 'quantity': 2, 'unsent_quantity': 0, '_src': b}]
+    summarize_auto_order(ok, [], [])
+    st = auto_order_status(ok, [], [])
+    assert (st['shortfall'], st['unsent'], st['status']) == (6, 4, 'partial_fail')
+
+
+def _fo(item, need, sup, qty, state, unsent=0):
+    from domae_mcp.cloud.fallback import FallbackOutcome
+    return FallbackOutcome(item, need, sup, qty, state, '', unsent)
+
+
+def test_auto_order_summary_stock_zero_fully_filled_by_fallback_is_success():
+    from domae_mcp.cloud.fallback import auto_order_status, summarize_auto_order
+    src = {'quantity': 15}
+    failed = [{'quantity': 15, 'message': '재고 0', '_src': src}]
+    summarize_auto_order([], failed, [_fo(src, 15, '백제', 15, 'ordered')])
+    st = auto_order_status([], failed, [])
+    assert st['status'] == 'success' and st['partial'] is False and st['failed_left'] == 0
+    summarize_auto_order([], failed, [_fo(src, 15, '백제', 10, 'ordered')])
+    assert auto_order_status([], failed, [])['status'] == 'partial_fail'
+
+
+def test_auto_order_summary_unconfirmed_fallback_is_check_not_left_in_cart():
+    from domae_mcp.cloud.fallback import auto_order_status, format_ordered_line, summarize_auto_order
+    src = {'quantity': 15}
+    ok = [{'product_name': 'X', 'requested_quantity': 15, 'quantity': 10, 'price': 100, '_src': src}]
+    summarize_auto_order(ok, [], [_fo(src, 5, '백제', 0, 'unconfirmed')])
+    st = auto_order_status(ok, [], [])
+    assert (st['status'], st['shortfall'], st['fallback_unconfirmed']) == ('unconfirmed', 0, 1)
+    line = format_ordered_line(ok[0])
+    assert '백제 대체주문 5개 결과 확인 필요 — 도매몰 주문내역 확인 전 재주문 금지' in line
+    assert '장바구니에 남김' not in line
+
+
+def test_auto_order_summary_fallback_supplier_stopped_remainder_is_unsent():
+    from domae_mcp.cloud.fallback import auto_order_status, format_ordered_line, summarize_auto_order
+    src = {'quantity': 15}
+    ok = [{'product_name': 'X', 'requested_quantity': 15, 'quantity': 10, 'price': 100, '_src': src}]
+    summarize_auto_order(ok, [], [_fo(src, 5, '지오영', 3, 'ordered', unsent=2)])
+    st = auto_order_status(ok, [], [])
+    assert (st['shortfall'], st['unsent'], st['status']) == (0, 2, 'partial_fail')
+    assert '지오영에 3개 대체주문, 2개는 확인 실패로 장바구니에 남김)' in format_ordered_line(ok[0])
+
 
 
 def test_geo_live_all_stocked_popup_rows_pass_allowlist():

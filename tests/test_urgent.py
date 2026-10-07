@@ -195,7 +195,8 @@ def test_claim_failure_propagates_without_order():
 
 
 def test_stopped_partial_fill_passes_remainder_to_next_supplier():
-    """사용자 정책 4(2026-10-07): 긴급주문은 확인 실패로 남긴 수량도 다음 도매로 넘긴다(그 도매에 보내지 않은 수량)."""
+    """사용자 정책 4(2026-10-07): 긴급주문은 확인 실패로 남긴 수량도 다음 도매로 넘긴다(그 도매에 보내지 않은 수량).
+    단계 결과가 filled(접수 3)로 닫혀야 루프가 남은 7 을 다음 도매에 요청한다(scheduler 의 total_qty − total_filled)."""
     r = OrderResult(success=True, reason_code="stock_adjusted", adjusted_quantity=3, fulfilled_quantity=3,
                     message="3개 주문 — 남은 7개는 확인 실패로 주문 안 함")
     r.shortfall_reason = "stopped"
