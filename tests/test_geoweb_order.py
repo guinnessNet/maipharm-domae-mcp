@@ -137,11 +137,14 @@ class Site:
             # 실측: "재고수량" 칸은 요청 num 을 그대로 돌려준다(자기센터 재고의 근거가 아님).
             p = url.rsplit("/", 1)[1]
             num = (data or {}).get("num", 0)
+            self.info_nums = getattr(self, "info_nums", []) + [num]
+            # 실측(2026-10-09, 34/34건): num>0 이면 팝업은 보이지만 타센터 수량칸이 disabled 로 온다.
+            off = ' disabled=""' if num else ''
             centers = self.centers.get(p) or ([["타센터가(가상)", "MV", self.other[p]]] if p in self.other else [])
             # 실측: 팝업은 항상 있고(재고 0 센터도 일반 행), 타센터가 없으면 빈 tbody.
             pop = ('<div class="another_center_pop"><table><tbody>' + "".join(
                 f'<tr style="" class=""><td>{n}</td><td>{q}</td><td><div class="amount_group">'
-                f'<input data-code="{c}" type="text"><button type="button" class="btn_basic btn_plus btn_tran_center_plus">+</button>'
+                f'<input data-code="{c}" type="text"{off}><button type="button" class="btn_basic btn_plus btn_tran_center_plus">+</button>'
                 f'<button type="button" class="btn_basic btn_darkBlue btn_tran_center_add">담기</button></div></td></tr>'
                 for n, c, q in centers)
                 + '</tbody></table></div>')
@@ -211,9 +214,10 @@ def test_geo_success_by_new_order_number_and_restore():
 
 
 def test_geo_split_two_stages_two_order_numbers():
-    site = Site({"A": 3}, {"A": 9})
+    site = Site({"A": 0}, {}, centers={"A": [["C1", "c1", 3], ["C2", "c2", 9]]})
     r = crawler(site)._order_bare("A", 5)
     assert r.success and len(site.sends) == 2 and len(site.orders) == 2
+    assert site.sends == [{("A", "c1"): 3}, {("A", "c2"): 2}]
 
 
 def test_geo_lost_reply_but_history_shows_accepted():
@@ -247,7 +251,7 @@ def test_geo_foreign_order_same_product_is_not_counted():
 
 
 def test_geoweb_stage2_unknown_keeps_stage1():
-    site = Site({"A": 3}, {"A": 9})
+    site = Site({"A": 0}, {}, centers={"A": [["C1", "c1", 3], ["C2", "c2", 9]]})
     orig = site.post
 
     def post(url, **kw):
@@ -525,12 +529,13 @@ def test_geo_history_lag_eventually_accepts_without_resend():
 
 
 def test_geo_batch_split_and_partial_stock():
-    site = Site({'A':3,'B':1}, {'A':9,'B':2}, cart={('Z',''):3})
+    site = Site({'A':0,'B':0}, {}, cart={('Z',''):3},
+                centers={'A': [['C1', 'c1', 3], ['C2', 'c2', 9]], 'B': [['C1', 'c1', 1], ['C2', 'c2', 2]]})
     c = crawler(site)
     r = c.order_batch([{'product_id':'A','quantity':5},{'product_id':'B','quantity':5}])
     assert r[0].success and r[0].fulfilled_quantity == 5
     assert r[1].success and r[1].adjusted_quantity == r[1].fulfilled_quantity == 3
-    assert site.sends == [{('A',''):3},{('A','MV'):2},{('B',''):1},{('B','MV'):2}]
+    assert site.sends == [{('A','c1'):3},{('A','c2'):2},{('B','c1'):1},{('B','c2'):2}]
     assert site.cart == {('Z',''):3} and len(c._progress) == 2
 
 
@@ -574,7 +579,7 @@ def test_geo_missing_names_search_exact_pid_before_send():
 
 
 def test_geo_stage2_before_history_failure_retains_stage1_and_batch_continues_safely():
-    site = Site({'A':3,'B':9}, {'A':9})
+    site = Site({'A':0,'B':9}, {}, centers={'A': [['C1', 'c1', 3], ['C2', 'c2', 9]]})
     original = site.get
     history_calls = []
     def get(url, **kw):
@@ -585,7 +590,7 @@ def test_geo_stage2_before_history_failure_retains_stage1_and_batch_continues_sa
     r = crawler(site).order_batch([{'product_id':'A','quantity':5},{'product_id':'B','quantity':2}])
     assert r[0].success and r[0].adjusted_quantity == r[0].fulfilled_quantity == 3
     assert r[1].success and r[1].fulfilled_quantity == 2
-    assert site.sends == [{('A',''):3},{('B',''):2}]
+    assert site.sends == [{('A','c1'):3},{('B',''):2}]
     assert len(set(history_calls)) == 1
 
 
@@ -797,7 +802,7 @@ def _expected():
 
 
 class LiveSite(Site):
-    """실측 검색·상세 원문 + 실제 사이트처럼 상세 '재고수량' 은 요청 num 을 돌려준다.
+    """실측 검색·상세 원문. 상세 원문은 num=0 으로 받은 것뿐이라 그 밖의 num 요청은 실패로 본다.
     장바구니·주문내역은 Site 대역. 상세 원문이 없는 pid 는 404."""
     def __init__(self, search_file=None, local=None, other=None):
         super().__init__(local or {}, other or {})
@@ -809,11 +814,12 @@ class LiveSite(Site):
         if 'PartialProductInfo/' in url:
             pid = url.rsplit('/', 1)[1]
             self.nums.append((pid, data['num']))
+            assert data['num'] == 0, '실측 원문이 없는 요청 조건(num>0)'
             try:
                 html = _live(f'info_{pid}.html')
             except FileNotFoundError:
                 return Resp('', 404)
-            return Resp(html.replace('<td>0</td>', f"<td>{data['num']}</td>", 1))
+            return Resp(html)
         return super().post(url, data=data, **k)
 
 
@@ -844,7 +850,7 @@ def test_geo_live_four_rows_parse_and_display():
         p: v for p, v in E['display'].items() if p in rows}
     assert set(rows) == {p for p, v in E['display'].items() if v[0] or v[1] or p in E['names']}
     assert [p for p, n in site.nums] == list(E['search_rows'])        # 4행 모두 상세 요청
-    assert all(n == E['search_rows'][p][0] for p, n in site.nums)      # num = 자기센터 재고(사이트와 같음)
+    assert all(n == 0 for p, n in site.nums)      # 상세는 num=0 으로만(실측 원문과 같은 조건)
 
 
 @live
@@ -940,12 +946,12 @@ def _detail_override(site, fn):
 
 
 def test_geo_blank_placeholder_row_in_popup_is_skipped():
-    site = Site({'A': 3}, {}, centers={'A': [['센터가', 'c1', 4]]})
+    site = Site({'A': 0}, {}, centers={'A': [['센터가', 'c1', 4]]})
     _detail_override(site, lambda r: setattr(r, 'text', r.text.replace(
         '<tbody>', '<tbody><tr><td colspan="20" style="border-bottom:none;">&nbsp;</td></tr>', 1)))
     c = crawler(site)
-    assert c._get_product_stocks('A') == (3, 4, 'c1')
-    assert c._order_bare('A', 5).success and site.sends == [{('A', ''): 3}, {('A', 'c1'): 2}]
+    assert c._get_product_stocks('A') == (0, 4, 'c1')
+    assert c._order_bare('A', 3).success and site.sends == [{('A', 'c1'): 3}]
 
 
 @pytest.mark.parametrize('break_detail', ['http404', 'http500', 'timeout', 'maintenance', 'popup_dup', 'popup_missing'])
@@ -1054,7 +1060,8 @@ def test_geo_duplicate_center_names_make_other_centers_unavailable():
 
 
 def test_geo_third_stage_guard_failure_keeps_two_stages_and_restores_cart():
-    site = Site({'A': 1}, {}, cart={('Z', ''): 3}, centers={'A': [['C1', 'c1', 2], ['C2', 'c2', 5]]})
+    site = Site({'A': 0}, {}, cart={('Z', ''): 3},
+                centers={'A': [['C0', 'c0', 1], ['C1', 'c1', 2], ['C2', 'c2', 5]]})
     c = crawler(site)
     calls = []
     def guard():
@@ -1063,7 +1070,7 @@ def test_geo_third_stage_guard_failure_keeps_two_stages_and_restores_cart():
             raise RuntimeError('소유권 상실')
     c.send_guard = guard
     r = c._order_bare('A', 6)
-    assert site.sends == [{('A', ''): 1}, {('A', 'c1'): 2}]
+    assert site.sends == [{('A', 'c0'): 1}, {('A', 'c1'): 2}]
     assert r.success and r.fulfilled_quantity == 3 and r.shortfall_reason == 'stopped'
     assert site.cart == {('Z', ''): 3}
 
@@ -1110,7 +1117,7 @@ def test_geo_confirmed_zero_everywhere_with_detail_failure_is_stock_zero():
 
 
 def test_geo_stopped_message_splits_check_failure_and_stock_shortage():
-    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 2]]})
+    site = Site({'A': 0}, {}, centers={'A': [['C0', 'c0', 3], ['C1', 'c1', 2]]})
     c = crawler(site)
     calls = []
     def guard():
@@ -1119,7 +1126,7 @@ def test_geo_stopped_message_splits_check_failure_and_stock_shortage():
             raise RuntimeError('소유권 상실')
     c.send_guard = guard
     r = c._order_bare('A', 10)
-    assert site.sends == [{('A', ''): 3}]
+    assert site.sends == [{('A', 'c0'): 3}]
     assert r.success and r.fulfilled_quantity == 3 and r.shortfall_reason == 'stopped'
     assert r.message == '3개 주문 — 남은 2개는 확인 실패로 주문 안 함, 5개는 재고 부족'
     assert r.available_stock is None                  # 계획 시점 재고를 '재고 N' 으로 보이지 않는다
@@ -1229,7 +1236,7 @@ def test_geo_hidden_zero_stock_popup_row_is_ignored():
 
 
 def test_geo_exception_after_accepted_stage_marks_stopped():
-    site = Site({'A': 2}, {}, centers={'A': [['C1', 'c1', 5]]})
+    site = Site({'A': 0}, {}, centers={'A': [['C0', 'c0', 2], ['C1', 'c1', 5]]})
     c = crawler(site)
     original, calls = c._stage, []
     def stage(*a, **k):
@@ -1239,7 +1246,7 @@ def test_geo_exception_after_accepted_stage_marks_stopped():
         return original(*a, **k)
     c._stage = stage
     r = c._order_bare('A', 6)
-    assert site.sends == [{('A', ''): 2}]
+    assert site.sends == [{('A', 'c0'): 2}]
     assert r.success and r.fulfilled_quantity == 2 and r.shortfall_reason == 'stopped'
     assert r.message == '2개 주문 — 남은 4개는 확인 실패로 주문 안 함'
 
@@ -1293,7 +1300,8 @@ def test_geo_mismatch_reread_uses_second_local_stock():
         return original(url, **kw)
     site.post = post
     r = crawler(site)._order_bare('A', 6)
-    assert site.sends == [{('A', ''): 4}, {('A', 'c1'): 2}] and r.reason_code == 'ok'
+    # 두 번째 묶음의 자기센터 4 만 주문(자기센터 재고가 있으면 타센터 주문 안 함 — 사이트 정책)
+    assert site.sends == [{('A', ''): 4}] and r.fulfilled_quantity == 4 and r.shortfall_reason == 'stopped'
 
 
 def test_batch_adjusted_line_wording():
@@ -1537,3 +1545,159 @@ def test_telegram_unconfirmed_fallback_line_forbids_reorder(monkeypatch):
     text = _telegram(monkeypatch, [], failed, outs)
     assert text.startswith('⚠️ 자동주문 결과 확인 필요')
     assert '⚠ D — 백제 주문 결과 불명 — 확인 필요 — 도매몰 주문내역 확인 전 재주문 금지' in text
+
+
+# ── 상세 num=0 · 자기센터 재고가 있으면 타센터 주문 안 함(2026-10-09 실측·사용자 결정 A′) ──
+# 사이트는 상세 요청 num>0 이면 타센터 수량칸을 disabled 로 내린다(위 Site 대역). 크롤러는 num=0 으로만 읽어
+# 타센터 재고를 표시·가용량에 반영하고, 주문은 사이트 화면 정책대로 자기센터 재고가 있으면 자기센터만 보낸다.
+
+def test_geo_detail_always_requests_num_zero():
+    site = Site({'A': 5}, {}, centers={'A': [['C1', 'c1', 7]]})
+    c = crawler(site)
+    c.search('A')
+    c.presend_stock({'product_id': 'A'})
+    c._order_bare('A', 3)
+    assert site.info_nums and all(n == 0 for n in site.info_nums)
+
+
+def test_geo_site_disables_other_center_row_when_num_positive():
+    """대역이 실측 규칙을 재현하는지 — num>0 응답은 판독을 거부해야 한다(이 규칙이 빠지면 위 회귀가 무의미)."""
+    site = Site({'A': 5}, {}, centers={'A': [['C1', 'c1', 7]]})
+    url = 'https://order.geoweb.kr/Home/PartialProductInfo/A'
+    assert gw.GeoWebCrawler._centers(_bs(site.post(url, data={'num': 0}).text, 'html.parser')) == [('C1', 'c1', 7)]
+    with pytest.raises(ValueError):
+        gw.GeoWebCrawler._centers(_bs(site.post(url, data={'num': 5}).text, 'html.parser'))
+
+
+def test_geo_search_shows_other_stock_when_local_positive():
+    site = Site({'A': 5}, {}, centers={'A': [['C1', 'c1', 7], ['C2', 'c2', 0]]})
+    c = crawler(site)
+    r = c.search('A')[0]
+    assert (r.local_stock, r.other_stock, r.quantity, r.other_move_code) == (5, 7, 12, 'c1')
+    assert c.presend_stock({'product_id': 'A'}) == 12        # 물리 재고(표시·긴급 가용량)
+
+
+def test_geo_local_positive_orders_local_only_and_stops_rest():
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 7]]})
+    r = crawler(site)._order_bare('A', 5)
+    assert site.sends == [{('A', ''): 3}]
+    assert r.success and r.reason_code == 'stock_adjusted' and r.fulfilled_quantity == r.adjusted_quantity == 3
+    assert r.shortfall_reason == 'stopped' and r.unsent_quantity == 2 and r.available_stock is None
+    assert r.message == '3개 주문 — 남은 2개는 타센터 주문 제한으로 주문 안 함'
+
+
+def test_geo_local_positive_splits_policy_and_stock_shortage():
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 2]]})
+    r = crawler(site)._order_bare('A', 10)
+    assert site.sends == [{('A', ''): 3}]
+    assert r.message == '3개 주문 — 남은 2개는 타센터 주문 제한으로 주문 안 함, 5개는 재고 부족'
+    assert r.shortfall_reason == 'stopped' and r.unsent_quantity == 2
+
+
+def test_geo_local_covers_request_is_plain_ok():
+    site = Site({'A': 5}, {}, centers={'A': [['C1', 'c1', 7]]})
+    r = crawler(site)._order_bare('A', 5)
+    assert site.sends == [{('A', ''): 5}] and r.reason_code == 'ok' and r.shortfall_reason is None
+
+
+def test_geo_local_positive_other_zero_is_plain_stock_shortage():
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 0]]})
+    r = crawler(site)._order_bare('A', 5)
+    assert site.sends == [{('A', ''): 3}]
+    assert r.reason_code == 'stock_adjusted' and r.adjusted_quantity == 3 and r.shortfall_reason is None
+
+
+def test_geo_local_zero_uses_other_centers():
+    site = Site({'A': 0}, {}, centers={'A': [['C1', 'c1', 2], ['C2', 'c2', 7]]})
+    r = crawler(site)._order_bare('A', 5)
+    assert site.sends == [{('A', 'c1'): 2}, {('A', 'c2'): 3}] and r.reason_code == 'ok'
+
+
+def test_geo_batch_local_positive_never_sends_other_center():
+    site = Site({'A': 3, 'B': 0}, {}, centers={'A': [['C1', 'c1', 7]], 'B': [['C1', 'c1', 4]]})
+    r = crawler(site).order_batch([{'product_id': 'A', 'quantity': 5}, {'product_id': 'B', 'quantity': 2}])
+    assert site.sends == [{('A', ''): 3}, {('B', 'c1'): 2}]
+    assert r[0].shortfall_reason == 'stopped' and r[1].reason_code == 'ok'
+
+
+def test_geo_policy_stop_is_not_auto_fallback_but_urgent_moves_on():
+    """정책 2: 일반 자동 대체주문은 stopped 를 대체하지 않는다. 정책 4: 긴급은 접수분만 채움으로 본다."""
+    from domae_mcp.cloud.fallback import auto_fallback_need
+    from domae_mcp.cloud.urgent import urgent_supplier_step
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 7]]})
+    c = crawler(site)
+    r = c._order_bare('A', 5)
+    assert auto_fallback_need({'quantity': 5}, r, True) == 0
+    site = Site({'A': 3}, {}, centers={'A': [['C1', 'c1', 7]]})
+    step = urgent_supplier_step(crawler(site), 'A', ['A'], 5, before_send=lambda: None)
+    assert step.state == 'filled' and step.qty == 3 and site.sends == [{('A', ''): 3}]
+
+
+# ── 실측 num 비교쌍(2026-10-09, 비공개 서버 레포 fixtures/geoweb_live_20261009) ──
+# GEOWEB_LIVE_FIXTURES 의 형제 디렉터리를 읽는다. 기본 경로도 지정도 없을 때만 건너뛴다.
+LIVE_NUM = os.path.join(os.path.dirname(LIVE.rstrip(os.sep)), "geoweb_live_20261009") if LIVE.strip() else ""
+live_num = pytest.mark.skipif(_LIVE_ENV is None and not os.path.isdir(LIVE_NUM),
+                              reason="비공개 num 비교 픽스처 없음")
+
+
+def _live_num(name):
+    with open(os.path.join(LIVE_NUM, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def _live_num_expected():
+    return json.loads(_live_num("expected.json"))
+
+
+@live_num
+def test_geo_live_num_positive_disables_other_center_rows():
+    """사이트 동작 고정: 타센터 재고가 있으면 num>0 응답은 판독 거부, num=0 은 판독되고 가격은 같다."""
+    E = _live_num_expected()
+    for pid in E["nums"]:
+        soups = {n: _bs(_live_num(f"info_{pid}_num{n}.html"), "html.parser") for n in E["nums"][pid]}
+        assert [list(c) for c in gw.GeoWebCrawler._centers(soups[0])] == E["centers_num0"][pid]
+        for n, soup in soups.items():
+            assert gw._quantity(soup.select_one("table > tbody > tr:nth-child(3) > td").get_text(strip=True)) \
+                == E["price"][pid]
+            if n == 0:
+                continue
+            if pid == E["roles"]["other_positive"]:
+                with pytest.raises(ValueError, match=E["reject_reason_num_positive"]):
+                    gw.GeoWebCrawler._centers(soup)
+            else:                                          # 타센터 재고 0 대조군은 num 과 무관
+                assert [list(c) for c in gw.GeoWebCrawler._centers(soup)] == E["centers_num0"][pid]
+
+
+class LiveNumSite(Site):
+    """num 비교쌍 원문 — 요청 num 에 맞는 원문을 그대로 돌려준다(없는 조건은 실패)."""
+    def __init__(self):
+        super().__init__({}, {})
+        self.body, self.nums = _live_num(_live_num_expected()["files"]["search_4rows"]), []
+
+    def post(self, url, data=None, **k):
+        if url.endswith("PartialSearchProduct"):
+            return Resp(self.body)
+        if "PartialProductInfo/" in url:
+            pid = url.rsplit("/", 1)[1]
+            self.nums.append((pid, data["num"]))
+            try:
+                return Resp(_live_num(f"info_{pid}_num{data['num']}.html"))
+            except FileNotFoundError:
+                return Resp("", 404)
+        return super().post(url, data=data, **k)
+
+
+@live_num
+def test_geo_live_num_search_shows_other_stock_and_orders_local_only():
+    E = _live_num_expected()
+    pid = E["roles"]["other_positive"]
+    local, other = E["search_rows"][pid]
+    site = LiveNumSite()
+    c = crawler(site)
+    c._names = {}
+    rows = {r.product_id: r for r in c.search("x")}
+    assert (rows[pid].local_stock, rows[pid].other_stock) == (local, other)
+    assert all(n == 0 for _, n in site.nums)
+    site.local, site.names = {pid: local}, {pid: rows[pid].product_name}   # 주문내역 대역은 검색 제품명을 쓴다
+    r = c._order_bare(pid, local + 1)
+    assert site.sends == [{(pid, ""): local}] and r.shortfall_reason == "stopped" and r.unsent_quantity == 1
