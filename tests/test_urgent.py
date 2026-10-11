@@ -114,12 +114,12 @@ def test_bad_price_keeps_confirmed_fill(price):
     assert (s.state, s.qty, s.price, s.fulfilled) == ("filled", 3, 0, 0)
 
 
-@pytest.mark.parametrize("rc", ["not_sent", "stock_zero"])
+@pytest.mark.parametrize("rc", ["not_sent", "stock_zero", "rejected"])
 def test_confirmed_not_ordered_skips(rc):
     assert _step(Crawler({"k": [sr("P", 5)]}, OrderResult(success=False, reason_code=rc)))[0].state == "skip"
 
 
-@pytest.mark.parametrize("rc", ["send_unknown", "rejected", "other", None, "isolated_fail", "cart_dirty"])
+@pytest.mark.parametrize("rc", ["send_unknown", "other", None, "isolated_fail", "cart_dirty"])
 def test_ambiguous_halts(rc):
     assert _step(Crawler({"k": [sr("P", 5)]}, OrderResult(success=False, reason_code=rc)))[0].state == "halt"
 
@@ -131,7 +131,7 @@ def test_positive_partial_fulfillment_is_preserved(ful):
     assert s.state == "halt" and s.fulfilled == ful
 
 
-@pytest.mark.parametrize("rc", ["not_sent", "stock_zero"])
+@pytest.mark.parametrize("rc", ["not_sent", "stock_zero", "rejected"])
 @pytest.mark.parametrize("ful", [0, 1, 3, 5, False, True, None, "0", -1, 6])
 def test_safe_skip_requires_validated_integer_zero(rc, ful):
     s, _ = _step(Crawler({"k": [sr("P", 5)]}, OrderResult(success=False, reason_code=rc,

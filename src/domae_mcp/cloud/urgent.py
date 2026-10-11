@@ -20,7 +20,9 @@ _CAPITAL_BEFORE_KOREAN = re.compile(r"^[A-Z](?=[가-힣])")
 _PAREN_TAIL = re.compile(r"\(.*$")
 _MAKERS = frozenset(("삼아", "한화", "대웅", "동아", "종근당", "유한", "한미", "보령", "일동", "광동",
                      "녹십자", "JW", "중외", "삼일", "한독", "부광", "경동", "동국", "명인", "환인"))
-_SAFE_SKIP = frozenset(("not_sent", "stock_zero"))
+# 주문되지 않았음이 확정된 결과 — 다음 도매로 넘어간다. rejected 는 인천이 전송 후 장바구니가
+# 그대로임을 확인한 거부다(일일 주문 한도 등). 일반 대체주문(fallback.SAFE_TO_CONTINUE)과 같은 기준.
+_SAFE_SKIP = frozenset(("not_sent", "stock_zero", "rejected"))
 
 
 def _keyword_add(values: list[str], value: Optional[str]) -> None:
