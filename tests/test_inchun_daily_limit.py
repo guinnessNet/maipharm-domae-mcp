@@ -186,6 +186,35 @@ def test_batch_restores_pharmacy_cart_after_limit_handling():
     assert c.cart == [("Z", 4)]
 
 
+def test_batch_known_limit_survives_failed_restock_search():
+    """검수 지적 1: 한도(3)를 이미 아는데 Phase 2 재검색이 실패해도 한도를 넘겨 보내지 않는다."""
+    c = LimitInchun({"A": 10, "B": 50}, {}, {"A": 3})
+    c._daily_limits = {"A": 3, "B": 0}
+    res = c.order_batch([dict(A), dict(B)])
+    assert c.submits == [[("A", 3), ("B", 2)]]
+    assert res[0].success and res[0].adjusted_quantity == 3 and "일일 주문 한도 3개" in res[0].message
+    assert res[1].success
+
+
+class FlakyLimitInchun(LimitInchun):
+    """첫 번째 보험코드 검색만 실패(빈 결과)한다."""
+    def search(self, keyword):
+        if keyword == "000000001" and "flaked" not in self.__dict__:
+            self.flaked = True
+            self.queries.append(keyword)
+            return []
+        return super().search(keyword)
+
+
+def test_batch_limit_learned_in_phase2_still_isolates():
+    """검수 지적 2: 주문 직전 한도 확인은 실패했고 Phase 2 에서 처음 알게 된 한도도 분리에 쓴다."""
+    c = FlakyLimitInchun({"A": 10, "B": 50}, TABLE, {"A": 3}, used={"A": 3})
+    res = c.order_batch([dict(A, quantity=3), dict(B)])
+    assert c.submits[-2:] == [[("B", 2)], [("A", 3)]]
+    assert res[1].success
+    assert res[0].reason_code == "rejected" and "일일 주문 한도 3개" in res[0].message
+
+
 # ── 실측 원문 (비공개 픽스처) ──
 
 LIVE = os.environ.get("INCHUN_LIVE_FIXTURES")
