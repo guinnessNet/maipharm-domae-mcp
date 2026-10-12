@@ -86,15 +86,21 @@ def encode_runtime_id(rt: dict) -> bytes:
     if not isinstance(rt["magic"], str) or len(rt["magic"]) % 2 or not rt["magic"]:
         raise EncodingError("runtime_id")
     magic = hexd(rt["magic"], len(rt["magic"]) // 2)
-    return (lp(rt["implementation"].encode()) + lp(rt["python_version"].encode()) + lp(magic)
-            + lp(rt["artifact_kind"].encode()) + lp(u64(validate_safe_int(rt["loader_abi"], 0, "runtime_id")))
-            + lp(rt["platform"].encode()))
+    try:
+        return (lp(rt["implementation"].encode()) + lp(rt["python_version"].encode()) + lp(magic)
+                + lp(rt["artifact_kind"].encode()) + lp(u64(validate_safe_int(rt["loader_abi"], 0, "runtime_id")))
+                + lp(rt["platform"].encode()))
+    except UnicodeEncodeError:
+        raise EncodingError("runtime_id") from None
 
 
 def key_fp_from_bearer(bearer: str) -> bytes:
     if not isinstance(bearer, str) or not bearer:
         raise EncodingError("bearer")
-    return hashlib.sha256(bearer.encode("utf-8")).digest()
+    try:
+        return hashlib.sha256(bearer.encode("utf-8")).digest()
+    except UnicodeEncodeError:
+        raise EncodingError("bearer") from None
 
 
 def key_fp_from_hex(h: str) -> bytes:

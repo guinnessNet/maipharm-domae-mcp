@@ -40,7 +40,11 @@ def verify_envelope(envelope: dict, domain: str, trust: dict[str, bytes]) -> str
     if pub is None:
         raise EnvelopeError("unknown_signing_key")
     try:
-        Ed25519PublicKey.from_public_bytes(pub).verify(sig_bytes, signed_digest(domain, key_id, payload))
+        digest = signed_digest(domain, key_id, payload)
+    except UnicodeEncodeError:
+        raise EnvelopeError("malformed") from None
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig_bytes, digest)
     except InvalidSignature:
         raise EnvelopeError("bad_signature") from None
     return payload

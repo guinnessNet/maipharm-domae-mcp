@@ -93,3 +93,11 @@ def test_bundle_hash_and_protocol_version():
     for bad in (0, -1, 2.0, True, "2"):
         with pytest.raises(EncodingError):
             validate_protocol_version(bad)
+
+
+def test_lone_surrogate_rejected_as_encoding_error():
+    with pytest.raises(EncodingError):
+        key_fp_from_bearer("a\ud800")
+    for k in ("implementation", "python_version", "artifact_kind", "platform"):
+        with pytest.raises(EncodingError):
+            encode_runtime_id({**V["inputs"]["runtime_id"], k: "x\ud800"})

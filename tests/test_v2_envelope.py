@@ -55,3 +55,18 @@ def test_envelope_malformed_fields():
         with pytest.raises(EnvelopeError) as e:
             verify_envelope(c, DOMAIN_BUNDLE, TRUST)
         assert e.value.reason == "malformed"
+
+
+def test_lone_surrogate_payload_rejected_as_malformed():
+    e0 = env(DOMAIN_BUNDLE)
+    with pytest.raises(EnvelopeError) as e:
+        verify_envelope({**e0, "payload": json.loads('"\\ud800"')}, DOMAIN_BUNDLE, TRUST)
+    assert e.value.reason == "malformed"
+
+
+def test_lone_surrogate_key_id_rejected_as_malformed():
+    e0 = env(DOMAIN_BUNDLE)
+    bad = "k\ud800"
+    with pytest.raises(EnvelopeError) as e:
+        verify_envelope({**e0, "signing_key_id": bad}, DOMAIN_BUNDLE, {bad: TRUST[e0["signing_key_id"]]})
+    assert e.value.reason == "malformed"
