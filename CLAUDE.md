@@ -189,4 +189,4 @@ cd .. && python -m PyInstaller domae.spec --clean --noconfirm
 이 레포는 공개 레포다. 실제 품목코드·재고·주문 수량, 채팅 ID, 약국명, 거래처 코드, 크롤러 소스를 넣지 않는다.
 시험 값은 가상값(보험코드 `699xxxxxx`, 채팅 ID `100000000N`, `시험약국`, `TEST000N`)을 쓴다.
 실측 픽스처는 비공개 server 레포 `prisma/seeds/domae-crawlers/fixtures/` 에만 둔다.
-CI 의 `scripts/check_public_data.py` 는 보험코드 형태·채팅 ID 와, 비공개 금지 목록(CI 비밀값)에 있는 거래처 코드·약국명을 검사한다. 금지 목록이 없으면 CI 는 실패한다. 재고·수량 표본은 자동 검사 대상이 아니므로, 시험이 검사하는 관계만 유지한 가상값을 쓰는지 리뷰에서 확인한다.
+CI 의 `scripts/check_public_data.py` 는 채팅 ID 형태와, 비공개 금지 목록에 있는 원값(도매 아이디·비밀번호 등)이 코드 어디에든 들어 있는지 검사한다. 금지 목록은 로컬에서는 gitignore 된 `.public-data-denylist`(한 줄에 하나), CI 에서는 Actions 비밀값 `PUBLIC_DATA_DENYLIST` 이며, 없으면 검사는 실패한다. 로컬 확인: `python scripts/check_public_data.py tests src`. 계정 정보는 코드·시험에 직접 쓰지 않고 `.env`(gitignore) 나 DB 에서 읽는다. 품목코드·재고·수량 표본은 자동 검사 대상이 아니므로 새로 넣을 때는 가상값을 쓴다.

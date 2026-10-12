@@ -15,10 +15,10 @@ jobs:
           python-version: '3.12'
       - name: Check public data
         env:
-          DENYLIST_CONTENT: ${{ secrets.PUBLIC_DATA_DENYLIST_SHA256 }}
+          DENYLIST_CONTENT: ${{ secrets.PUBLIC_DATA_DENYLIST }}
         run: |
           umask 077
-          DENY="$RUNNER_TEMP/denylist.sha256"
+          DENY="$RUNNER_TEMP/denylist"
           printf '%s' "$DENYLIST_CONTENT" > "$DENY"
           PUBLIC_DATA_DENYLIST="$DENY" python scripts/check_public_data.py tests src
           rm -f "$DENY"

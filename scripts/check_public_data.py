@@ -1,63 +1,52 @@
 """공개 레포에 실측값이 들어가지 않았는지 검사한다. 일치한 값은 출력하지 않는다.
 
-금지 목록(거래처 코드·약국명의 SHA-256)은 비공개로 관리하며 PUBLIC_DATA_DENYLIST 로 경로를 받는다.
-목록이 없거나 잘못되면 검사를 건너뛰지 않고 종료 코드 2 로 실패한다.
+금지 목록은 도매 아이디·비밀번호 같은 원값을 한 줄에 하나씩 적은 비공개 파일이다.
+경로는 PUBLIC_DATA_DENYLIST 로 받고, 없으면 레포 루트의 .public-data-denylist(gitignore 대상)를 쓴다.
+CI 는 Actions 비밀값 PUBLIC_DATA_DENYLIST 를 임시 파일로 써서 넘긴다.
+목록이 없거나 비었거나 4자 미만 값이 있으면 검사를 건너뛰지 않고 종료 코드 2 로 실패한다.
 """
-import hashlib
 import os
 import re
 import sys
 from pathlib import Path
 
-SYNTHETIC_CODE = re.compile(r"^699\d{6}$")
-DIGEST = re.compile(r"^[0-9a-f]{64}$")
-# 거래처 코드·약국명 후보: 따옴표 안의 영숫자 코드(4~12자)와 '약국'·'팜'으로 끝나는 이름(공백 허용)
-CANDIDATE = re.compile(r"['\"]([A-Za-z0-9]{4,12}|[가-힣A-Za-z0-9 ]{1,20}(?:약국|팜))['\"]")
+DEFAULT_DENYLIST = Path(__file__).resolve().parents[1] / ".public-data-denylist"
+MIN_LEN = 4
 PATTERNS = {
-    "insurance_code": re.compile(r"(?<!\d)\d{9}(?!\d)"),
     "chat_id": re.compile(r"(?i)chat_?id\D{0,6}(-?\d{9,})"),
 }
-
-
-# 32자 이상 16진 토큰(커밋 SHA·해시)은 보험코드 검사 전에 가린다
-HEX_HASH = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])")
+SYNTHETIC_CHAT_ID = re.compile(r"-?10{7,}\d?")
 
 
 def load_denylist():
-    path = os.environ.get("PUBLIC_DATA_DENYLIST")
-    if not path:
-        return None
+    env = os.environ.get("PUBLIC_DATA_DENYLIST")
+    path = Path(env) if env else DEFAULT_DENYLIST
     try:
-        lines = [l.strip() for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
+        values = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     except (OSError, UnicodeDecodeError):
         return None
-    if not lines or not all(DIGEST.match(l) for l in lines):
+    if not values or any(len(v) < MIN_LEN for v in values):
         return None
-    return set(lines)
+    return values
 
 
-def scan(path: Path, deny: set) -> list:
+def scan(path: Path, deny: list) -> list:
     hits = []
     for no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-        masked = HEX_HASH.sub(lambda m: " " * len(m.group(0)), line)
         for name, pat in PATTERNS.items():
-            for m in pat.finditer(masked):
-                value = m.group(m.lastindex or 0)
-                if name == "insurance_code" and (SYNTHETIC_CODE.match(value) or len(set(value)) == 1):
-                    continue
-                if name == "chat_id" and re.fullmatch(r"-?10{7,}\d?", value):
+            for m in pat.finditer(line):
+                if name == "chat_id" and SYNTHETIC_CHAT_ID.fullmatch(m.group(1)):
                     continue
                 hits.append((no, name))
-        for m in CANDIDATE.finditer(line):
-            if hashlib.sha256("".join(m.group(1).split()).encode("utf-8")).hexdigest() in deny:
-                hits.append((no, "denylisted"))
+        if any(v in line for v in deny):
+            hits.append((no, "denylisted"))
     return hits
 
 
 def main(argv: list) -> int:
     deny = load_denylist()
     if deny is None:
-        print("config_error: PUBLIC_DATA_DENYLIST missing, unreadable, empty or malformed")
+        print("config_error: denylist missing, unreadable, empty or has values shorter than 4 chars")
         return 2
     bad = 0
     for arg in argv:

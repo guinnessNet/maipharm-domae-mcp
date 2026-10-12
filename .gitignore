@@ -55,3 +55,6 @@ src/domae_mcp/core/crawlers/familypharm.py
 
 # 테스트 크리덴셜 (공개 레포에 노출 금지)
 tests/.test_credentials.json
+
+# 공개 레포 검사기의 비공개 금지 목록(도매 아이디·비밀번호 원값)
+.public-data-denylist

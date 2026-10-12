@@ -27,20 +27,20 @@ def _setup(monkeypatch, resp):
 def test_dead_chat_is_reported(monkeypatch):
     dead, ok, bot = _setup(monkeypatch, Resp(403, {"ok": False, "description":
                            "Forbidden: bot can't initiate conversation with a user"}))
-    assert Notifier.send_telegram("123459363", "hi") is None
-    assert dead and dead[0][0] == "123459363" and ok == [] and bot == []
+    assert Notifier.send_telegram("100000001", "hi") is None
+    assert dead and dead[0][0] == "100000001" and ok == [] and bot == []
 
 
 def test_token_rejection_marks_bot(monkeypatch):
     dead, ok, bot = _setup(monkeypatch, Resp(401, {"ok": False, "description": "Unauthorized"}))
-    Notifier.send_telegram("123459363", "hi")
+    Notifier.send_telegram("100000001", "hi")
     assert dead == [] and ok == [] and bot and "Unauthorized" in bot[0]
 
 
 def test_success_clears(monkeypatch):
     dead, ok, bot = _setup(monkeypatch, Resp(200, {"ok": True, "result": {"message_id": 7}}))
-    assert Notifier.send_telegram("123459363", "hi") == 7
-    assert ok == ["123459363"] and dead == []
+    assert Notifier.send_telegram("100000001", "hi") == 7
+    assert ok == ["100000001"] and dead == []
 
 
 def test_sink_error_does_not_break_send(monkeypatch):
