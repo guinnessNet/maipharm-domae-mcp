@@ -101,3 +101,22 @@ def test_lone_surrogate_rejected_as_encoding_error():
     for k in ("implementation", "python_version", "artifact_kind", "platform"):
         with pytest.raises(EncodingError):
             encode_runtime_id({**V["inputs"]["runtime_id"], k: "x\ud800"})
+
+
+def test_u64_range_matches_typescript():
+    assert u64(2**53 - 1) == (2**53 - 1).to_bytes(8, "big")
+    for bad in (2**53, 2**64 - 1, -1, True, False, 1.0, "1", None):
+        with pytest.raises(EncodingError) as e:
+            u64(bad)
+        assert e.value.args == ("u64",)
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "\udc00"])
+def test_lone_surrogate_reason_matches_typescript(bad):
+    with pytest.raises(EncodingError) as e:
+        key_fp_from_bearer(f"b{bad}")
+    assert e.value.args == ("bearer",)
+    for k in ("implementation", "python_version", "artifact_kind", "platform"):
+        with pytest.raises(EncodingError) as e:
+            encode_runtime_id({**V["inputs"]["runtime_id"], k: f"x{bad}y"})
+        assert e.value.args == ("runtime_id",)

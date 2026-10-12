@@ -70,3 +70,12 @@ def test_lone_surrogate_key_id_rejected_as_malformed():
     with pytest.raises(EnvelopeError) as e:
         verify_envelope({**e0, "signing_key_id": bad}, DOMAIN_BUNDLE, {bad: TRUST[e0["signing_key_id"]]})
     assert e.value.reason == "malformed"
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "\udc00"])
+def test_unknown_key_id_checked_before_payload_encoding(bad):
+    # 신뢰 목록 조회가 digest 계산보다 먼저다(server envelope.spec.ts 와 같은 순서).
+    e0 = env(DOMAIN_BUNDLE)
+    with pytest.raises(EnvelopeError) as e:
+        verify_envelope({**e0, "signing_key_id": "other", "payload": "{\"n\":\"" + bad + "\"}"}, DOMAIN_BUNDLE, TRUST)
+    assert e.value.reason == "unknown_signing_key"

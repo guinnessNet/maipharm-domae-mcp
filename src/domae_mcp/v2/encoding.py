@@ -25,7 +25,8 @@ def lp(b: bytes) -> bytes:
 
 
 def u64(n: int) -> bytes:
-    if not _is_int(n) or n < 0 or n > 0xFFFFFFFFFFFFFFFF:
+    """0 이상 2^53-1 이하만 받는다(TypeScript u64 의 Number.isSafeInteger 범위와 같다)."""
+    if not _is_int(n) or n < 0 or n > MAX_SAFE:
         raise EncodingError("u64")
     return struct.pack(">Q", n)
 

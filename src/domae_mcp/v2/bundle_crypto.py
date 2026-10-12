@@ -56,11 +56,17 @@ def kdf_info(ctx: BundleContext) -> bytes:
 
 def module_aad(ctx: BundleContext, module_name: str, artifact_sha256: bytes) -> bytes:
     rt = _check(ctx)
-    if len(artifact_sha256) != 32:
+    if not isinstance(artifact_sha256, bytes) or len(artifact_sha256) != 32:
         raise CryptoError("context")
+    if not isinstance(module_name, str):
+        raise CryptoError("context")
+    try:
+        name = module_name.encode("utf-8")
+    except UnicodeEncodeError:  # 짝 없는 서로게이트 (TypeScript 는 utf8() 왕복 검사로 같은 사유)
+        raise CryptoError("context") from None
     return (lp(u64(ctx.protocol_version)) + lp(ctx.request_id) + lp(ctx.key_fp) + lp(ctx.device_id)
             + lp(ctx.bundle_hash.encode("utf-8")) + lp(u64(ctx.release_seq)) + lp(rt)
-            + lp(module_name.encode("utf-8")) + lp(artifact_sha256))
+            + lp(name) + lp(artifact_sha256))
 
 
 def x25519_shared(private_raw: bytes, peer_pub: bytes) -> bytes:
@@ -75,13 +81,22 @@ def x25519_shared(private_raw: bytes, peer_pub: bytes) -> bytes:
     return shared
 
 
+def _check_key32(key: bytes) -> None:
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise CryptoError("key_length")
+
+
 def derive_session_key(shared: bytes, salt: bytes, ctx: BundleContext) -> bytes:
-    if len(salt) != 32:
+    _check_key32(shared)
+    if shared == b"\x00" * 32:
+        raise CryptoError("zero_shared")
+    if not isinstance(salt, bytes) or len(salt) != 32:
         raise CryptoError("salt")
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=kdf_info(ctx)).derive(shared)
 
 
 def encrypt_module(session_key: bytes, ctx: BundleContext, name: str, plain: bytes, iv: bytes) -> dict:
+    _check_key32(session_key)  # AESGCM 은 16·24바이트 키도 받으므로 AES-256 을 여기서 강제한다
     if len(iv) != 12:
         raise CryptoError("iv")
     out = AESGCM(session_key).encrypt(iv, plain, module_aad(ctx, name, hashlib.sha256(plain).digest()))
@@ -89,7 +104,11 @@ def encrypt_module(session_key: bytes, ctx: BundleContext, name: str, plain: byt
 
 
 def decrypt_modules(session_key: bytes, ctx: BundleContext, modules: dict, manifest_sha256: dict) -> dict:
-    if not isinstance(modules, dict) or set(modules) != set(manifest_sha256):
+    # 순서: 컨테이너 형식 → 세션 키 길이 → 모듈 집합 (server decryptModules 와 같은 순서)
+    if not isinstance(modules, dict) or not isinstance(manifest_sha256, dict):
+        raise CryptoError("module_set")
+    _check_key32(session_key)
+    if set(modules) != set(manifest_sha256):
         raise CryptoError("module_set")
     seen, out = set(), {}
     for name in sorted(modules):

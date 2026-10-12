@@ -107,3 +107,65 @@ def test_all_zero_shared_rejected():
     with pytest.raises(CryptoError) as e:
         x25519_shared(d(I["client_priv_b64"]), b"\x00" * 32)
     assert e.value.reason == "zero_shared"
+
+
+# --- 교차 언어 거부 사유 일치 (최종 검수 I1·M1·L1). server bundleCrypto.spec.ts 에 짝 시험이 있다.
+
+SHA = b"\x01" * 32
+IV = b"\x02" * 12
+
+
+def reason(fn):
+    try:
+        fn()
+    except CryptoError as e:
+        return e.reason
+    return "none"
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "\udc00"])
+def test_module_name_surrogate_rejected_as_context(bad):
+    assert reason(lambda: module_aad(ctx(), "m" + bad, SHA)) == "context"
+    assert reason(lambda: encrypt_module(session_key(), ctx(), "m" + bad, b"x", IV)) == "context"
+
+
+def test_module_name_fffd_allowed_and_non_str_rejected():
+    assert len(module_aad(ctx(), "m�", SHA)) > 0
+    assert set(encrypt_module(session_key(), ctx(), "m�", b"x", IV)) == {"iv", "ct", "tag"}
+    assert reason(lambda: module_aad(ctx(), 1, SHA)) == "context"
+    assert reason(lambda: module_aad(ctx(), None, SHA)) == "context"
+
+
+def test_decrypt_container_type_is_module_set():
+    sk, enc, man = session_key(), enc_modules(), manifest()
+    for mods, mans in ((None, man), ([], man), ("x", man), (enc, None), (enc, []), ({}, []), ({}, None)):
+        assert reason(lambda: decrypt_modules(sk, ctx(), mods, mans)) == "module_set"
+    # 컨테이너 검사는 세션 키 검사보다 먼저다
+    assert reason(lambda: decrypt_modules(b"", ctx(), enc, None)) == "module_set"
+    assert decrypt_modules(sk, ctx(), {}, {}) == {}
+
+
+@pytest.mark.parametrize("bad", ["a" * 32, b"\x00" * 31, b"\x00" * 33, None, 1, bytearray(32)])
+def test_manifest_digest_value_rejected_as_context(bad):
+    man = manifest()
+    man["alpha"] = bad
+    assert reason(lambda: decrypt_modules(session_key(), ctx(), enc_modules(), man)) == "context"
+    assert reason(lambda: module_aad(ctx(), "alpha", bad)) == "context"
+
+
+@pytest.mark.parametrize("bad", [b"", b"\x01" * 16, b"\x01" * 31, b"\x01" * 33, "k" * 32, None, bytearray(32)])
+def test_session_key_must_be_32_bytes(bad):
+    assert reason(lambda: encrypt_module(bad, ctx(), "alpha", b"x", IV)) == "key_length"
+    assert reason(lambda: decrypt_modules(bad, ctx(), enc_modules(), manifest())) == "key_length"
+    # 세션 키 검사는 IV 검사보다 먼저다
+    assert reason(lambda: encrypt_module(bad, ctx(), "alpha", b"x", b"\x00" * 11)) == "key_length"
+
+
+def test_derive_session_key_rejects_bad_shared():
+    salt = d(I["salt_b64"])
+    assert reason(lambda: derive_session_key(b"\x00" * 32, salt, ctx())) == "zero_shared"
+    for bad in (b"", b"\x01" * 16, b"\x01" * 31, b"\x01" * 33, "s" * 32, None):
+        assert reason(lambda: derive_session_key(bad, salt, ctx())) == "key_length"
+    # shared 검사는 salt 검사보다 먼저다
+    assert reason(lambda: derive_session_key(b"\x00" * 32, b"", ctx())) == "zero_shared"
+    assert reason(lambda: derive_session_key(b"\x01" * 32, b"", ctx())) == "salt"
