@@ -1,7 +1,7 @@
 """크리덴셜 + 크롤러 코드 AES-256-GCM 암복호화
 
 크리덴셜 키: DOMAE_CREDENTIAL_KEY (base64 32바이트)
-크롤러 키: DOMAE_CRAWLER_KEY (없으면 DOMAE_CREDENTIAL_KEY로 fallback)
+크롤러 키: DOMAE_CRAWLER_KEY (base64 32바이트, fallback 없음)
 키 생성: python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
 """
 
@@ -29,10 +29,10 @@ def _get_credential_key() -> bytes:
 
 
 def _get_crawler_key() -> bytes:
-    """크롤러 코드 암복호화용 AES-256 키 로드. DOMAE_CRAWLER_KEY 우선, 없으면 크리덴셜 키 재사용."""
-    key_b64 = os.environ.get("DOMAE_CRAWLER_KEY") or os.environ.get("DOMAE_CREDENTIAL_KEY")
+    """크롤러 코드 암복호화용 AES-256 키 로드. DOMAE_CRAWLER_KEY 만 사용한다."""
+    key_b64 = os.environ.get("DOMAE_CRAWLER_KEY")
     if not key_b64:
-        raise RuntimeError("DOMAE_CRAWLER_KEY 또는 DOMAE_CREDENTIAL_KEY 환경변수가 설정되지 않았습니다.")
+        raise RuntimeError("DOMAE_CRAWLER_KEY 환경변수가 설정되지 않았습니다.")
     key = base64.b64decode(key_b64)
     if len(key) != 32:
         raise RuntimeError(f"크롤러 키는 32바이트여야 합니다 (현재: {len(key)})")
@@ -74,10 +74,10 @@ def encrypt_crawler_code(plaintext: str) -> str:
 
 def decrypt_crawler_code(stored: str) -> str:
     """암호화된 크롤러 코드를 복호화.
-    'v1:' prefix 없으면 legacy 평문으로 간주하여 그대로 반환 (마이그레이션 안전).
+    'v1:' 접두어가 없으면 거부한다.
     """
     if not stored.startswith(CRAWLER_MAGIC_PREFIX):
-        return stored  # legacy 평문
+        raise RuntimeError("legacy plaintext crawler code is not allowed")
     key = _get_crawler_key()
     aesgcm = AESGCM(key)
     raw = base64.b64decode(stored[len(CRAWLER_MAGIC_PREFIX):])
