@@ -29,7 +29,7 @@ def load_denylist():
         return None
     try:
         lines = [l.strip() for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if not lines or not all(DIGEST.match(l) for l in lines):
         return None

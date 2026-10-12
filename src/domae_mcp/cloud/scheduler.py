@@ -695,9 +695,8 @@ class CloudScheduler:
         """DB에서 크롤러 코드 로드 (AES-GCM 복호화 → SHA-256 해시 검증 → 동적 import)
 
         저장 포맷:
-        - 신규: 'v1:' prefix + base64(nonce+ciphertext+tag) — AES-256-GCM 암호화
-        - 레거시: 평문 (마이그레이션 전 레코드)
-        decrypt_crawler_code가 둘 다 처리.
+        - 'v1:' prefix + base64(nonce+ciphertext+tag) — AES-256-GCM 암호화(DOMAE_CRAWLER_KEY)
+        - 레거시 평문 행은 decrypt_crawler_code 가 거부하므로 복호화 실패로 기록되고 건너뛴다.
 
         재진입 시 기존 캐시는 초기화 (DB에서 비활성화된 크롤러가 메모리에 잔존하는 것 방지).
         """
@@ -715,7 +714,7 @@ class CloudScheduler:
         from domae_mcp.cloud.crypto import decrypt_crawler_code
 
         for name, stored_code, code_hash in rows:
-            # 1) 복호화 (legacy 평문은 그대로 반환)
+            # 1) 복호화 (legacy 평문·키 불일치는 예외 → 이 크롤러만 건너뜀)
             try:
                 plain_code = decrypt_crawler_code(stored_code)
             except Exception as e:
