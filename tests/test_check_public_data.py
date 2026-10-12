@@ -65,5 +65,14 @@ def test_empty_or_malformed_denylist_fails_closed(tmp_path):
 
 
 def test_hex_hash_digits_are_not_insurance_code(tmp_path):
-    sha = "6453" + "01230" + "abcdef0123456789"     # 숫자 9자리 뒤에 16진 문자가 이어지는 해시 모양
+    sha = "6453" + "01230" + "abcdef0123456789abcdef0123456789"[:31]   # 40자 SHA 모양
+    assert len(sha) == 40
     assert run(tmp_path, f"sha = {sha!r}\n").returncode == 0
+
+
+def test_code_adjacent_to_hex_letters_is_still_detected(tmp_path):
+    code = "645" + "301230"
+    for text in (f"x = {'D' + code!r}\n", f"x = {code + 'abc'!r}\n"):
+        r = run(tmp_path, text)
+        assert r.returncode == 1 and "insurance_code" in r.stdout
+        assert code not in r.stdout + r.stderr

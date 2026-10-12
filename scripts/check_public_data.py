@@ -14,10 +14,13 @@ DIGEST = re.compile(r"^[0-9a-f]{64}$")
 # 거래처 코드·약국명 후보: 따옴표 안의 영숫자 코드(4~12자)와 '약국'·'팜'으로 끝나는 이름(공백 허용)
 CANDIDATE = re.compile(r"['\"]([A-Za-z0-9]{4,12}|[가-힣A-Za-z0-9 ]{1,20}(?:약국|팜))['\"]")
 PATTERNS = {
-    # 16진수 해시(커밋 SHA 등) 안의 숫자열은 보험코드가 아니므로 16진 문자가 붙은 경우는 제외한다
-    "insurance_code": re.compile(r"(?<![0-9a-fA-F])\d{9}(?![0-9a-fA-F])"),
+    "insurance_code": re.compile(r"(?<!\d)\d{9}(?!\d)"),
     "chat_id": re.compile(r"(?i)chat_?id\D{0,6}(-?\d{9,})"),
 }
+
+
+# 32자 이상 16진 토큰(커밋 SHA·해시)은 보험코드 검사 전에 가린다
+HEX_HASH = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])")
 
 
 def load_denylist():
@@ -36,8 +39,9 @@ def load_denylist():
 def scan(path: Path, deny: set) -> list:
     hits = []
     for no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+        masked = HEX_HASH.sub(lambda m: " " * len(m.group(0)), line)
         for name, pat in PATTERNS.items():
-            for m in pat.finditer(line):
+            for m in pat.finditer(masked):
                 value = m.group(m.lastindex or 0)
                 if name == "insurance_code" and (SYNTHETIC_CODE.match(value) or len(set(value)) == 1):
                     continue
