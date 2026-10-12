@@ -244,11 +244,17 @@ def run_fb(crawlers, check):
     return out[0], pend
 
 
-def test_c2_same_product_unconfirmed_blocks_item():
+def test_c2_same_product_unconfirmed_skips_to_next_supplier():
     cs = {'복산': FC('복산'), '백제': FC('백제')}
     o, pend = run_fb(cs, lambda s, pid: 'same_product' if s == '복산' else None)
-    assert o.state == 'blocked' and '이전 주문 결과 확인 전' in o.message
-    assert pend == [] and cs['복산'].orders == [] and cs['백제'].orders == []
+    assert o.state == 'ordered' and o.supplier == '백제'
+    assert pend == ['백제'] and cs['복산'].orders == [] and len(cs['백제'].orders) == 1
+
+
+def test_c2_same_product_unconfirmed_everywhere_is_failed_not_blocked():
+    cs = {'복산': FC('복산'), '백제': FC('백제')}
+    o, pend = run_fb(cs, lambda s, pid: 'same_product')
+    assert o.state == 'failed' and pend == []
 
 
 def test_c2_cart_sync_supplier_any_unconfirmed_skips_to_next():
