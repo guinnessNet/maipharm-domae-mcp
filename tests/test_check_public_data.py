@@ -6,6 +6,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_public_data.py"
 LOGIN_ID = "shop" + "_user.01"           # 시험 전용 가상 아이디(밑줄·마침표 포함)
 PASSWORD = "Pw!" + "x9#long-secret"      # 시험 전용 가상 비밀번호(특수문자, 12자 초과)
+SPACED_ID = "abc" + " pharm7"            # 시험 전용 가상 아이디(중간 띄어쓰기)
 
 
 def run(tmp_path, text, deny=(LOGIN_ID, PASSWORD), deny_raw=None, set_env=True, deny_bytes=None):
@@ -69,3 +70,11 @@ def test_default_denylist_file_is_gitignored():
     root = Path(__file__).resolve().parents[1]
     r = subprocess.run(["git", "check-ignore", "-q", ".public-data-denylist"], cwd=root)
     assert r.returncode == 0
+
+
+def test_spaced_id_matches_with_or_without_space(tmp_path):
+    joined = SPACED_ID.replace(" ", "")
+    for text in (f"id = {SPACED_ID!r}\n", f"id = {joined!r}\n", f"id = {SPACED_ID.replace(' ', '  ')!r}\n"):
+        r = run(tmp_path, text, deny=(SPACED_ID,))
+        assert r.returncode == 1 and "denylisted" in r.stdout
+        assert SPACED_ID not in r.stdout + r.stderr and joined not in r.stdout + r.stderr
