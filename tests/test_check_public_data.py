@@ -60,8 +60,9 @@ def test_missing_denylist_env_fails_closed(tmp_path):
 
 
 def test_empty_or_malformed_denylist_fails_closed(tmp_path):
-    assert run(tmp_path, "x = 1\n", deny_raw="").returncode == 2
-    assert run(tmp_path, "x = 1\n", deny_raw="not-a-digest\n").returncode == 2
+    for raw in ("", "not-a-digest\n"):
+        r = run(tmp_path, "x = 1\n", deny_raw=raw)
+        assert r.returncode == 2 and "config_error" in r.stdout
 
 
 def test_hex_hash_digits_are_not_insurance_code(tmp_path):
