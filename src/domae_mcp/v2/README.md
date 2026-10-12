@@ -7,7 +7,7 @@
 | 항목 | 값 |
 |---|---|
 | LP | 4바이트 BE 길이 + 바이트 |
-| 정수 | 8바이트 BE unsigned. release_seq·시각은 0(또는 1)~2^53-1 의 정수, bool 거부 |
+| 정수 | 8바이트 BE unsigned. release_seq·protocol_version 은 1~2^53-1, 시각·loader_abi·device_generation 은 0~2^53-1 의 정수, bool·소수·문자열 거부 |
 | 시각 필드 | UTC epoch 초 정수 |
 | bundle_hash | 소문자 hex 64자 문자열, UTF-8 로 LP |
 | device_id | 소문자 hex 64자, 원시 32바이트로 LP |
