@@ -267,7 +267,7 @@ def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, rele
     """check_unconfirmed(supplier, product_id) → None | "same_product" | "other_product".
 
     같은 약국·도매에 결과 미확정 주문이 있는지 전송(pending 생성) 전에 확인한다.
-      same_product   그 품목의 대체주문을 멈춘다(blocked). 다음 순번으로도 넘기지 않는다.
+      same_product   그 도매만 건너뛰고 다음 순번 도매로 넘긴다(품목을 멈추지 않는다).
       other_product  장바구니 전체를 보내는 도매(SUPPORTS_CART_SYNC)면 그 도매만 건너뛴다.
       확인 실패      그 도매는 건너뛴다(아무것도 보내지 않았으므로 안전).
 
@@ -307,9 +307,10 @@ def run_fallback(needs, candidates, open_crawler, acquire_lock, renew_lock, rele
                         logger.warning("대체주문 미확정 조회 실패 [%s] — 건너뜀: %s", sup, e)
                         continue
                     if prior == "same_product":
-                        logger.warning("대체주문 중단 [%s/%s]: 같은 제품 미확정 주문 존재", sup, pick.product_id)
-                        outcome = FallbackOutcome(item, need, sup, 0, "blocked", BLOCKED_MESSAGE)
-                        break
+                        # 품목 전체를 멈추지 않는다. 같은 도매에 다시 보내는 것만 피하고 다음 순번으로 넘긴다
+                        # (2026-10-13: 멈추면 해소 수단이 없어 그 제품이 영영 주문되지 않았다).
+                        logger.warning("대체주문 [%s/%s] 건너뜀: 같은 제품 미확정 주문 존재 — 다음 순번", sup, pick.product_id)
+                        continue
                     if prior and getattr(crawler, "SUPPORTS_CART_SYNC", False):
                         logger.warning("대체주문 [%s] 건너뜀: 장바구니 전체 전송 도매에 미확정 주문 존재", sup)
                         continue
