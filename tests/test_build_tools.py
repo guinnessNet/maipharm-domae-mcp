@@ -202,3 +202,10 @@ def test_fake_server_roundtrip_with_worker_loader(tmp_path):
         assert [r[0] for r in st.requests] == ["GET", "POST", "GET"]
     finally:
         srv.shutdown()
+
+
+def test_build_report_builtin_stdlib_not_required(tmp_path):
+    f = tmp_path / "r.xml"
+    builtin = [m for m in cbr.REQUIRED_STDLIB if m in sys.builtin_module_names]
+    _nuitka_xml(f, [m for m in GOOD if m not in builtin])
+    assert cbr.main([str(f), "--kind", "nuitka"]) == 0

@@ -47,6 +47,8 @@ def problems(mods: set[str], stdlib_listed: bool) -> list[str]:
         elif m.startswith("domae_mcp.core.crawlers.") and m not in ALLOWED_CRAWLER_PKG:
             bad.append(f"forbidden:{m}")
     for r in REQUIRED + (REQUIRED_STDLIB if stdlib_listed else ()):
+        if r in sys.builtin_module_names:  # time·math 등 인터프리터 내장 모듈은 보고서에 나오지 않는다
+            continue
         if not _has(mods, r):
             bad.append(f"missing:{r}")
     return bad
