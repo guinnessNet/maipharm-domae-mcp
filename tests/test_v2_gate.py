@@ -704,3 +704,44 @@ def test_idle_time_with_wall_advancing_is_fine(env):
     for _ in range(3):
         env.t.advance(3600)
         CrawlerRegistry.require()
+
+
+# ── 결정 A(Codex 3차): float 누적·초기화 시점 기준점·단조 허용 ──
+
+def test_subsecond_repeated_entries_accumulate(env):
+    env.first_key()
+    env.t.advance(10)
+    CrawlerRegistry.require()
+    blocked = False
+    for _ in range(600):
+        env.t.advance(0, mono=0.5)  # wall 고정, 단조만 0.5초씩
+        try:
+            CrawlerRegistry.require()
+        except CrawlerBlocked as e:
+            assert e.reason == "clock_untrusted"
+            blocked = True
+            break
+    assert blocked
+    env.new_process()
+    env.server.version_status = (503, {"error": "no_release"}, None)
+    env.gate.start()
+    assert env.gate.status()["state"] != "ready"
+
+
+def test_rollback_right_after_publish_then_offline_restart(env):
+    env.first_key()  # publish 가 기준점을 지금으로 잡는다
+    env.t.advance(0, mono=300)  # 300초 사용 뒤 wall 을 발급 시각으로 되돌린 채 첫 진입
+    _blocked("clock_untrusted")
+    env.new_process()
+    env.server.version_status = (503, {"error": "no_release"}, None)
+    env.gate.start()
+    assert env.gate.status()["state"] != "ready"
+
+
+def test_monotonic_slightly_faster_than_wall_no_false_block(env):
+    env.first_key()
+    env.server.version_status = (503, {"error": "no_release"}, None)  # 오프라인
+    for _ in range(72):
+        env.t.advance(3600, mono=3600.18)  # 단조가 50ppm 빠름
+        CrawlerRegistry.require()
+        env.jobs.run_all()

@@ -12,6 +12,10 @@ from typing import Callable
 # 관측 최고 시각 저장 간격(초). 계획의 10분은 "저장 → 사용 → 종료 → 시계를 저장 시각으로 되돌려 재시작" 으로
 # 잔량을 되살릴 수 있어(Codex 전체 검수 1차) 진입 때마다(초 단위로 바뀔 때만) 저장한다.
 HIGH_WATER_PERSIST_S = 1
+# 단조 시간으로 계산한 시각 하한에만 두는 허용(사용자 결정 A, 2026-10-19). 단조 시계가 wall 보다 미세하게 빠를 때
+# 오프라인 장기 실행의 오탐을 막는다. wall 기준 관측 최고 시각 검사는 허용 0 이다.
+MONO_TOLERANCE_S = 2.0
+MONO_TOLERANCE_RATE = 0.001
 
 
 class ClockUntrusted(Exception):

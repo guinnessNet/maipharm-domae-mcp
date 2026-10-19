@@ -85,7 +85,8 @@ def test_build_report_ok(tmp_path):
 
 @pytest.mark.parametrize("extra", ["domae_mcp.core.crawlers.loader", "domae_mcp.core.crawlers._client_key",
                                    "domae_mcp.core.crawlers.familypharm", "domae_mcp.cloud.scheduler", "pytest",
-                                   "fakeredis", "tests.test_x", "domae_mcp.core.crawlers.geoweb"])
+                                   "fakeredis", "tests.test_x", "domae_mcp.core.crawlers.geoweb",
+                                   "domae_mcp.local.mcp_server", "mcp.server"])
 def test_build_report_forbidden(tmp_path, extra, capsys):
     f = tmp_path / "r.xml"
     _nuitka_xml(f, GOOD + [extra])

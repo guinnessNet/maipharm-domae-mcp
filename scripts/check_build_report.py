@@ -12,7 +12,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 FORBIDDEN_EXACT = {"domae_mcp.core.crawlers.loader", "domae_mcp.core.crawlers._client_key"}
-FORBIDDEN_PREFIX = ("domae_mcp.cloud", "pytest", "_pytest", "fakeredis", "tests")
+# MCP stdio 경로는 exe 에 넣지 않는다(exe 진입점에 --mcp 가 없다, 2026-10-19 coordinator 결정 A)
+FORBIDDEN_PREFIX = ("domae_mcp.cloud", "pytest", "_pytest", "fakeredis", "tests", "domae_mcp.local.mcp_server", "mcp")
 ALLOWED_CRAWLER_PKG = {"domae_mcp.core.crawlers", "domae_mcp.core.crawlers.base", "domae_mcp.core.crawlers.registry",
                        "domae_mcp.core.crawlers.cart_snapshot"}
 REQUIRED = ("domae_mcp.v2.crawler_deps", "domae_mcp.v2.gate", "domae_mcp._build_info", "requests", "urllib3", "bs4",

@@ -84,6 +84,7 @@ try {
             "--nofollow-import-to=domae_mcp.cloud --nofollow-import-to=domae_mcp.core.crawlers.loader",
             "--nofollow-import-to=domae_mcp.core.crawlers._client_key --nofollow-import-to=pytest",
             "--nofollow-import-to=_pytest --nofollow-import-to=fakeredis --nofollow-import-to=tests",
+            "--nofollow-import-to=domae_mcp.local.mcp_server --nofollow-import-to=mcp",
             "--output-filename=MaipharmDomae.exe `"--output-dir=$Out`" `"--report=$report`"",
             "--no-progressbar src\domae_mcp\desktop\app.py"
         ) -join " "

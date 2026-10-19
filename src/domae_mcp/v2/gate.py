@@ -15,7 +15,7 @@ from domae_mcp.core.crawlers.registry import CrawlerBlocked, CrawlerRegistry
 
 from .artifacts import LoadFailed, load_modules, unload_all
 from .client import next_backoff
-from .clock import HIGH_WATER_PERSIST_S, Clock, Lease, next_high_water
+from .clock import HIGH_WATER_PERSIST_S, MONO_TOLERANCE_RATE, MONO_TOLERANCE_S, Clock, Lease, next_high_water
 from .encoding import key_fp_from_bearer
 from .keyslot import KeySlots
 from .loader import Prepared, V2Error, V2Loader, V2Revoked
@@ -81,7 +81,7 @@ class RuntimeGate:
         self._last_hw_persist = 0
         # 관측 최고 시각 추적 (hw, 그때의 monotonic). 다음 진입까지 흐른 단조 시간만큼 hw 를 밀어 올려
         # "사용 → 다음 진입 전에 wall 을 되돌림 → 재시작" 으로 잔량을 되살리지 못하게 한다(Codex 2차)
-        self._hw_track: tuple[int, float] | None = None
+        self._hw_track: tuple[float, float] | None = None   # (기준 시각, 그때의 monotonic) — 진입마다 옮기지 않는다
 
     # ── 조립 ──
 
@@ -228,7 +228,7 @@ class RuntimeGate:
                 lease.cap(run.lease.check())
             self._registry.register_all(classes)
             self._running = _Running(p, lease)
-            self._hw_track = None
+            self._reset_hw_track(max(now, ks.time_high_water))
             if switching:
                 self._key_fp = p.key_fp
                 self._bearer = bearer or self._bearer
@@ -317,7 +317,7 @@ class RuntimeGate:
             self._version_failed = False
             self._version_level = 0
             self._version_retry_at = 0
-            self._hw_track = None  # 검증된 버전 확인이 hw 를 재설정했을 수 있다
+            self._reset_hw_track(self._clock.wall())  # 검증된 버전 확인이 hw 를 now 로 재설정했다
             if self._block == "clock_untrusted":
                 self._recover_clock()
             retry_cache = self._block == "clock_untrusted" or self._running is None
@@ -420,7 +420,7 @@ class RuntimeGate:
         lease.cap(run.lease.check())
         self._running = _Running(p, lease)
         self._block = None
-        self._hw_track = None  # 검증된 서버 시각으로 hw 를 재설정했다
+        self._reset_hw_track(now)  # 검증된 서버 시각으로 hw 를 재설정했다
 
     # ── 진입점 집행 ──
 
@@ -446,23 +446,26 @@ class RuntimeGate:
                 if self._block not in TERMINAL:
                     self._kick()
                 raise CrawlerBlocked(self._block)
+            # ① wall 기준 관측 최고 시각(허용 0)  ② 기준점 뒤 흐른 단조 시간(float 누적, 허용 2초+경과의 0.1%)
+            # — 사용자 결정 A(2026-10-19, Codex 3차). ②는 "사용 → 다음 진입 전 wall 되돌림 → 재시작" 을 막는다
             mono = self._clock.mono()
             if self._hw_track is None:
-                self._hw_track = (ks.time_high_water, mono)
-            expected = max(ks.time_high_water, self._hw_track[0] + int(max(0.0, mono - self._hw_track[1])))
-            if now < expected:
-                # 단조 경과로 계산한 시각을 저장해 재시작이 되돌린 시계로 잔량을 되살리지 못하게 한다
+                self._hw_track = (float(ks.time_high_water), mono)
+            elapsed = max(0.0, mono - self._hw_track[1])
+            mono_floor = int(self._hw_track[0] + elapsed - (MONO_TOLERANCE_S + MONO_TOLERANCE_RATE * elapsed))
+            if now < ks.time_high_water or now < mono_floor:
+                # 단조 시간으로 계산한 하한을 저장해 재시작이 되돌린 시계로 잔량을 되살리지 못하게 한다
+                floor = max(ks.time_high_water, mono_floor)
                 try:
                     self._state.update(run.prepared.key_fp,
-                                       lambda s: (setattr(s, "time_high_water", max(s.time_high_water, expected)), s)[1],
+                                       lambda s: (setattr(s, "time_high_water", max(s.time_high_water, floor)), s)[1],
                                        create=False)
                 except StoreError as e:
                     logger.warning("v2 시각 기록 생략: %s", e.reason)
                 self._set_block("clock_untrusted")
                 self._kick()
                 raise CrawlerBlocked("clock_untrusted")
-            hw = next_high_water(expected, now)
-            self._hw_track = (hw, mono)
+            hw = max(next_high_water(ks.time_high_water, now), mono_floor)
             if now - self._last_hw_persist >= HIGH_WATER_PERSIST_S or hw - ks.time_high_water >= HIGH_WATER_PERSIST_S:
                 self._last_hw_persist = now
                 try:
@@ -473,6 +476,10 @@ class RuntimeGate:
                     logger.warning("v2 시각 기록 생략: %s", e.reason)
             if run.lease.needs_renewal() and ks.backoff_until <= now:
                 self._kick()
+
+    def _reset_hw_track(self, base: int) -> None:
+        """publish·검증된 버전 확인·시계 복구 때 단조 추적의 기준점을 지금으로 잡는다(잠금 안)."""
+        self._hw_track = (float(base), self._clock.mono())
 
     def _kick(self) -> None:
         """복구·갱신 작업을 백그라운드로 1개만 시작한다(잠금 안). 네트워크를 기다리지 않는다."""
@@ -527,7 +534,7 @@ class RuntimeGate:
                 self.block("protocol_too_old", ctx)
             raise
         with self._lock:
-            self._hw_track = None
+            self._reset_hw_track(self._clock.wall())
             if self._block == "clock_untrusted":
                 self._recover_clock()
             run = self._running
