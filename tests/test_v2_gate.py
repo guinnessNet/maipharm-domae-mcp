@@ -683,3 +683,24 @@ def test_restart_with_clock_rollback_cannot_restore_lease(env):
     env.gate.start()
     _blocked()
     assert env.gate.status()["state"] != "ready"
+
+
+def test_rollback_before_next_entry_detected_by_monotonic(env):
+    # Codex 2차: 사용 뒤 다음 진입 전에 wall 을 마지막 저장 시각으로 되돌려도 단조 경과로 잡는다
+    env.first_key()
+    env.t.advance(10)
+    CrawlerRegistry.require()
+    env.t.advance(0, mono=300)  # 300초가 흘렀지만 wall 은 되돌려 그대로
+    _blocked("clock_untrusted")
+    env.new_process()
+    env.server.version_status = (503, {"error": "no_release"}, None)
+    env.gate.start()
+    _blocked()
+    assert env.gate.status()["state"] != "ready"
+
+
+def test_idle_time_with_wall_advancing_is_fine(env):
+    env.first_key()
+    for _ in range(3):
+        env.t.advance(3600)
+        CrawlerRegistry.require()

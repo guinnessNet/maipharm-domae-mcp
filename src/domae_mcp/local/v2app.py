@@ -24,6 +24,7 @@ BLOCK_MESSAGES = {
     "offline_deadline": "오프라인 사용 기한이 지났습니다. 인터넷 연결 뒤 자동으로 다시 받습니다.",
     "not_loaded": "크롤러가 아직 준비되지 않았습니다. 설정에서 API 키를 확인해 주세요.",
     "downgrade": "새 크롤러를 받는 중입니다. 잠시 뒤 다시 시도해 주세요.",
+    "stale_crawler": "크롤러가 바뀌었습니다. 다시 시도해 주세요.",
 }
 
 VERIFY_MESSAGES = {

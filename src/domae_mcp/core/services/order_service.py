@@ -51,12 +51,13 @@ class OrderService:
                 crawler.ensure_login(credentials["login_id"], credentials["login_pw"])
                 # 토큰/단가 캐시가 필요한 크롤러(TJ팜 등)를 위해 product_name 으로 선행 search.
                 # 결과는 버리고 크롤러 내부 상태만 확보.
+                CrawlerRegistry.ensure_current(crawler)  # 로그인 중 철회·키 전환됐으면 시작하지 않는다
                 if product_name:
                     try:
                         crawler.search(product_name)
                     except Exception:
                         logger.warning("order 전 선행 search 실패: %s / %s", supplier, product_name)
-                CrawlerRegistry.require()  # 로그인·선행 검색 중 철회·차단됐으면 주문을 시작하지 않는다
+                CrawlerRegistry.ensure_current(crawler)  # 선행 검색 중 철회·차단·키 전환됐으면 주문하지 않는다
                 result = crawler.order(product_id, quantity)
             except CrawlerBlocked:
                 raise

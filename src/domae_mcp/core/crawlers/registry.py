@@ -45,6 +45,17 @@ class CrawlerRegistry:
             guard()
 
     @classmethod
+    def ensure_current(cls, crawler: BaseCrawler) -> None:
+        """이미 얻은 크롤러 인스턴스로 다음 동작(검색·주문)을 하기 직전에 부른다.
+        게이트 검사에 더해, 그 인스턴스가 지금 등록된 클래스와 같은지 본다(키 전환·철회 뒤 옛 참조 실행 금지)."""
+        cls.require()
+        if cls._guard is None:
+            return
+        name = getattr(crawler, "SUPPLIER_NAME", "")
+        if cls._crawlers.get(name) is not type(crawler):
+            raise CrawlerBlocked("stale_crawler")
+
+    @classmethod
     def register(cls, name: str, crawler_class: type[BaseCrawler]) -> None:
         """크롤러 등록."""
         cls._crawlers[name] = crawler_class

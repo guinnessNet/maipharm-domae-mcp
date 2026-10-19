@@ -74,6 +74,7 @@ class SearchService:
         """개별 도매상 검색."""
         crawler = CrawlerRegistry.get(supplier_name)
         crawler.ensure_login(cred["login_id"], cred["login_pw"])
+        CrawlerRegistry.ensure_current(crawler)  # 로그인 중 철회·키 전환됐으면 검색하지 않는다
         return crawler.search(keyword)
 
     @staticmethod

@@ -79,6 +79,9 @@ class RuntimeGate:
         self._version_retry_at = 0
         self._version_level = 0
         self._last_hw_persist = 0
+        # 관측 최고 시각 추적 (hw, 그때의 monotonic). 다음 진입까지 흐른 단조 시간만큼 hw 를 밀어 올려
+        # "사용 → 다음 진입 전에 wall 을 되돌림 → 재시작" 으로 잔량을 되살리지 못하게 한다(Codex 2차)
+        self._hw_track: tuple[int, float] | None = None
 
     # ── 조립 ──
 
@@ -225,6 +228,7 @@ class RuntimeGate:
                 lease.cap(run.lease.check())
             self._registry.register_all(classes)
             self._running = _Running(p, lease)
+            self._hw_track = None
             if switching:
                 self._key_fp = p.key_fp
                 self._bearer = bearer or self._bearer
@@ -313,6 +317,7 @@ class RuntimeGate:
             self._version_failed = False
             self._version_level = 0
             self._version_retry_at = 0
+            self._hw_track = None  # 검증된 버전 확인이 hw 를 재설정했을 수 있다
             if self._block == "clock_untrusted":
                 self._recover_clock()
             retry_cache = self._block == "clock_untrusted" or self._running is None
@@ -415,6 +420,7 @@ class RuntimeGate:
         lease.cap(run.lease.check())
         self._running = _Running(p, lease)
         self._block = None
+        self._hw_track = None  # 검증된 서버 시각으로 hw 를 재설정했다
 
     # ── 진입점 집행 ──
 
@@ -440,14 +446,26 @@ class RuntimeGate:
                 if self._block not in TERMINAL:
                     self._kick()
                 raise CrawlerBlocked(self._block)
-            if now < ks.time_high_water:
+            mono = self._clock.mono()
+            if self._hw_track is None:
+                self._hw_track = (ks.time_high_water, mono)
+            expected = max(ks.time_high_water, self._hw_track[0] + int(max(0.0, mono - self._hw_track[1])))
+            if now < expected:
+                # 단조 경과로 계산한 시각을 저장해 재시작이 되돌린 시계로 잔량을 되살리지 못하게 한다
+                try:
+                    self._state.update(run.prepared.key_fp,
+                                       lambda s: (setattr(s, "time_high_water", max(s.time_high_water, expected)), s)[1],
+                                       create=False)
+                except StoreError as e:
+                    logger.warning("v2 시각 기록 생략: %s", e.reason)
                 self._set_block("clock_untrusted")
                 self._kick()
                 raise CrawlerBlocked("clock_untrusted")
-            if now - self._last_hw_persist >= HIGH_WATER_PERSIST_S:
+            hw = next_high_water(expected, now)
+            self._hw_track = (hw, mono)
+            if now - self._last_hw_persist >= HIGH_WATER_PERSIST_S or hw - ks.time_high_water >= HIGH_WATER_PERSIST_S:
                 self._last_hw_persist = now
                 try:
-                    hw = next_high_water(ks.time_high_water, now)
                     if hw != ks.time_high_water:
                         self._state.update(run.prepared.key_fp, lambda s: (setattr(s, "time_high_water", hw), s)[1],
                                            create=False)
@@ -509,6 +527,7 @@ class RuntimeGate:
                 self.block("protocol_too_old", ctx)
             raise
         with self._lock:
+            self._hw_track = None
             if self._block == "clock_untrusted":
                 self._recover_clock()
             run = self._running

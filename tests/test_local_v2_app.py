@@ -390,3 +390,41 @@ def test_masked_key_reverifies_active_key(env):
     body = env.verify(st["api_key_prefix"])
     assert body["valid"] is True and env.server.posts == 1
     assert env.slots.active() == (FA, TEST_BEARER)
+
+
+def test_stale_crawler_after_key_switch_not_used(env, monkeypatch):
+    from domae_mcp.core.services.order_service import OrderService
+    env.verify()
+    calls = {"order": 0}
+    old_cls = CrawlerRegistry._crawlers["가짜A"]
+    inst = old_cls()
+    orig_login = type(inst).ensure_login
+
+    def login_then_switch(self, i, p):
+        env.verify(TEST_BEARER_2)  # 로그인 대기 중 다른 키로 전환 성공
+    type(inst).ensure_login = login_then_switch
+    type(inst).order = lambda self, pid, q: calls.__setitem__("order", calls["order"] + 1)
+    try:
+        monkeypatch.setattr(CrawlerRegistry, "get", classmethod(lambda cls, name: inst))  # 전환 전 인스턴스
+        with pytest.raises(CrawlerBlocked) as e:
+            OrderService().place_order("가짜A", "p", "", 1, CREDS, None)
+        assert e.value.reason == "stale_crawler" and calls["order"] == 0
+    finally:
+        type(inst).ensure_login = orig_login
+
+
+def test_search_not_started_if_revoked_during_login(env):
+    from domae_mcp.core.services.search_service import SearchService
+    env.verify()
+    gate = env.gate
+    searched = {"n": 0}
+    cls = CrawlerRegistry._crawlers["가짜A"]
+    orig_login, orig_search = cls.ensure_login, cls.search
+    cls.ensure_login = lambda self, i, p: gate.block("key_revoked")
+    cls.search = lambda self, k: searched.__setitem__("n", 1) or []
+    try:
+        with pytest.raises(CrawlerBlocked):
+            SearchService._search_one("가짜A", "x", CREDS)
+        assert searched["n"] == 0
+    finally:
+        cls.ensure_login, cls.search = orig_login, orig_search
