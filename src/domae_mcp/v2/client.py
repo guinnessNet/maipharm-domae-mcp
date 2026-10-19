@@ -44,6 +44,7 @@ class Outcome:
     envelope: dict | None = field(default=None, repr=False)
     retry_after: int | None = None
     error: str | None = None
+    cancelled: bool = False           # 우리가 닫은 요청(서버 응답과 구분)
 
 
 def server_base() -> str:
@@ -142,13 +143,15 @@ class V2Client:
 
     def _send(self, method: str, path: str, headers: dict, body: bytes | None = None) -> Outcome:
         if self._closed:
-            return Outcome(TRANSIENT, error="cancelled")
+            return Outcome(TRANSIENT, error="cancelled", cancelled=True)
         try:
             r = self._http.request(method, self._base + path, headers=headers, content=body, follow_redirects=False)
         except Exception:  # 연결·타임아웃·잘못된 URL·인코딩 — 밖으로 내지 않는다
-            return Outcome(TRANSIENT, error="cancelled" if self._closed else "connection")
+            if self._closed:
+                return Outcome(TRANSIENT, error="cancelled", cancelled=True)
+            return Outcome(TRANSIENT, error="connection")
         if self._closed:  # 취소 뒤 도착한 응답은 버린다(P20)
-            return Outcome(TRANSIENT, error="cancelled")
+            return Outcome(TRANSIENT, error="cancelled", cancelled=True)
         return classify(r.status_code, r.content, r.headers)
 
     def version(self, req: Request) -> Outcome:

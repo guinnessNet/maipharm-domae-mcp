@@ -159,7 +159,12 @@ def test_response_after_close_is_discarded():
 
     holder["c"] = _client(handler)
     o = holder["c"].version(holder["c"].new_request())
-    assert o.kind == TRANSIENT and o.error == "cancelled"
+    assert o.kind == TRANSIENT and o.cancelled is True
+
+
+def test_server_error_named_cancelled_is_not_cancellation():
+    o = classify(503, _b({"error": "cancelled"}), {})
+    assert o.kind == TRANSIENT and o.cancelled is False
 
 
 def test_repr_hides_envelope_and_device():
@@ -173,7 +178,7 @@ def test_closed_client_is_transient_and_sends_nothing():
     c = _client(lambda r: (seen.append(r), httpx.Response(200, json=ENV))[1])
     c.close()
     o = c.version(c.new_request())
-    assert o.kind == TRANSIENT and o.error == "cancelled" and seen == []
+    assert o.kind == TRANSIENT and o.cancelled is True and seen == []
 
 
 def test_backoff_growth_cap_and_retry_after():

@@ -180,6 +180,8 @@ class V2Loader:
     def check_version(self) -> VersionInfo:
         req = self._client.new_request()
         o = self._client.version(req)
+        if o.cancelled:
+            raise V2Error("cancelled")
         if o.kind == c.REVOKED_ENVELOPE:
             self._revocation(o.envelope, req.request_id_b64)
         if o.kind != c.OK:
@@ -253,6 +255,8 @@ class V2Loader:
                     if e.reason != "stale":
                         self.fail_backoff()
                     raise
+            if o.cancelled:  # 우리가 취소한 요청은 서버 실패가 아니다(backoff 없음)
+                raise V2Error("cancelled")
             if o.kind != c.OK:
                 self.fail_backoff(o.retry_after)
                 raise V2Error(o.kind, retry_after=o.retry_after, detail=o.error)
@@ -282,14 +286,14 @@ class V2Loader:
             raise V2Error("payload", detail=e.reason) from None
         if not self._still_current():
             raise V2Error("stale")
-        seq, issued = p["release_seq"], p["issued_at"]
+        seq = p["release_seq"]
 
         def fn(s: KeyState) -> KeyState:
             s.min_release_seq = max(s.min_release_seq, vb.policy.min_release_seq)
             s.min_protocol_version = max(s.min_protocol_version, vb.policy.min_protocol_version)
             if s.device_generation is None or vb.device_generation > s.device_generation:
                 s.device_generation = vb.device_generation
-            s.time_high_water = next_high_water(s.time_high_water, issued, now)
+            s.time_high_water = next_high_water(s.time_high_water, now)
             return s
 
         ks = self._write(fn)
@@ -382,7 +386,7 @@ class V2Loader:
         def fn(s: KeyState) -> KeyState:
             s.min_release_seq = max(s.min_release_seq, vb.policy.min_release_seq)
             s.min_protocol_version = max(s.min_protocol_version, vb.policy.min_protocol_version)
-            s.time_high_water = next_high_water(s.time_high_water, issued, now)
+            s.time_high_water = next_high_water(s.time_high_water, now)
             return s
 
         ks = self._write(fn)

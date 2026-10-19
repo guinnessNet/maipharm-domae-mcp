@@ -189,8 +189,8 @@ class StateStore:
             return _copy(new)
 
     def reset_high_water(self, key_fp: bytes, verified_issued_at: int, now: int, create: bool = False) -> KeyState:
-        """시계 복구(P8). 서명·request_id·±10분 신선도를 통과한 release 응답의 issued_at 만 넘긴다.
-        time_high_water 를 낮출 수 있는 유일한 연산이다."""
+        """시계 복구(P8, 결정 A). 서명·request_id·±10분 신선도를 통과한 release 응답의 issued_at 만 넘긴다.
+        로컬 now 가 서버 시각과 ±10분 안임을 확인한 뒤 time_high_water 를 now 로 둔다. 낮출 수 있는 유일한 연산이다."""
         if abs(now - verified_issued_at) > _FRESH_S:
             raise StoreError("not_fresh")
         with self._lock:
@@ -199,7 +199,7 @@ class StateStore:
             if name not in keys and not create:
                 raise StoreError("forgotten")
             s = _copy(keys.get(name) or KeyState())
-            s.time_high_water = max(verified_issued_at, now)
+            s.time_high_water = now
             try:
                 _check_state(s)
             except EncodingError:

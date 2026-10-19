@@ -1,4 +1,9 @@
-"""도매 v2 시각과 오프라인 lease (스펙 B5 실행 중 집행, P8). 시각 역행 허용 오차는 두지 않는다."""
+"""도매 v2 시각과 오프라인 lease (스펙 B5 실행 중 집행, P8). 시각 역행 허용 오차는 두지 않는다.
+
+관측 최고 시각(time_high_water)에는 로컬 wall 관측만 쓴다(2026-10-19 사용자 결정 A, 계획 P8 수정).
+서버 issued_at 은 그 번들의 cache 모드 판정(now < issued_at → ClockUntrusted)에만 쓴다. 서버 시계가 로컬보다
+빠른 정상 시차에서 실행 중 차단·버전 확인 반복·불필요 POST 가 생기지 않게 하기 위해서다.
+"""
 import threading
 import time
 from dataclasses import dataclass, field
@@ -27,8 +32,9 @@ def effective_now_cache(now: int, high_water: int, issued_at: int) -> int:
     return max(now, high_water)
 
 
-def next_high_water(stored: int, issued_at: int, now: int) -> int:
-    return max(stored, issued_at, now)
+def next_high_water(stored: int, now: int) -> int:
+    """로컬 wall 관측만 반영한다(결정 A)."""
+    return max(stored, now)
 
 
 class Lease:

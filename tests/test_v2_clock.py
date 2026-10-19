@@ -47,10 +47,9 @@ def test_now_before_issued_untrusted():
         effective_now_cache(T0 - 1, 0, T0)
 
 
-def test_high_water_takes_local_now():
-    assert next_high_water(T0, T0 - 5, T0 + 50) == T0 + 50
-    assert next_high_water(T0 + 100, T0 - 5, T0 + 50) == T0 + 100
-    assert next_high_water(T0, T0 + 70, T0 + 50) == T0 + 70
+def test_high_water_takes_local_now_only():
+    assert next_high_water(T0, T0 + 50) == T0 + 50
+    assert next_high_water(T0 + 100, T0 + 50) == T0 + 100
 
 
 def test_network_effective_now():

@@ -148,6 +148,8 @@ def test_reset_high_water_lowers_and_persists(tmp_path, prot):
     assert e.value.reason == "not_fresh"
     with pytest.raises(StoreError):
         st.reset_high_water(FP_A, T0 + 601, T0)
+    # 서버 시각이 로컬보다 빨라도 로컬 now 로 둔다(결정 A)
+    assert st.reset_high_water(FP_A, T0 + 300, T0).time_high_water == T0
 
 
 def test_state_unreadable_starts_empty_once(tmp_path, prot):
