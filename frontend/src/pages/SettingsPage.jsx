@@ -13,13 +13,36 @@ export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState('apikey');
   const [currentFontSize, setCurrentFontSize] = useState(getFontSize() || 'normal');
 
+  const [reentry, setReentry] = useState([]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await client.get('/settings/setup-status');
+        setReentry(data.reentry_required || []);
+      } catch {}
+    })();
+  }, []);
+
   const handleFontChange = (size) => {
     setFontSize(size);
     setCurrentFontSize(size);
   };
 
+  const reentryLabel = (item) => {
+    if (item === 'api_key') return 'API 키';
+    if (item === 'telegram') return '텔레그램 봇 토큰';
+    if (item.startsWith('credentials:')) return `${item.slice('credentials:'.length)} 비밀번호`;
+    return item;
+  };
+
   return (
     <div>
+      {reentry.length > 0 && (
+        <div className="error-box" style={{ marginBottom: '1.25rem', maxWidth: '500px' }}>
+          보안 저장 방식이 바뀌어 다음 항목을 다시 입력해야 합니다: {reentry.map(reentryLabel).join(', ')}
+        </div>
+      )}
       {/* 글씨 크기 설정 */}
       <div className="card" style={{ marginBottom: '1.25rem', maxWidth: '500px' }}>
         <h3 style={{ marginBottom: '0.5rem' }}>글씨 크기</h3>
