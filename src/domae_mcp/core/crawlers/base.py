@@ -7,6 +7,10 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+# 크롤러 ABI(도매 v2, B-4). server scripts/domae-v2/build-config.json 의 base_abi 와 짝이다.
+# 크롤러가 쓰는 이 모듈의 API(이름·시그니처)를 깨는 변경을 하면 server 값과 함께 올린다.
+BASE_ABI = 1
+
 
 @dataclass
 class SearchResult:

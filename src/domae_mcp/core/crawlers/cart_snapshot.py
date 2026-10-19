@@ -22,6 +22,9 @@ import time
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+# 크롤러 ABI(도매 v2, B-4). server build-config.json 의 cart_abi 와 짝이다.
+# 크롤러가 쓰는 이 모듈의 API(이름·시그니처)를 깨는 변경을 하면 server 값과 함께 올린다.
+CART_ABI = 1
 LOCK_TTL = 900          # 실행 잠금. 조작 직전마다 갱신한다
 RELEASE_PENDING_KEY = "domae:cart_release_pending"
 REISSUE_SEC = 3600      # 막힌 상태에서 확인 버튼 재발급 간격
