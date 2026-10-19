@@ -2,6 +2,7 @@
 import ctypes
 import getpass
 import hashlib
+import platform
 import sys
 import uuid
 
@@ -11,8 +12,11 @@ NONCE_LEN = 32
 
 
 def machine_guid() -> str:
-    if sys.platform != "win32":
-        return f"{uuid.getnode():012x}"  # source 실행 전용(P17)
+    if sys.platform != "win32":  # source 실행 전용(P17)
+        node = uuid.getnode()
+        if node & (1 << 40):  # 하드웨어 주소를 못 읽어 무작위 값이 나왔다 — 실행마다 바뀌므로 쓰지 않는다
+            return f"host:{platform.node()}"
+        return f"{node:012x}"
     import winreg
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
                         winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:

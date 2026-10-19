@@ -31,3 +31,12 @@ def test_device_id_windows_sources():
     assert re.fullmatch(r"[0-9a-fA-F-]{36}", device.machine_guid())
     assert device.user_sid().startswith("S-1-5-")
     assert re.fullmatch(r"[0-9a-f]{64}", device.device_id_hex(b"\x01" * 32))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="source 실행 전용 경로")
+@pytest.mark.parametrize("node, expect_host", [(0x0223456789AB, False), (0x0223456789AB | (1 << 40), True)])
+def test_machine_guid_source_is_stable(monkeypatch, node, expect_host):
+    # getnode() 가 무작위 값(멀티캐스트 비트)을 돌려주면 실행마다 device_id 가 바뀌므로 호스트 이름을 쓴다
+    monkeypatch.setattr(device.uuid, "getnode", lambda: node)
+    monkeypatch.setattr(device.platform, "node", lambda: "test-host")
+    assert device.machine_guid() == ("host:test-host" if expect_host else f"{node:012x}")
