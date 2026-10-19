@@ -16,6 +16,7 @@ from domae_mcp.core.models import (
     UrgentOrder,
     UrgentOrderLog,
 )
+from domae_mcp.core.crawlers.registry import CrawlerBlocked, CrawlerRegistry
 from domae_mcp.core.services.search_service import SearchService
 from domae_mcp.core.services.order_service import OrderService
 from domae_mcp.core.services.telegram_service import TelegramService
@@ -99,6 +100,8 @@ class MonitorService:
         while not self._stop_event.is_set():
             try:
                 self.run_cycle()
+            except CrawlerBlocked as e:
+                logger.warning("모니터링 회차 건너뜀(크롤러 차단): %s", e.reason)
             except Exception:
                 logger.error("모니터링 사이클 에러", exc_info=True)
 
@@ -111,6 +114,7 @@ class MonitorService:
 
     def run_cycle(self):
         """모니터링 1회 사이클 실행."""
+        CrawlerRegistry.require()  # v2 게이트 진입 검사(막히면 그 회차를 건너뛴다)
         db: Session = self._db_session_factory()
         try:
             # 1. 모니터링 대상 제품 조회
@@ -122,6 +126,8 @@ class MonitorService:
             for product in products:
                 try:
                     self._process_product(db, product)
+                except CrawlerBlocked:
+                    raise
                 except Exception:
                     logger.warning(
                         "제품 처리 에러: %s", product.name, exc_info=True

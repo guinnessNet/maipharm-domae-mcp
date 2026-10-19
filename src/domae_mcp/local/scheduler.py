@@ -8,6 +8,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from domae_mcp.core.crawlers.registry import CrawlerBlocked, CrawlerRegistry
 from domae_mcp.core.models import MonitorSchedule
 from domae_mcp.core.services.monitor_service import MonitorService
 
@@ -100,8 +101,11 @@ class LocalScheduler:
         """메인 루프: 시간대별 간격에 따라 MonitorService.run_cycle() 호출."""
         while not self._stop_event.is_set():
             try:
+                CrawlerRegistry.require()  # v2 게이트 진입 검사
                 self._monitor.run_cycle()
                 self._last_run = datetime.now()
+            except CrawlerBlocked as e:
+                logger.warning("스케줄러 회차 건너뜀(크롤러 차단): %s", e.reason)
             except Exception:
                 logger.error("스케줄러 사이클 에러", exc_info=True)
 

@@ -5,12 +5,14 @@ import logging
 from typing import Optional
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from domae_mcp.core.crawlers import CrawlerRegistry
+from domae_mcp.core.crawlers.registry import CrawlerBlocked
 from domae_mcp.core.models import MonitorSchedule
+from domae_mcp.local import v2app
 from domae_mcp.local.config import ConfigManager
 from domae_mcp.local.database import get_db
 
@@ -89,6 +91,9 @@ class SetupStatusResponse(BaseModel):
     credentials_total: int
     telegram_set: bool
     crawler_count: int
+    crawler_state: dict
+    protected: bool
+    reentry_required: list[str]
 
 
 class ApiKeySaveRequest(BaseModel):
@@ -105,83 +110,38 @@ class ApiKeyVerifyResponse(BaseModel):
 
 @router.get("/settings/setup-status", response_model=SetupStatusResponse)
 def get_setup_status():
-    """초기 설정 상태 조회 (셋업 위자드용)."""
-    api_key = _config.get_api_key()
+    """초기 설정 상태 조회 (셋업 위자드용). 키 원문은 내보내지 않는다."""
+    gate = v2app.get_gate()
+    state = gate.status()
     creds = _config.get_all_credentials()
     tg = _config.get_telegram()
     configured = sum(1 for c in creds if c["configured"])
+    key_set = state["state"] != "no_key"
 
     return SetupStatusResponse(
-        api_key_set=bool(api_key),
-        api_key_prefix=api_key[:4] + "..." if api_key and len(api_key) > 4 else (api_key or ""),
+        api_key_set=key_set,
+        api_key_prefix="dmk_..." if key_set else "",
         credentials_configured=configured,
         credentials_total=len(creds),
         telegram_set=bool(tg.get("token") and tg.get("chat_id")),
-        crawler_count=len(CrawlerRegistry.get_all()) if CrawlerRegistry.is_loaded() else 0,
+        crawler_count=state["crawler_count"],
+        crawler_state=state,
+        protected=state["protected"],
+        reentry_required=_config.reentry_required() if hasattr(_config, "reentry_required") else [],
     )
 
 
-@router.put("/settings/api-key", response_model=MessageResponse)
-def save_api_key(req: ApiKeySaveRequest):
-    """API 키 저장. 기존 캐시 무효화 후 크롤러 재로드."""
-    _config.set_api_key(req.api_key)
-
-    # 캐시 무효화 (bundle.json 삭제)
-    bundle_path = _config.base_dir / "crawlers" / "bundle.json"
-    if bundle_path.exists():
-        bundle_path.unlink()
-        logger.info("크롤러 캐시 무효화됨")
-
-    return MessageResponse(success=True, message="API 키가 저장되었습니다.")
-
-
 @router.post("/settings/api-key/verify", response_model=ApiKeyVerifyResponse)
-async def verify_api_key(req: ApiKeySaveRequest, request: Request):
-    """API 키 검증 + 크롤러 다운로드."""
-    from domae_mcp.local.api_key import ApiKeyManager
-
-    api_key = req.api_key
-    if not api_key.startswith("dmk_"):
-        return ApiKeyVerifyResponse(
-            valid=False, tier="", pharmacy_name="",
-            message="API 키 형식이 올바르지 않습니다. (dmk_ 로 시작해야 합니다)",
-            crawler_count=0,
-        )
-
-    # 1. 서버에서 검증
-    manager = ApiKeyManager(_config)
-    try:
-        result = await manager.verify(api_key)
-    except ValueError as e:
-        logger.error("API 키 검증 실패: %s", e, exc_info=True)
-        return ApiKeyVerifyResponse(
-            valid=False, tier="", pharmacy_name="",
-            message="검증 중 오류가 발생했습니다", crawler_count=0,
-        )
-
-    # 2. API 키 저장
-    _config.set_api_key(api_key)
-
-    # 3. 크롤러 다운로드 + 레지스트리 갱신
-    crawler_count = 0
-    try:
-        from domae_mcp.core.crawlers.loader import CrawlerLoader
-        loader = CrawlerLoader(_config.base_dir, api_key)
-        crawlers = await asyncio.to_thread(loader.load)
-        CrawlerRegistry.register_all(crawlers)
-        crawler_count = len(crawlers)
-        # app.state에도 반영
-        if hasattr(request.app.state, "crawler_loader"):
-            request.app.state.crawler_loader = loader
-    except Exception as e:
-        logger.warning("API 키 검증 성공이나 크롤러 로드 실패: %s", e)
-
+async def verify_api_key(req: ApiKeySaveRequest):
+    """API 키 검증 = 도매 v2 초기화(버전 확인 → 번들 다운로드 → 전체 로드 성공 뒤 키 저장).
+    실패하면 활성 키·캐시·레지스트리는 그대로다."""
+    valid, message, count = await asyncio.to_thread(v2app.verify_key, req.api_key)
     return ApiKeyVerifyResponse(
-        valid=True,
-        tier=result.get("tier", "free"),
-        pharmacy_name=result.get("pharmacy_name", ""),
-        message=f"인증 완료! 크롤러 {crawler_count}개 로드됨.",
-        crawler_count=crawler_count,
+        valid=valid,
+        tier="local" if valid else "",
+        pharmacy_name="",
+        message=message,
+        crawler_count=count,
     )
 
 
@@ -216,10 +176,13 @@ def test_credentials(req: TestCredentialRequest):
 
     from domae_mcp.core.crawlers.base import CrawlerError
 
+    CrawlerRegistry.require()  # 막히면 423
     try:
         crawler = CrawlerRegistry.get(req.supplier)
         crawler.ensure_login(cred["login_id"], cred["login_pw"])
         return MessageResponse(success=True, message="로그인 성공")
+    except CrawlerBlocked:
+        raise
     except CrawlerError as e:
         logger.warning("로그인 실패 (%s): %s", req.supplier, e)
         return MessageResponse(success=False, message="로그인 실패: ID/비밀번호를 확인해주세요")

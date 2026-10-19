@@ -20,7 +20,7 @@ a = Analysis(
         'domae_mcp.local.database',
         'domae_mcp.local.scheduler',
         'domae_mcp.local.mcp_server',
-        'domae_mcp.local.api_key',
+        'domae_mcp.local.v2app',
         'domae_mcp.local.startup',
         'domae_mcp.local.routers.search',
         'domae_mcp.local.routers.order',

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from domae_mcp.core.crawlers import CrawlerRegistry, SearchResult
+from domae_mcp.core.crawlers.registry import CrawlerBlocked
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class SearchService:
         Returns:
             보험코드 기준 그룹핑된 검색 결과 리스트.
         """
+        CrawlerRegistry.require()  # v2 게이트 진입 검사(막히면 CrawlerBlocked)
         if credentials is None:
             credentials = {}
 
@@ -56,6 +58,8 @@ class SearchService:
                 try:
                     results = future.result()
                     all_results.extend(results)
+                except CrawlerBlocked:
+                    raise
                 except Exception:
                     logger.warning("크롤러 에러 무시: %s", name, exc_info=True)
 

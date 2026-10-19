@@ -6,6 +6,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from domae_mcp.core.crawlers import CrawlerRegistry, OrderResult
+from domae_mcp.core.crawlers.registry import CrawlerBlocked
 from domae_mcp.core.models import Order
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class OrderService:
         Returns:
             OrderResult.
         """
+        CrawlerRegistry.require()  # v2 게이트 진입 검사(막히면 CrawlerBlocked, 주문 기록 없음)
         if not CrawlerRegistry.is_loaded():
             result = OrderResult(
                 success=False,
@@ -55,6 +57,8 @@ class OrderService:
                     except Exception:
                         logger.warning("order 전 선행 search 실패: %s / %s", supplier, product_name)
                 result = crawler.order(product_id, quantity)
+            except CrawlerBlocked:
+                raise
             except Exception as e:
                 logger.error("주문 실패: %s %s", supplier, product_name, exc_info=True)
                 result = OrderResult(success=False, message=str(e))

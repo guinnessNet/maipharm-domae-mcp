@@ -7,13 +7,11 @@ import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from domae_mcp.local.config import ConfigManager
+from domae_mcp import __version__
 
 router = APIRouter(tags=["업데이트"])
 
 logger = logging.getLogger(__name__)
-
-_config = ConfigManager()
 
 GITHUB_REPO = "guinnessNet/maipharm-domae-mcp"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -35,7 +33,7 @@ class UpdateCheckResponse(BaseModel):
 @router.get("/update-check", response_model=UpdateCheckResponse)
 def check_update():
     """GitHub Releases API로 최신 버전 체크."""
-    current_version = _config._config.get("version", "1.0.0")
+    current_version = __version__
 
     try:
         resp = requests.get(

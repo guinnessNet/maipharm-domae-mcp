@@ -9,6 +9,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from domae_mcp.core.crawlers import CrawlerRegistry
+from domae_mcp.core.crawlers.registry import CrawlerBlocked
 from domae_mcp.core.models import (
     Order,
     Product,
@@ -44,16 +45,12 @@ def _init_services():
     init_db(_config)
     _session_factory = _get_session_factory(_config)
 
-    # 크롤러 동적 로드 (MCP 모드 — 동기)
-    api_key = _config.get_api_key()
-    if api_key:
-        from domae_mcp.core.crawlers.loader import CrawlerLoader
-        loader = CrawlerLoader(_config.base_dir, api_key)
-        try:
-            crawlers = loader.load()
-            CrawlerRegistry.register_all(crawlers)
-        except RuntimeError as e:
-            logger.warning("크롤러 로드 실패: %s", e)
+    # 도매 v2 시작 흐름 (MCP 모드 — 동기)
+    from domae_mcp.local import v2app
+    try:
+        v2app.get_gate().start()
+    except Exception:
+        logger.exception("v2 시작 흐름 실패")
     _search_service = SearchService()
     _order_service = OrderService()
 
@@ -267,6 +264,9 @@ async def call_tool(name: str, arguments: dict):
             return await _handle_test_credential(arguments)
         else:
             return _json_response({"error": f"알 수 없는 도구: {name}"})
+    except CrawlerBlocked as e:
+        from domae_mcp.local import v2app
+        return _json_response(v2app.blocked_body(e))
     except Exception as e:
         logger.error("도구 실행 에러: %s", name, exc_info=True)
         return _json_response({"error": str(e)})
@@ -519,10 +519,13 @@ async def _handle_test_credential(args: dict):
     if not cred.get("login_id") or not cred.get("login_pw"):
         return _json_response({"success": False, "message": f"{supplier} 계정이 설정되지 않았습니다."})
 
+    CrawlerRegistry.require()
     try:
         crawler = CrawlerRegistry.get(supplier)
         crawler.ensure_login(cred["login_id"], cred["login_pw"])
         return _json_response({"success": True, "message": "로그인 성공"})
+    except CrawlerBlocked:
+        raise
     except Exception as e:
         return _json_response({"success": False, "message": f"로그인 실패: {e}"})
 

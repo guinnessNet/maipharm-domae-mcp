@@ -98,7 +98,7 @@ function ApiKeyTab() {
         setInfo({ crawlerCount: data.crawler_count });
       }
     } catch (err) {
-      setStatus({ valid: false, message: err.response?.data?.detail || '서버 연결 실패' });
+      setStatus({ valid: false, message: err.response?.data?.message || err.response?.data?.detail || '서버 연결 실패' });
     } finally {
       setLoading(false);
     }
@@ -120,7 +120,7 @@ function ApiKeyTab() {
           type="text"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
-          placeholder="dmk_free_xxxxxxxxxxxxxxxx"
+          placeholder="dmk_xxxxxxxxxxxxxxxx"
           style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
           onKeyDown={(e) => e.key === 'Enter' && handleVerify()}
         />
@@ -133,7 +133,7 @@ function ApiKeyTab() {
           <div>{status.message}</div>
           {status.valid && status.tier && (
             <div style={{ fontSize: '0.8rem', marginTop: '0.3rem' }}>
-              등급: {status.tier} | 약국: {status.pharmacy_name || '-'}
+              등급: {status.tier === 'local' ? '로컬' : status.tier}
             </div>
           )}
         </div>

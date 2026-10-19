@@ -1,0 +1,16 @@
+{
+  "name": "마이팜 도매",
+  "short_name": "도매검색",
+  "description": "의약품 도매 통합검색 · 주문",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

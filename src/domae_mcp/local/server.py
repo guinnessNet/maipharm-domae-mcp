@@ -1,6 +1,5 @@
 """FastAPI 웹서버: 0.0.0.0 바인딩, 로컬 네트워크 전용"""
 
-import asyncio
 import ipaddress
 import logging
 from contextlib import asynccontextmanager
@@ -12,10 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
+from domae_mcp import __version__
+from domae_mcp.core.crawlers.registry import CrawlerBlocked
+from domae_mcp.local import v2app
 from domae_mcp.local.config import ConfigManager
 from domae_mcp.local.database import init_db
-from domae_mcp.core.crawlers.loader import CrawlerLoader
-from domae_mcp.core.crawlers.registry import CrawlerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -26,22 +26,13 @@ async def lifespan(app: FastAPI):
     config = ConfigManager()
     init_db(config)
 
-    # 크롤러 서버 로드 (동기 loader를 asyncio.to_thread로 래핑)
-    api_key = config.get_api_key()
-    loader = None
-    if api_key:
-        try:
-            loader = CrawlerLoader(config.base_dir, api_key)
-            crawlers = await asyncio.to_thread(loader.load)
-            CrawlerRegistry.register_all(crawlers)
-        except RuntimeError as e:
-            # 크롤러 로드 실패해도 서버는 시작 (설정 페이지 접근 필요)
-            logger.warning("크롤러 로드 실패: %s", e)
-    else:
-        logger.warning("API 키 미설정 — 크롤러 없이 시작. 설정 페이지에서 API 키를 등록하세요.")
+    # 도매 v2 시작 흐름(캐시 → 버전 확인 → 필요하면 다운로드). 실패해도 서버는 뜬다(설정 화면 필요)
+    try:
+        v2app.start_background()
+    except Exception:
+        logger.exception("v2 게이트 준비 실패 — 크롤러 없이 시작")
 
     app.state.config = config
-    app.state.crawler_loader = loader
 
     yield
     # 종료: 정리 작업
@@ -50,9 +41,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="maipharm-domae-mcp",
     description="의약품 도매 통합 검색/주문 로컬 서버",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(CrawlerBlocked)
+async def crawler_blocked_handler(request: Request, exc: CrawlerBlocked):
+    return JSONResponse(status_code=423, content=v2app.blocked_body(exc))
+
 
 @app.middleware("http")
 async def local_network_only(request: Request, call_next):
