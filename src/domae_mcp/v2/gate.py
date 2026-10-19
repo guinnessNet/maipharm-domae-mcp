@@ -436,6 +436,8 @@ class RuntimeGate:
                 self._kick()
                 raise CrawlerBlocked("not_loaded")
             if run.lease.check() == 0:
+                # 만료로 막을 때도 단조 하한을 저장한다(되돌린 시계로 재시작해 잔량을 되살리지 못하게, Codex 4차)
+                self._persist_mono_floor(run.prepared.key_fp)
                 self._set_block("offline_deadline")
                 self._kick()
                 raise CrawlerBlocked("offline_deadline")
@@ -448,11 +450,7 @@ class RuntimeGate:
                 raise CrawlerBlocked(self._block)
             # ① wall 기준 관측 최고 시각(허용 0)  ② 기준점 뒤 흐른 단조 시간(float 누적, 허용 2초+경과의 0.1%)
             # — 사용자 결정 A(2026-10-19, Codex 3차). ②는 "사용 → 다음 진입 전 wall 되돌림 → 재시작" 을 막는다
-            mono = self._clock.mono()
-            if self._hw_track is None:
-                self._hw_track = (float(ks.time_high_water), mono)
-            elapsed = max(0.0, mono - self._hw_track[1])
-            mono_floor = int(self._hw_track[0] + elapsed - (MONO_TOLERANCE_S + MONO_TOLERANCE_RATE * elapsed))
+            mono_floor = self._mono_floor(ks.time_high_water)
             if now < ks.time_high_water or now < mono_floor:
                 # 단조 시간으로 계산한 하한을 저장해 재시작이 되돌린 시계로 잔량을 되살리지 못하게 한다
                 floor = max(ks.time_high_water, mono_floor)
@@ -476,6 +474,24 @@ class RuntimeGate:
                     logger.warning("v2 시각 기록 생략: %s", e.reason)
             if run.lease.needs_renewal() and ks.backoff_until <= now:
                 self._kick()
+
+    def _mono_floor(self, stored_hw: int) -> int:
+        """기준점 뒤 흐른 단조 시간으로 계산한 시각 하한(허용 2초+경과의 0.1%, 결정 A). 잠금 안."""
+        mono = self._clock.mono()
+        if self._hw_track is None:
+            self._hw_track = (float(stored_hw), mono)
+        elapsed = max(0.0, mono - self._hw_track[1])
+        return int(self._hw_track[0] + elapsed - (MONO_TOLERANCE_S + MONO_TOLERANCE_RATE * elapsed))
+
+    def _persist_mono_floor(self, key_fp: bytes) -> None:
+        try:
+            ks = self._key_state(key_fp)
+            floor = max(self._mono_floor(ks.time_high_water), self._clock.wall())
+            if floor > ks.time_high_water:
+                self._state.update(key_fp, lambda s: (setattr(s, "time_high_water", max(s.time_high_water, floor)), s)[1],
+                                   create=False)
+        except StoreError as e:
+            logger.warning("v2 시각 기록 생략: %s", e.reason)
 
     def _reset_hw_track(self, base: int) -> None:
         """publish·검증된 버전 확인·시계 복구 때 단조 추적의 기준점을 지금으로 잡는다(잠금 안)."""

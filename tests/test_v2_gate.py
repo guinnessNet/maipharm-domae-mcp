@@ -745,3 +745,15 @@ def test_monotonic_slightly_faster_than_wall_no_false_block(env):
         env.t.advance(3600, mono=3600.18)  # 단조가 50ppm 빠름
         CrawlerRegistry.require()
         env.jobs.run_all()
+
+
+def test_expiry_block_still_persists_monotonic_floor(env):
+    # Codex 4차: 단조만 144시간+1초 흐르고 wall 을 되돌린 채 진입 → offline_deadline 으로 막혀도 하한을 저장
+    env.first_key()
+    env.server.version_status = (503, {"error": "no_release"}, None)
+    env.t.advance(0, mono=144 * H + 1)
+    _blocked("offline_deadline")
+    assert env.state.get(FA).time_high_water >= T0 + 144 * H - 600
+    env.new_process()
+    env.gate.start()
+    assert env.gate.status()["state"] != "ready"
