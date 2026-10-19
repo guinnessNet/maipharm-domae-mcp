@@ -33,7 +33,6 @@ a = Analysis(
         'domae_mcp.core.crawlers',
         'domae_mcp.core.crawlers.base',
         'domae_mcp.core.crawlers.registry',
-        'domae_mcp.core.crawlers.loader',
         'domae_mcp.core.models',
         'domae_mcp.core.services.search_service',
         'domae_mcp.core.services.order_service',
