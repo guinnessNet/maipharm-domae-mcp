@@ -209,3 +209,25 @@ def test_build_report_builtin_stdlib_not_required(tmp_path):
     builtin = [m for m in cbr.REQUIRED_STDLIB if m in sys.builtin_module_names]
     _nuitka_xml(f, [m for m in GOOD if m not in builtin])
     assert cbr.main([str(f), "--kind", "nuitka"]) == 0
+
+
+def test_gui_logging_when_no_console(tmp_path, monkeypatch):
+    import logging
+    from domae_mcp.desktop import app as desktop_app
+    monkeypatch.setenv("MAIPHARM_DOMAE_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    root = logging.getLogger()
+    old = root.handlers[:]
+    root.handlers = []
+    try:
+        desktop_app._setup_logging()
+        assert sys.stdout is not None and sys.stderr is not None
+        import uvicorn.logging as ul
+        ul.DefaultFormatter(fmt="%(message)s", use_colors=None)  # isatty 에서 실패하지 않는다
+        logging.getLogger("x").warning("hello-log")
+        assert "hello-log" in (tmp_path / "logs" / "app.log").read_text(encoding="utf-8")
+    finally:
+        for h in root.handlers:
+            h.close()
+        root.handlers = old

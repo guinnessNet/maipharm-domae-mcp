@@ -105,10 +105,15 @@ class TrayApp:
         # 서버 시작
         _start_server()
 
+        # 시험 실행(MAIPHARM_DOMAE_HEADLESS=1)은 브라우저 자동 열기·시작프로그램 질문을 하지 않는다
+        import os
+        headless = os.environ.get("MAIPHARM_DOMAE_HEADLESS") == "1"
+
         # 2초 후 브라우저 열기
-        timer = threading.Timer(2.0, _open_browser)
-        timer.daemon = True
-        timer.start()
+        if not headless:
+            timer = threading.Timer(2.0, _open_browser)
+            timer.daemon = True
+            timer.start()
 
         # 첫 실행 시 시작프로그램 등록 제안 (3초 후)
         def _ask_startup():
@@ -128,9 +133,10 @@ class TrayApp:
                 except Exception:
                     pass
 
-        startup_timer = threading.Timer(3.0, _ask_startup)
-        startup_timer.daemon = True
-        startup_timer.start()
+        if not headless:
+            startup_timer = threading.Timer(3.0, _ask_startup)
+            startup_timer.daemon = True
+            startup_timer.start()
 
         # 트레이 아이콘 메뉴
         menu = pystray.Menu(
