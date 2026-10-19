@@ -5,6 +5,8 @@ import sys
 
 
 def main():
+    from domae_mcp.v2.selftest import maybe_run
+    maybe_run(sys.argv[1:])  # --v2-selftest-out <file> 이면 자체 시험 뒤 종료
     parser = argparse.ArgumentParser(
         prog="domae_mcp",
         description="의약품 도매 통합 검색/주문 MCP 서버",

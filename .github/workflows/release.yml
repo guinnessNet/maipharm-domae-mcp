@@ -1,12 +1,15 @@
 name: Release
 
+# exe 빌드 정본은 pico 로컬 scripts/build_exe.ps1 이다(B-4 결정 F7). 이 워크플로는 같은 스크립트로
+# 출시 빌드를 재현해 아티팩트로만 올린다. GitHub Release 업로드는 하지 않는다(배포·업데이트 경로는 B-5).
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-exe:
@@ -17,29 +20,27 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.10'
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Build frontend
+      - name: Create venv and install
         run: |
-          cd frontend
-          npm ci
-          npm run build
-          Copy-Item -Recurse dist/* ../src/domae_mcp/static/ -Force
+          python -m venv .venv
+          .venv\Scripts\python -m pip install . -r requirements-build.txt
 
-      - name: Install dependencies
-        run: |
-          pip install .
-          pip install pyinstaller pystray Pillow
+      - name: Build exe (release)
+        run: powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -Kind release -Python .venv\Scripts\python.exe -Out dist
 
-      - name: Build exe
-        run: pyinstaller domae.spec
-
-      - name: Upload exe to release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/MaipharmDomae.exe
+          name: MaipharmDomae-exe
+          path: |
+            dist/MaipharmDomae.exe
+            dist/MaipharmDomae.exe.sha256
+            dist/nuitka-report.xml
+            dist/build-summary.json

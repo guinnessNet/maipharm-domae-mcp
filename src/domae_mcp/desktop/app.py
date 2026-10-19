@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 def main():
     """데스크톱 앱 진입점."""
+    from domae_mcp.v2.selftest import maybe_run
+    maybe_run(sys.argv[1:])  # --v2-selftest-out <file> 이면 자체 시험 뒤 종료
     from domae_mcp.desktop.tray import TrayApp
     app = TrayApp()
     app.run()
