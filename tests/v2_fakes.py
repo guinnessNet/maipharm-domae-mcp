@@ -194,6 +194,7 @@ class FakeV2Server:
         self.manifest_kw: dict = {}
         self.requests: list[httpx.Request] = []
         self.on_request = None
+        self.post_envelope = None  # 서명된 번들 envelope 을 응답 직전에 바꾸는 훅(시험용)
 
     @property
     def posts(self) -> int:
@@ -253,10 +254,13 @@ class FakeV2Server:
             if self.device_generation is None:
                 self.device_generation = self.generation_on_register
             rt = self.runtime_id or body["runtime_id"]
-            return httpx.Response(200, json=make_bundle_envelope(
+            env = make_bundle_envelope(
                 self.plain, self.manifest(), rid, body["client_pub"], fp, did, rt, self.release_seq, now,
                 self.device_generation, mutate=self.post_mutate, encrypt_plain=self.post_encrypt_plain,
-                **self.post_sign_kw))
+                **self.post_sign_kw)
+            if self.post_envelope:
+                env = self.post_envelope(env)
+            return httpx.Response(200, json=env)
         raise AssertionError(f"unexpected {req.method} {path}")
 
     def transport(self) -> httpx.MockTransport:
@@ -264,3 +268,47 @@ class FakeV2Server:
 
     def client(self) -> httpx.Client:
         return httpx.Client(transport=self.transport(), follow_redirects=False)
+
+
+# ── 로더·게이트 시험 공용 (Task 6~8) ──
+
+DEVICE_HEX = "d0" * 32
+T0 = 1_800_000_000
+H = 3600
+
+
+class FakeTime:
+    def __init__(self, wall: int = T0, mono: float = 1000.0):
+        self.w, self.m = wall, mono
+
+    def clock(self):
+        from domae_mcp.v2.clock import Clock
+        return Clock(wall=lambda: self.w, mono=lambda: self.m)
+
+    def advance(self, wall: int = 0, mono: float | None = None):
+        self.w += wall
+        self.m += wall if mono is None else mono
+
+
+def pick_protector():
+    import sys
+    from domae_mcp.v2.winprotect import DevPlainProtector, DpapiProtector
+    return DpapiProtector() if sys.platform == "win32" else DevPlainProtector()
+
+
+class CountingProtector:
+    def __init__(self, inner):
+        self.inner = inner
+        self.protected = inner.protected
+        self.unprotects = 0
+        self.fail_unprotect = False
+
+    def protect(self, data, purpose):
+        return self.inner.protect(data, purpose)
+
+    def unprotect(self, blob, purpose):
+        self.unprotects += 1
+        if self.fail_unprotect:
+            from domae_mcp.v2.winprotect import ProtectError
+            raise ProtectError("unprotect")
+        return self.inner.unprotect(blob, purpose)
