@@ -33,10 +33,21 @@ def test_device_id_windows_sources():
     assert re.fullmatch(r"[0-9a-f]{64}", device.device_id_hex(b"\x01" * 32))
 
 
+
 @pytest.mark.skipif(sys.platform == "win32", reason="source 실행 전용 경로")
-@pytest.mark.parametrize("node, expect_host", [(0x0223456789AB, False), (0x0223456789AB | (1 << 40), True)])
-def test_machine_guid_source_is_stable(monkeypatch, node, expect_host):
-    # getnode() 가 무작위 값(멀티캐스트 비트)을 돌려주면 실행마다 device_id 가 바뀌므로 호스트 이름을 쓴다
-    monkeypatch.setattr(device.uuid, "getnode", lambda: node)
-    monkeypatch.setattr(device.platform, "node", lambda: "test-host")
-    assert device.machine_guid() == ("host:test-host" if expect_host else f"{node:012x}")
+def test_machine_guid_source_uses_real_hwaddr(monkeypatch):
+    monkeypatch.setattr(device.uuid, "getnode", lambda: 0x0223456789AB)
+    assert device.machine_guid() == "0223456789ab"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="source 실행 전용 경로")
+def test_device_id_stable_when_hwaddr_random(monkeypatch):
+    # getnode() 가 실행마다 다른 무작위 값(멀티캐스트 비트)을 돌려줘도 같은 nonce 면 device_id 가 같아야 한다
+    nonce = b"\x07" * 32
+    ids = set()
+    for node in (0x0223456789AB | (1 << 40), 0x1A2B3C4D5E6F | (1 << 40)):
+        monkeypatch.setattr(device.uuid, "getnode", lambda n=node: n)
+        assert device.machine_guid() == device.SOURCE_NO_HWADDR
+        ids.add(device.device_id_hex(nonce))
+    assert len(ids) == 1
+    assert device.device_id_hex(b"\x08" * 32) not in ids

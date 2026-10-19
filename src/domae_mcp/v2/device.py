@@ -2,20 +2,20 @@
 import ctypes
 import getpass
 import hashlib
-import platform
 import sys
 import uuid
 
 from .encoding import lp
 
 NONCE_LEN = 32
+SOURCE_NO_HWADDR = "source-no-hwaddr"
 
 
 def machine_guid() -> str:
     if sys.platform != "win32":  # source 실행 전용(P17)
         node = uuid.getnode()
         if node & (1 << 40):  # 하드웨어 주소를 못 읽어 무작위 값이 나왔다 — 실행마다 바뀌므로 쓰지 않는다
-            return f"host:{platform.node()}"
+            return SOURCE_NO_HWADDR  # 설치 구분은 앱 홈에 저장된 nonce 가 맡는다
         return f"{node:012x}"
     import winreg
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
