@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from domae_mcp.core.models import Base, MonitorSchedule
 from domae_mcp.local.config import ConfigManager
+from domae_mcp.v2.store import app_home
 
 
 def _get_db_path(config: ConfigManager | None = None) -> Path:
@@ -16,7 +17,7 @@ def _get_db_path(config: ConfigManager | None = None) -> Path:
     if config:
         base_dir = config.base_dir
     else:
-        base_dir = Path.home() / ".maipharm-domae-mcp"
+        base_dir = app_home()
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / "domae.db"

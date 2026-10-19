@@ -8,6 +8,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from domae_mcp.v2.store import app_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +38,7 @@ class ConfigManager:
     """
 
     def __init__(self, base_dir: Path | None = None):
-        self._base_dir = base_dir or Path.home() / ".maipharm-domae-mcp"
+        self._base_dir = base_dir or app_home()
         self._config_path = self._base_dir / "config.json"
         self._key_path = self._base_dir / ".key"
 
