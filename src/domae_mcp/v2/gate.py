@@ -262,8 +262,8 @@ class RuntimeGate:
             if active is not None:
                 try:
                     self._sync_locked(ctx, use_cache=True)
-                except Exception:
-                    logger.exception("v2 시작 흐름 오류")
+                except Exception as e:  # 경로(key_fp)가 든 traceback 은 남기지 않는다
+                    logger.warning("v2 시작 흐름 오류: %s", type(e).__name__)
             try:
                 self._slots.cleanup()
             except OSError:
@@ -275,8 +275,8 @@ class RuntimeGate:
             return
         try:
             self._sync_locked(ctx, use_cache=False)
-        except Exception:
-            logger.exception("v2 갱신 작업 오류")
+        except Exception as e:
+            logger.warning("v2 갱신 작업 오류: %s", type(e).__name__)
         finally:
             self._sync_lock.release()
 

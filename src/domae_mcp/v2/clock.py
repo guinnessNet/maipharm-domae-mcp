@@ -9,7 +9,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-HIGH_WATER_PERSIST_S = 600
+# 관측 최고 시각 저장 간격(초). 계획의 10분은 "저장 → 사용 → 종료 → 시계를 저장 시각으로 되돌려 재시작" 으로
+# 잔량을 되살릴 수 있어(Codex 전체 검수 1차) 진입 때마다(초 단위로 바뀔 때만) 저장한다.
+HIGH_WATER_PERSIST_S = 1
 
 
 class ClockUntrusted(Exception):

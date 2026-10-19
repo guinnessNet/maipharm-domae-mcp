@@ -56,6 +56,7 @@ class OrderService:
                         crawler.search(product_name)
                     except Exception:
                         logger.warning("order 전 선행 search 실패: %s / %s", supplier, product_name)
+                CrawlerRegistry.require()  # 로그인·선행 검색 중 철회·차단됐으면 주문을 시작하지 않는다
                 result = crawler.order(product_id, quantity)
             except CrawlerBlocked:
                 raise

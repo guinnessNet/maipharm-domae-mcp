@@ -667,3 +667,19 @@ def test_clock_rollback_still_detected_with_server_ahead(env):
     CrawlerRegistry.require()
     env.t.advance(-120)
     _blocked("clock_untrusted")
+
+
+# ── Codex 전체 검수 1차: 재시작 + 시계 되돌림으로 잔량을 되살리지 못한다 ──
+
+def test_restart_with_clock_rollback_cannot_restore_lease(env):
+    env.first_key()
+    env.t.advance(10)
+    CrawlerRegistry.require()
+    env.t.advance(300)
+    CrawlerRegistry.require()  # 진입 때마다 관측 최고 시각을 저장한다
+    env.new_process()
+    env.t.advance(-300)  # 마지막 저장 시각 이전으로 되돌리고 재시작
+    env.server.version_status = (503, {"error": "no_release"}, None)  # 오프라인
+    env.gate.start()
+    _blocked()
+    assert env.gate.status()["state"] != "ready"

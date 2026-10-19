@@ -537,3 +537,22 @@ def test_trust_file_only_outside_release(tmp_path, monkeypatch):
     f.write_text(json.dumps({"k": b64(b"x" * 31)}), encoding="utf-8")
     with pytest.raises(ValueError):
         trust.active_trust()
+
+
+def test_revocation_raises_even_if_all_storage_fails(env, monkeypatch):
+    env.install()
+    env.server.mode = "revoke_key"
+    from domae_mcp.v2 import loader as L
+    from domae_mcp.v2.store import BundleCache, StoreError
+
+    def broken(*a, **k):
+        raise StoreError("invalid")
+
+    def broken_os(*a, **k):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(env.state, "update", broken)
+    monkeypatch.setattr(BundleCache, "delete", broken_os)
+    monkeypatch.setattr(L, "quarantine", broken_os)
+    with pytest.raises(V2Revoked):
+        env.loader().check_version()

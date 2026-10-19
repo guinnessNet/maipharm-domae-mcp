@@ -344,3 +344,49 @@ def test_no_v1_endpoints_called(env):
     paths = {r.url.path for r in env.server.requests}
     assert paths and all(p in ("/api/domae/crawlers/v2", "/api/domae/crawlers/v2/version") for p in paths)
     assert all(r.url.host == "pharmsq.com" for r in env.server.requests)
+
+
+def test_order_not_started_if_revoked_during_login(env):
+    from domae_mcp.core.crawlers.base import BaseCrawler, OrderResult
+    from domae_mcp.core.services.order_service import OrderService
+    env.verify()
+    calls = {"order": 0}
+    gate = env.gate
+
+    class Slow(BaseCrawler):
+        SUPPLIER_NAME = "가짜A"
+
+        def login(self, i, p):
+            return True
+
+        def ensure_login(self, i, p):
+            gate.block("key_revoked")  # 로그인 대기 중 철회됨
+
+        def search(self, k):
+            return []
+
+        def order(self, product_id, quantity):
+            calls["order"] += 1
+            return OrderResult(success=True)
+
+    CrawlerRegistry.register_all({"가짜A": Slow})
+
+    class DB:
+        def add(self, o):
+            raise AssertionError("주문 기록 없음")
+
+        def commit(self):
+            pass
+
+    with pytest.raises(CrawlerBlocked):
+        OrderService().place_order("가짜A", "p", "", 1, CREDS, DB())
+    assert calls["order"] == 0
+
+
+def test_masked_key_reverifies_active_key(env):
+    env.verify()
+    st = env.client.get("/api/settings/setup-status").json()
+    env.t.advance(60)
+    body = env.verify(st["api_key_prefix"])
+    assert body["valid"] is True and env.server.posts == 1
+    assert env.slots.active() == (FA, TEST_BEARER)

@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _gate: RuntimeGate | None = None
+MASKED_KEY = "dmk_..."  # setup-status 의 api_key_prefix
 
 BLOCK_MESSAGES = {
     "key_revoked": "비활성화된 키입니다. 설정에서 새 키를 입력해 주세요.",
@@ -84,8 +85,8 @@ def start_background() -> threading.Thread:
     def run():
         try:
             gate.start()
-        except Exception:
-            logger.exception("v2 시작 흐름 실패")
+        except Exception as e:
+            logger.warning("v2 시작 흐름 실패: %s", type(e).__name__)
 
     t = threading.Thread(target=run, name="domae-v2-start", daemon=True)
     t.start()
@@ -94,6 +95,19 @@ def start_background() -> threading.Thread:
 
 def verify_key(api_key: str) -> tuple[bool, str, int]:
     """설정의 키 검증 = v2 초기화(P13). 실패하면 활성 키·캐시·레지스트리는 그대로다."""
+    if api_key == MASKED_KEY:  # 설정 화면이 보여 준 가린 값 그대로 = 활성 키 재검증
+        try:
+            n = get_gate().reverify()
+        except V2Revoked as e:
+            return False, VERIFY_MESSAGES.get(e.reason, "비활성화된 키입니다."), 0
+        except V2Error as e:
+            if e.reason == "no_key":
+                return False, "API 키를 입력해 주세요.", 0
+            return False, VERIFY_MESSAGES.get(e.reason, "서버 응답 검증에 실패했습니다. 잠시 뒤 다시 시도해 주세요."), 0
+        except Exception as e:
+            logger.warning("v2 재검증 중 오류: %s", type(e).__name__)
+            return False, "잠시 뒤 다시 시도해 주세요.", 0
+        return True, f"인증 완료! 크롤러 {n}개 로드됨.", n
     if not isinstance(api_key, str) or not api_key.startswith("dmk_") or len(api_key) > 200 or not api_key.isascii():
         return False, "API 키 형식이 올바르지 않습니다. (dmk_ 로 시작해야 합니다)", 0
     try:

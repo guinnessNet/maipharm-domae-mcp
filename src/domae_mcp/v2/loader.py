@@ -171,7 +171,10 @@ class V2Loader:
         try:
             self._cache.delete()
         except OSError:
-            quarantine(self._cache.path)
+            try:
+                quarantine(self._cache.path)
+            except OSError:
+                logger.warning("v2 철회 뒤 캐시를 지우지 못했다")
         self._version_verified = False
         raise V2Revoked("key_revoked" if scope == "key" else "device_revoked")
 

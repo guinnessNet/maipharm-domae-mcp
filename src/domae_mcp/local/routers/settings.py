@@ -120,7 +120,7 @@ def get_setup_status():
 
     return SetupStatusResponse(
         api_key_set=key_set,
-        api_key_prefix="dmk_..." if key_set else "",
+        api_key_prefix=v2app.MASKED_KEY if key_set else "",
         credentials_configured=configured,
         credentials_total=len(creds),
         telegram_set=bool(tg.get("token") and tg.get("chat_id")),
