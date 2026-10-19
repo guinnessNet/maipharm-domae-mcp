@@ -267,3 +267,88 @@ class BundleCache:
             self._path.unlink()
         except FileNotFoundError:
             pass
+
+
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def path_lock(path: Path) -> threading.Lock:
+    """같은 파일을 쓰는 여러 인스턴스(모듈마다 만든 ConfigManager 등)를 프로세스 안에서 직렬화한다."""
+    key = str(Path(path).resolve()).lower()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
+
+
+class SecretStore:
+    """로컬 비밀(스펙 B10, P16). v2/secrets.dpapi 에 {이름: 값} 을 DPAPI 로 감싸 둔다.
+
+    이름: "telegram_token", "cred:<도매상>". API 키는 키 슬롯(keyslot.KeySlots)에 둔다.
+    해제에 실패하면 파일을 격리하고(평문으로 다시 저장하지 않는다) 표시 파일 secrets.lost 를 남긴다. 설정 상태가
+    이 표시로 재입력을 요청한다. 일시 읽기 오류(OSError)면 쓰지 않는다(다른 비밀을 덮어 지우지 않게).
+    """
+
+    def __init__(self, root: Path, prot: Protector):
+        self._path = Path(root) / "secrets.dpapi"
+        self.lost_marker = Path(root) / "secrets.lost"
+        self._prot = prot
+        self._lock = path_lock(self._path)
+
+    def _load(self) -> dict[str, str] | None:
+        """None = 지금 읽을 수 없음(일시 오류)."""
+        if not self._path.exists():
+            return {}
+        try:
+            blob = self._path.read_bytes()
+        except OSError:
+            return None
+        try:
+            raw = json.loads(self._prot.unprotect(blob, purpose("secrets")).decode("utf-8"))
+            if not isinstance(raw, dict) or not _is_int(raw.get("format")) or raw.get("format") != 1 \
+                    or not isinstance(raw.get("values"), dict) \
+                    or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw["values"].items()):
+                raise ValueError("secrets")
+            return dict(raw["values"])
+        except (ProtectError, ValueError, UnicodeDecodeError):
+            try:
+                atomic_write_bytes(self.lost_marker, b"1")  # 표시 먼저, 격리는 그다음(중간에 죽어도 재입력 요청이 남게)
+                quarantine(self._path)
+            except OSError:
+                return None
+            return {}
+
+    def _save(self, values: dict[str, str]) -> None:
+        body = _dumps({"format": 1, "values": values})
+        atomic_write_bytes(self._path, self._prot.protect(body, purpose("secrets")))
+
+    def get(self, name: str) -> str:
+        with self._lock:
+            return (self._load() or {}).get(name, "")
+
+    def set(self, name: str, value: str) -> None:
+        with self._lock:
+            values = self._load()
+            if values is None:
+                raise OSError("secrets_unreadable")
+            if value:
+                values[name] = value
+            else:
+                values.pop(name, None)
+            self._save(values)
+
+    def names(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._load() or {})
+
+    def lost(self) -> bool:
+        """격리 표시가 있는지(손상을 지금 감지한다). 재입력 요청을 저장한 뒤 clear_lost() 로 지운다."""
+        with self._lock:
+            self._load()
+            return self.lost_marker.exists()
+
+    def clear_lost(self) -> None:
+        with self._lock:
+            try:
+                self.lost_marker.unlink()
+            except OSError:
+                pass
