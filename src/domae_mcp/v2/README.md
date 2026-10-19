@@ -17,7 +17,7 @@
 | KDF | HKDF-SHA256(shared, salt 32B, info 스펙 B1), 32바이트 |
 | 모듈 | AES-256-GCM, IV 12B 모듈별·중복 금지, tag 16B, AAD 스펙 B1 |
 
-server 는 서명·암호화(엔드포인트는 B-3), worker 는 검증·복호화(`verify.py` 의 network·cache 모드, release·revocation 검증; 로더 연결은 B-4)를 쓴다.
+server 는 서명·암호화(엔드포인트는 B-3), worker 는 검증·복호화(`verify.py` 의 network·cache 모드, release·revocation 검증; 로더 연결은 B-4)를 쓴다. 클라이언트 조립(로더·DPAPI·진입점 집행)은 `loader.py`·`gate.py` 가 맡는다(B-4).
 
 ## 호출 순서와 전제
 
@@ -35,5 +35,6 @@ server 는 서명·암호화(엔드포인트는 B-3), worker 는 검증·복호�
 
 - cache 모드에 넘기는 `now` 는 B-4 가 시계 역행 검사를 거쳐 만든 `effective_now` 다.
 - 서버는 요청마다 새 X25519 키와 salt 를 만들고 세션 키를 재사용하지 않는다. 운영 경로에서는 `ivFor`(고정 IV)를 쓰지 않으며, 이 인자는 시험 전용이다. 한 payload 의 모든 모듈은 `encryptModules` 한 번에 처리한다. IV 중복 검사가 호출 한 번 안에서만 유지되기 때문이다.
-- 정수를 `1.0` 처럼 표기한 JSON 숫자를 어떻게 처리할지(JSON 숫자 토큰 규칙)는 B-3 에서 정한다.
+- JSON 숫자 표기(2026-10-18 확정): 서버가 내보내는 정수는 안전 정수의 정수 토큰(소수점·지수 없음)이다. 클라이언트(Python)는 `1.0`·`1e0` 을 거부한다.
+  서버가 받는 요청 본문은 JS 숫자 의미로 해석한다(`2.0` 은 `2`). 요청은 서명 대상이 아니므로 표기 차이가 바인딩을 바꾸지 않는다.
 - `VerifiedBundle` 은 정책과 세대만 돌려준다. 따라서 B-4 는 salt·server_pub·manifest 해시를 payload 에서 다시 읽어야 하며, 이때 같은 엄격 디코더(`b64d`)를 쓴다.
