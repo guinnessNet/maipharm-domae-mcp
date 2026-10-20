@@ -8,7 +8,6 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from domae_mcp import __version__
@@ -16,6 +15,7 @@ from domae_mcp.core.crawlers.registry import CrawlerBlocked
 from domae_mcp.local import v2app
 from domae_mcp.local.config import ConfigManager
 from domae_mcp.local.database import init_db
+from domae_mcp.local.spa import SPAStaticFiles
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ app.include_router(update.router, prefix="/api")
 # 정적 파일 서빙 (React 빌드 결과물)
 static_dir = Path(__file__).parent.parent / "static"
 if static_dir.is_dir():
-    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+    app.mount("/", SPAStaticFiles(directory=str(static_dir), html=True), name="static")
 
 
 def run_web_server(port: int = 5900) -> None:
