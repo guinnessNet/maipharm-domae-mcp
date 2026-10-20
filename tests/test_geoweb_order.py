@@ -1701,3 +1701,53 @@ def test_geo_live_num_search_shows_other_stock_and_orders_local_only():
     site.local, site.names = {pid: local}, {pid: rows[pid].product_name}   # 주문내역 대역은 검색 제품명을 쓴다
     r = c._order_bare(pid, local + 1)
     assert site.sends == [{(pid, ""): local}] and r.shortfall_reason == "stopped" and r.unsent_quantity == 1
+
+
+# ── 타센터 칸 '-' (실측 2026-10-20: 제약사 간헐적입고 품목, 상세에 타센터 팝업 자체가 없음) ──
+
+DASH_OTHER = "\n                -\n        "
+
+
+def with_no_center_popup(site, pid="A"):
+    original = site.post
+    def post(url, **kw):
+        if url.endswith(f'PartialProductInfo/{pid}'):
+            return Resp('<table><tbody><tr><th>제품비고</th><td></td></tr><tr><th>제품코드</th><td></td></tr>'
+                        '<tr><th>주문단가</th><td>4020</td><th>박스입수</th><td></td></tr>'
+                        '<tr><th>재고수량</th><td>0</td></tr></tbody></table>')
+        return original(url, **kw)
+    site.post = post
+    return site
+
+
+def _dash_search(stock="0"):
+    return search_row("A", stock=stock).replace(
+        '<span class="font_size_13">0</span> </span> </td> <td class="return">',
+        f'<span class="font_size_13">{DASH_OTHER}</span> </span> </td> <td class="return">')
+
+
+def test_geo_dash_other_without_popup_is_listed_as_no_other(caplog):
+    site = with_no_center_popup(with_search(Site({'A': 0}, {}), _dash_search("0")))
+    with caplog.at_level("WARNING"):
+        rows = crawler(site).search('A')
+    assert [(r.product_id, r.local_stock, r.other_stock, r.quantity, r.price) for r in rows] == [('A', 0, 0, 0, 4020)]
+    assert "판독 실패" not in caplog.text and "확인 불가" not in caplog.text
+
+
+def test_geo_dash_other_order_uses_local_only():
+    site = with_no_center_popup(with_search(Site({'A': 9}, {}), _dash_search("9")))
+    assert crawler(site)._get_product_stocks('A') == (9, 0, '')
+
+
+def test_geo_dash_other_with_stocked_popup_does_not_use_other_centers():
+    site = with_search(Site({'A': 9}, {}, centers={'A': [["타센터가(가상)", "MV", 5]]}), _dash_search("9"))
+    assert crawler(site)._get_product_stocks('A') == (9, 0, '')
+
+
+@pytest.mark.parametrize('other', ['--', '−', 'x', '- 1'])
+def test_geo_other_cell_garbage_still_excluded(other):
+    html = search_row("A", stock="9").replace(
+        '<span class="font_size_13">0</span> </span> </td> <td class="return">',
+        f'<span class="font_size_13">{other}</span> </span> </td> <td class="return">')
+    site = with_search(Site({'A': 9}, {}), html)
+    assert crawler(site).search('A') == []
