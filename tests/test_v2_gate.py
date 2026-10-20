@@ -757,3 +757,40 @@ def test_expiry_block_still_persists_monotonic_floor(env):
     env.new_process()
     env.gate.start()
     assert env.gate.status()["state"] != "ready"
+
+
+# ── G7 실기: 복구 뒤 last_error 가 남지 않는다 ──
+
+def test_first_key_clears_no_key_error(env):
+    env.gate.start()
+    assert env.gate.status()["last_error"] == "no_key"
+    env.first_key()
+    s = env.gate.status()
+    assert s["state"] == "ready" and s["last_error"] is None
+
+
+def test_corrupt_cache_recovery_clears_error(env):
+    env.first_key()
+    cache = env.slots.cache_dir(FA) / "bundle-cache.json"
+    data = cache.read_bytes()
+    cache.write_bytes(data[:-100])
+    env.t.advance(60)
+    env.new_process().start()
+    s = env.gate.status()
+    assert s["state"] == "ready" and env.server.posts == 2
+    assert s["last_error"] is None
+
+
+def test_version_recovery_clears_error(env):
+    env.first_key()
+    env.server.version_status = (503, {"error": "no_release"}, None)
+    env.t.advance(72 * H)
+    CrawlerRegistry.require()
+    env.jobs.run_all()
+    assert env.gate.status()["last_error"] is not None
+    env.server.version_status = None
+    env.t.advance(2 * H)
+    CrawlerRegistry.require()
+    env.jobs.run_all()
+    s = env.gate.status()
+    assert s["version_check_failed"] is False and s["last_error"] is None

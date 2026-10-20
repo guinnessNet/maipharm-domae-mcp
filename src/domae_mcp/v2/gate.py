@@ -228,6 +228,7 @@ class RuntimeGate:
                 lease.cap(run.lease.check())
             self._registry.register_all(classes)
             self._running = _Running(p, lease)
+            self._last_error = None  # 로드 성공 — 이전 실패 사유(no_key·no_cache 등)는 더 이상 현재 상태가 아니다
             self._reset_hw_track(max(now, ks.time_high_water))
             if switching:
                 self._key_fp = p.key_fp
@@ -315,6 +316,7 @@ class RuntimeGate:
             if self.context() != ctx:
                 return
             self._version_failed = False
+            self._last_error = None
             self._version_level = 0
             self._version_retry_at = 0
             self._reset_hw_track(self._clock.wall())  # 검증된 버전 확인이 hw 를 now 로 재설정했다
@@ -550,6 +552,7 @@ class RuntimeGate:
                 self.block("protocol_too_old", ctx)
             raise
         with self._lock:
+            self._last_error = None
             self._reset_hw_track(self._clock.wall())
             if self._block == "clock_untrusted":
                 self._recover_clock()
