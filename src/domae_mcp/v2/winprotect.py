@@ -1,5 +1,6 @@
 """도매 v2 로컬 보호 저장 (스펙 B2·B10). CurrentUser DPAPI 만 쓴다. 실패하면 다른 방식으로 대신하지 않는다."""
 import ctypes
+import glob
 import os
 import sys
 import tempfile
@@ -127,13 +128,32 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+QUARANTINE_KEEP = 3  # 같은 파일의 격리 사본은 최근 것만 남긴다
+
+
 def quarantine(path: Path) -> Path | None:
     path = Path(path)
     if not path.exists():
         return None
-    stamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')  # 마이크로초까지: 정리 뒤 같은 이름을 다시 쓰지 않게
     dest, i = path.with_name(f"{path.name}.bad-{stamp}"), 1
     while dest.exists():  # 같은 초의 두 번째 격리가 앞 사본을 덮지 않게 한다
         dest, i = path.with_name(f"{path.name}.bad-{stamp}-{i}"), i + 1
     os.replace(path, dest)
+    _prune_quarantine(path)
     return dest
+
+
+def _prune_quarantine(path: Path) -> None:
+    prefix = f"{path.name}.bad-"
+
+    def order(f: Path) -> tuple:
+        stamp, _, n = f.name[len(prefix):].partition("-")
+        return stamp, int(n) if n.isdigit() else 0
+
+    copies = sorted((f for f in path.parent.glob(f"{glob.escape(prefix)}*") if f.is_file()), key=order)
+    for old in copies[:-QUARANTINE_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass

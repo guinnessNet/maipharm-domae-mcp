@@ -105,3 +105,17 @@ def test_quarantine_renames(tmp_path):
     assert dest is not None and dest.name.startswith("install.dpapi.bad-")
     assert not f.exists() and dest.read_bytes() == b"junk"
     assert quarantine(tmp_path / "none") is None
+
+
+def test_quarantine_keeps_only_recent_copies(tmp_path):
+    p = tmp_path / "bundle-cache.json"
+    for i in range(5):
+        p.write_text(str(i))
+        quarantine(p)
+    copies = sorted(tmp_path.glob("bundle-cache.json.bad-*"))
+    assert len(copies) == winprotect.QUARANTINE_KEEP == 3
+    assert sorted(c.read_text() for c in copies) == ["2", "3", "4"]
+    other = tmp_path / "state.dpapi"
+    other.write_text("s")
+    quarantine(other)
+    assert len(list(tmp_path.glob("state.dpapi.bad-*"))) == 1
