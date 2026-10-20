@@ -119,3 +119,21 @@ def test_quarantine_keeps_only_recent_copies(tmp_path):
     other.write_text("s")
     quarantine(other)
     assert len(list(tmp_path.glob("state.dpapi.bad-*"))) == 1
+
+
+def test_quarantine_keeps_new_copy_when_clock_goes_back(tmp_path, monkeypatch):
+    p = tmp_path / "bundle-cache.json"
+    for i in range(3):
+        p.write_text(str(i))
+        quarantine(p)
+
+    class Past(winprotect.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return winprotect.datetime(2000, 1, 1, tzinfo=tz)
+
+    monkeypatch.setattr(winprotect, "datetime", Past)
+    p.write_text("new")
+    dest = quarantine(p)
+    assert dest is not None and dest.exists() and dest.read_text() == "new"
+    assert len(list(tmp_path.glob("bundle-cache.json.bad-*"))) == winprotect.QUARANTINE_KEEP

@@ -536,6 +536,10 @@ class RuntimeGate:
             self._worker_loader = loader  # 종결 차단·전환이 이 요청도 취소할 수 있게(P20)
         try:
             return self._reverify_with(loader, ctx, key_fp)
+        except V2Error as e:
+            if not _cancelled(e):
+                self._last_error = e.reason  # 버전 확인 뒤 단계가 실패해도 상태에 사유를 남긴다
+            raise
         finally:
             with self._lock:
                 if self._worker_loader is loader:

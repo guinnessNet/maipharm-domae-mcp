@@ -140,19 +140,20 @@ def quarantine(path: Path) -> Path | None:
     while dest.exists():  # 같은 초의 두 번째 격리가 앞 사본을 덮지 않게 한다
         dest, i = path.with_name(f"{path.name}.bad-{stamp}-{i}"), i + 1
     os.replace(path, dest)
-    _prune_quarantine(path)
+    _prune_quarantine(path, dest)
     return dest
 
 
-def _prune_quarantine(path: Path) -> None:
+def _prune_quarantine(path: Path, keep: Path) -> None:
     prefix = f"{path.name}.bad-"
 
     def order(f: Path) -> tuple:
         stamp, _, n = f.name[len(prefix):].partition("-")
         return stamp, int(n) if n.isdigit() else 0
 
-    copies = sorted((f for f in path.parent.glob(f"{glob.escape(prefix)}*") if f.is_file()), key=order)
-    for old in copies[:-QUARANTINE_KEEP]:
+    # 방금 만든 사본은 시계가 뒤로 가 이름이 오래돼 보여도 남긴다
+    copies = sorted((f for f in path.parent.glob(f"{glob.escape(prefix)}*") if f.is_file() and f != keep), key=order)
+    for old in copies[:len(copies) - (QUARANTINE_KEEP - 1)]:
         try:
             old.unlink()
         except OSError:

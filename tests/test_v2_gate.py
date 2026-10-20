@@ -794,3 +794,12 @@ def test_version_recovery_clears_error(env):
     env.jobs.run_all()
     s = env.gate.status()
     assert s["version_check_failed"] is False and s["last_error"] is None
+
+
+def test_reverify_download_failure_keeps_error(env):
+    env.first_key()
+    env.server.publish()
+    env.server.post_status = (503, {"error": "busy"}, None)
+    with pytest.raises(V2Error) as e:
+        env.gate.reverify()
+    assert env.gate.status()["last_error"] == e.value.reason
